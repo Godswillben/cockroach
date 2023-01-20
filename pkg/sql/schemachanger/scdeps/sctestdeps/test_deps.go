@@ -160,6 +160,23 @@ func (s *TestState) HasOwnership(
 	return true, nil
 }
 
+// HasPrivilege implements the scbuild.AuthorizationAccessor interface.
+func (s *TestState) HasPrivilege(
+	ctx context.Context,
+	privilegeObject privilege.Object,
+	privilege privilege.Kind,
+	user username.SQLUsername,
+) (bool, error) {
+	return true, nil
+}
+
+// HasAnyPrivilege implements the scbuild.AuthorizationAccessor interface.
+func (s *TestState) HasAnyPrivilege(
+	ctx context.Context, privilegeObject privilege.Object,
+) (bool, error) {
+	return true, nil
+}
+
 // CheckPrivilegeForUser implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) CheckPrivilegeForUser(
 	ctx context.Context,
@@ -307,7 +324,13 @@ func (s *TestState) MayResolveIndex(
 		if tbl == nil {
 			return false, catalog.ResolvedObjectPrefix{}, nil, nil
 		}
-		idx, _ = tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
+		idx = catalog.FindIndex(
+			tbl,
+			catalog.IndexOpts{AddMutations: true},
+			func(idx catalog.Index) bool {
+				return idx.GetName() == string(tableIndexName.Index)
+			},
+		)
 	} else {
 		db, schema := s.mayResolvePrefix(tableIndexName.Table.ObjectNamePrefix)
 		prefix = catalog.ResolvedObjectPrefix{
@@ -326,7 +349,13 @@ func (s *TestState) MayResolveIndex(
 			if !ok {
 				return nil
 			}
-			idx, _ = tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
+			idx = catalog.FindIndex(
+				tbl,
+				catalog.IndexOpts{AddMutations: true},
+				func(idx catalog.Index) bool {
+					return idx.GetName() == string(tableIndexName.Index)
+				},
+			)
 			if idx != nil {
 				return iterutil.StopIteration()
 			}
@@ -471,20 +500,12 @@ func (s *TestState) ResolveType(
 		return nil, err
 	}
 	tn := tree.MakeQualifiedTypeName(prefix.Database.GetName(), prefix.Schema.GetName(), typ.GetName())
-	return typ.MakeTypesT(ctx, &tn, s)
+	return typedesc.HydratedTFromDesc(ctx, &tn, typ, s)
 }
 
 // ResolveTypeByOID implements the scbuild.CatalogReader interface.
 func (s *TestState) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
-	id, err := typedesc.UserDefinedTypeOIDToID(oid)
-	if err != nil {
-		return nil, err
-	}
-	name, typ, err := s.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return typ.MakeTypesT(ctx, &name, s)
+	return typedesc.ResolveHydratedTByOID(ctx, oid, s)
 }
 
 var _ catalog.TypeDescriptorResolver = (*TestState)(nil)
@@ -683,8 +704,9 @@ func (s *TestState) GetFullyQualifiedName(ctx context.Context, id descpb.ID) (st
 // NewCatalogChangeBatcher implements the scexec.Catalog interface.
 func (s *TestState) NewCatalogChangeBatcher() scexec.CatalogChangeBatcher {
 	return &testCatalogChangeBatcher{
-		s:             s,
-		namesToDelete: make(map[descpb.NameInfo]descpb.ID),
+		s:                s,
+		namesToDelete:    make(map[descpb.NameInfo]descpb.ID),
+		commentsToUpdate: make(map[catalogkeys.CommentKey]string),
 	}
 }
 
@@ -694,6 +716,7 @@ type testCatalogChangeBatcher struct {
 	namesToDelete       map[descpb.NameInfo]descpb.ID
 	descriptorsToDelete catalog.DescriptorIDSet
 	zoneConfigsToDelete catalog.DescriptorIDSet
+	commentsToUpdate    map[catalogkeys.CommentKey]string
 }
 
 var _ scexec.CatalogChangeBatcher = (*testCatalogChangeBatcher)(nil)
@@ -730,7 +753,7 @@ func (b *testCatalogChangeBatcher) DeleteZoneConfig(ctx context.Context, id desc
 func (b *testCatalogChangeBatcher) UpdateComment(
 	ctx context.Context, key catalogkeys.CommentKey, cmt string,
 ) error {
-	b.s.LogSideEffectf("upsert comment (objID: %d, subID %d, cmtType: %d, cmt: %s)", key.ObjectID, key.SubID, key.CommentType, cmt)
+	b.commentsToUpdate[key] = cmt
 	return nil
 }
 
@@ -738,13 +761,7 @@ func (b *testCatalogChangeBatcher) UpdateComment(
 func (b *testCatalogChangeBatcher) DeleteComment(
 	ctx context.Context, key catalogkeys.CommentKey,
 ) error {
-	b.s.LogSideEffectf("delete all comments for (objID: %d, subID %d, cmtType: %d)", key.ObjectID, key.SubID, key.CommentType)
-	return nil
-}
-
-// DeleteTableComments implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) DeleteTableComments(ctx context.Context, tblID descpb.ID) error {
-	b.s.LogSideEffectf("delete all comments for table descriptor %v", tblID)
+	b.commentsToUpdate[key] = ""
 	return nil
 }
 
@@ -793,6 +810,28 @@ func (b *testCatalogChangeBatcher) ValidateAndRun(ctx context.Context) error {
 	}
 	for _, deletedID := range b.zoneConfigsToDelete.Ordered() {
 		b.s.LogSideEffectf("deleting zone config for #%d", deletedID)
+	}
+	commentKeys := make([]catalogkeys.CommentKey, 0, len(b.commentsToUpdate))
+	for key := range b.commentsToUpdate {
+		commentKeys = append(commentKeys, key)
+	}
+	sort.Slice(commentKeys, func(i, j int) bool {
+		if d := int(commentKeys[i].CommentType) - int(commentKeys[j].CommentType); d != 0 {
+			return d < 0
+		}
+		if d := int(commentKeys[i].ObjectID) - int(commentKeys[j].ObjectID); d != 0 {
+			return d < 0
+		}
+		return int(commentKeys[i].SubID)-int(commentKeys[j].SubID) < 0
+	})
+	for _, key := range commentKeys {
+		if cmt := b.commentsToUpdate[key]; cmt == "" {
+			b.s.LogSideEffectf("delete comment %s(objID: %d, subID: %d)",
+				key.CommentType, key.ObjectID, key.SubID)
+		} else {
+			b.s.LogSideEffectf("upsert comment %s(objID: %d, subID: %d) -> %q",
+				key.CommentType, key.ObjectID, key.SubID, cmt)
+		}
 	}
 	ve := b.s.uncommitted.Validate(
 		ctx,
@@ -1007,15 +1046,28 @@ func (s *TestState) Validator() scexec.Validator {
 	return s
 }
 
-// ValidateCheckConstraint implements the validator interface.
-func (s *TestState) ValidateCheckConstraint(
+// ValidateConstraint implements the validator interface.
+func (s *TestState) ValidateConstraint(
 	ctx context.Context,
 	tbl catalog.TableDescriptor,
-	constraint catalog.CheckConstraint,
+	constraint catalog.Constraint,
 	indexIDForValidation descpb.IndexID,
 	override sessiondata.InternalExecutorOverride,
 ) error {
-	s.LogSideEffectf("validate check constraint %v in table #%d", constraint.GetName(), tbl.GetID())
+	s.LogSideEffectf("validate %v constraint %v in table #%d",
+		catalog.GetConstraintType(constraint), constraint.GetName(), tbl.GetID())
+	return nil
+}
+
+func (s *TestState) ValidateForeignKeyConstraint(
+	ctx context.Context,
+	out catalog.TableDescriptor,
+	in catalog.TableDescriptor,
+	constraint catalog.Constraint,
+	override sessiondata.InternalExecutorOverride,
+) error {
+	s.LogSideEffectf("validate foreign key constraint %v from table #%d to table #%d",
+		constraint.GetName(), out.GetID(), in.GetID())
 	return nil
 }
 

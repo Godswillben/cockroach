@@ -589,7 +589,7 @@ func TestValidateTableDesc(t *testing.T) {
 				NextColumnID: 2,
 				NextFamilyID: 1,
 			}},
-		{`family "baz" contains unknown column "2"`,
+		{`family "baz" contains column reference "bar" with unknown ID 2`,
 			descpb.TableDescriptor{
 				ID:            2,
 				ParentID:      1,
@@ -2855,7 +2855,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 					{
 						Name: "a",
 						ID:   1,
-						Type: types.MakeCompositeType(catid.TypeIDToOID(500), catid.TypeIDToOID(100500), nil, nil),
+						Type: types.NewCompositeType(catid.TypeIDToOID(500), catid.TypeIDToOID(100500), nil, nil),
 					},
 				},
 			},

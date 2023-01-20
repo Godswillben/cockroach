@@ -21,14 +21,15 @@ import { SqlBox, SqlBoxSize } from "src/sql";
 import { getMatchParamByName, idAttr } from "src/util";
 import { FlattenedStmtInsightEvent } from "../types";
 import { InsightsError } from "../insightsErrorComponent";
-import classNames from "classnames/bind";
-
-import { commonStyles } from "src/common";
 import { getExplainPlanFromGist } from "src/api/decodePlanGistApi";
 import { StatementInsightDetailsOverviewTab } from "./statementInsightDetailsOverviewTab";
+import { ExecutionInsightsRequest } from "../../api";
+import { executionInsightsRequestFromTimeScale } from "../utils";
 import { TimeScale } from "../../timeScaleDropdown";
 
 // Styles
+import classNames from "classnames/bind";
+import { commonStyles } from "src/common";
 import insightsDetailsStyles from "src/insights/workloadInsightDetails/insightsDetails.module.scss";
 import LoadingError from "../../sqlActivity/errorComponent";
 
@@ -42,11 +43,14 @@ export interface StatementInsightDetailsStateProps {
   insightEventDetails: FlattenedStmtInsightEvent;
   insightError: Error | null;
   isTenant?: boolean;
+  timeScale?: TimeScale;
+  hasAdminRole: boolean;
 }
 
 export interface StatementInsightDetailsDispatchProps {
+  refreshStatementInsights: (req: ExecutionInsightsRequest) => void;
   setTimeScale: (ts: TimeScale) => void;
-  refreshStatementInsights: () => void;
+  refreshUserSQLRoles: () => void;
 }
 
 export type StatementInsightDetailsProps = StatementInsightDetailsStateProps &
@@ -67,8 +71,11 @@ export const StatementInsightDetails: React.FC<
   insightError,
   match,
   isTenant,
+  timeScale,
+  hasAdminRole,
   setTimeScale,
   refreshStatementInsights,
+  refreshUserSQLRoles,
 }) => {
   const [explainPlanState, setExplainPlanState] = useState<ExplainPlanState>({
     explainPlan: null,
@@ -101,10 +108,17 @@ export const StatementInsightDetails: React.FC<
   const executionID = getMatchParamByName(match, idAttr);
 
   useEffect(() => {
-    if (insightEventDetails == null) {
-      refreshStatementInsights();
+    refreshUserSQLRoles();
+    if (!insightEventDetails || insightEventDetails === null) {
+      const req = executionInsightsRequestFromTimeScale(timeScale);
+      refreshStatementInsights(req);
     }
-  }, [insightEventDetails, refreshStatementInsights]);
+  }, [
+    insightEventDetails,
+    timeScale,
+    refreshStatementInsights,
+    refreshUserSQLRoles,
+  ]);
 
   return (
     <div>
@@ -124,8 +138,8 @@ export const StatementInsightDetails: React.FC<
       </h3>
       <div>
         <Loading
-          loading={insightEventDetails == null}
-          page={"Transaction Insight details"}
+          loading={insightEventDetails === null}
+          page={"Statement Insight details"}
           error={insightError}
           renderError={() => InsightsError()}
         >
@@ -148,6 +162,7 @@ export const StatementInsightDetails: React.FC<
               <StatementInsightDetailsOverviewTab
                 insightEventDetails={insightEventDetails}
                 setTimeScale={setTimeScale}
+                hasAdminRole={hasAdminRole}
               />
             </Tabs.TabPane>
             {!isTenant && (

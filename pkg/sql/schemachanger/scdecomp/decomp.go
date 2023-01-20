@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -33,7 +32,7 @@ type walkCtx struct {
 	desc                 catalog.Descriptor
 	ev                   ElementVisitor
 	lookupFn             func(id catid.DescID) catalog.Descriptor
-	cachedTypeIDClosures map[catid.DescID]map[catid.DescID]struct{}
+	cachedTypeIDClosures map[catid.DescID]catalog.DescriptorIDSet
 	backRefs             catalog.DescriptorIDSet
 	commentReader        CommentGetter
 	zoneConfigReader     ZoneConfigGetter
@@ -71,7 +70,7 @@ func WalkDescriptor(
 		desc:                 desc,
 		ev:                   ev,
 		lookupFn:             lookupFn,
-		cachedTypeIDClosures: make(map[catid.DescID]map[catid.DescID]struct{}),
+		cachedTypeIDClosures: make(map[catid.DescID]catalog.DescriptorIDSet),
 		commentReader:        commentReader,
 		zoneConfigReader:     zoneConfigReader,
 	}
@@ -167,34 +166,42 @@ func (w *walkCtx) walkSchema(sc catalog.SchemaDescriptor) {
 }
 
 func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
-	switch typ.GetKind() {
-	case descpb.TypeDescriptor_ALIAS:
-		typeT, err := newTypeT(typ.TypeDesc().Alias)
-		if err != nil {
-			panic(errors.NewAssertionErrorWithWrappedErrf(err, "alias type %q (%d)",
-				typ.GetName(), typ.GetID()))
-		}
+	if alias := typ.AsAliasTypeDescriptor(); alias != nil {
+		typeT := newTypeT(alias.Aliased())
 		w.ev(descriptorStatus(typ), &scpb.AliasType{
 			TypeID: typ.GetID(),
 			TypeT:  *typeT,
 		})
-	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
-		w.ev(descriptorStatus(typ), &scpb.EnumType{
-			TypeID:        typ.GetID(),
-			ArrayTypeID:   typ.GetArrayTypeID(),
-			IsMultiRegion: typ.GetKind() == descpb.TypeDescriptor_MULTIREGION_ENUM,
+	} else if enum := typ.AsEnumTypeDescriptor(); enum != nil {
+		w.ev(descriptorStatus(enum), &scpb.EnumType{
+			TypeID:        enum.GetID(),
+			ArrayTypeID:   enum.GetArrayTypeID(),
+			IsMultiRegion: enum.AsRegionEnumTypeDescriptor() != nil,
 		})
-		for ord := 0; ord < typ.NumEnumMembers(); ord++ {
-			w.ev(descriptorStatus(typ), &scpb.EnumTypeValue{
-				TypeID:                 typ.GetID(),
-				PhysicalRepresentation: typ.GetMemberPhysicalRepresentation(ord),
-				LogicalRepresentation:  typ.GetMemberLogicalRepresentation(ord),
+		for ord := 0; ord < enum.NumEnumMembers(); ord++ {
+			w.ev(descriptorStatus(enum), &scpb.EnumTypeValue{
+				TypeID:                 enum.GetID(),
+				PhysicalRepresentation: enum.GetMemberPhysicalRepresentation(ord),
+				LogicalRepresentation:  enum.GetMemberLogicalRepresentation(ord),
 			})
 		}
-	case descpb.TypeDescriptor_COMPOSITE:
-		name := tree.Name(typ.GetName())
-		panic(scerrors.NotImplementedErrorf(&name, "composite types not supported in new schema changer"))
-	default:
+	} else if comp := typ.AsCompositeTypeDescriptor(); comp != nil {
+		w.ev(descriptorStatus(typ), &scpb.CompositeType{
+			TypeID:      comp.GetID(),
+			ArrayTypeID: comp.GetArrayTypeID(),
+		})
+		for i := 0; i < comp.NumElements(); i++ {
+			typeT := newTypeT(comp.GetElementType(i))
+			w.ev(descriptorStatus(typ), &scpb.CompositeTypeAttrType{
+				CompositeTypeID: typ.GetID(),
+				TypeT:           *typeT,
+			})
+			w.ev(descriptorStatus(typ), &scpb.CompositeTypeAttrName{
+				CompositeTypeID: typ.GetID(),
+				Name:            comp.GetElementLabel(i),
+			})
+		}
+	} else {
 		panic(errors.AssertionFailedf("unsupported type kind %q", typ.GetKind()))
 	}
 	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
@@ -423,8 +430,7 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 			}
 			return nil
 		})
-		typeT, err := newTypeT(col.GetType())
-		onErrPanic(err)
+		typeT := newTypeT(col.GetType())
 		columnType.TypeT = *typeT
 
 		if col.IsComputed() {
@@ -639,11 +645,14 @@ func (w *walkCtx) walkForeignKeyConstraint(
 ) {
 	// TODO(postamar): proper handling of constraint status
 	w.ev(scpb.Status_PUBLIC, &scpb.ForeignKeyConstraint{
-		TableID:             tbl.GetID(),
-		ConstraintID:        c.GetConstraintID(),
-		ColumnIDs:           c.ForeignKeyDesc().OriginColumnIDs,
-		ReferencedTableID:   c.GetReferencedTableID(),
-		ReferencedColumnIDs: c.ForeignKeyDesc().ReferencedColumnIDs,
+		TableID:                 tbl.GetID(),
+		ConstraintID:            c.GetConstraintID(),
+		ColumnIDs:               c.ForeignKeyDesc().OriginColumnIDs,
+		ReferencedTableID:       c.GetReferencedTableID(),
+		ReferencedColumnIDs:     c.ForeignKeyDesc().ReferencedColumnIDs,
+		OnUpdateAction:          c.OnUpdate(),
+		OnDeleteAction:          c.OnDelete(),
+		CompositeKeyMatchMethod: c.Match(),
 	})
 	w.ev(scpb.Status_PUBLIC, &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.GetID(),

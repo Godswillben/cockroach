@@ -13,7 +13,6 @@ package batcheval
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
@@ -35,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 func init() {
@@ -473,7 +473,7 @@ func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline hlc.Timestamp) b
 // reason and possibly an extra message to be used for the error.
 func IsEndTxnTriggeringRetryError(
 	txn *roachpb.Transaction, args *roachpb.EndTxnRequest,
-) (retry bool, reason roachpb.TransactionRetryReason, extraMsg string) {
+) (retry bool, reason roachpb.TransactionRetryReason, extraMsg redact.RedactableString) {
 	// If we saw any WriteTooOldErrors, we must restart to avoid lost
 	// update anomalies.
 	if txn.WriteTooOld {
@@ -492,7 +492,7 @@ func IsEndTxnTriggeringRetryError(
 	// A transaction must obey its deadline, if set.
 	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args.Deadline) {
 		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
-		extraMsg = fmt.Sprintf(
+		extraMsg = redact.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
 			exceededBy, txn.WriteTimestamp, args.Deadline)
 		retry, reason = true, roachpb.RETRY_COMMIT_DEADLINE_EXCEEDED
@@ -554,7 +554,8 @@ func resolveLocalLocks(
 				//
 				// Note that the underlying pebbleIterator will still be reused
 				// since readWriter is a pebbleBatch in the typical case.
-				ok, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update)
+				ok, _, _, err := storage.MVCCResolveWriteIntent(ctx, readWriter, ms, update,
+					storage.MVCCResolveWriteIntentOptions{})
 				if err != nil {
 					return err
 				}
@@ -579,15 +580,15 @@ func resolveLocalLocks(
 			externalLocks = append(externalLocks, outSpans...)
 			if inSpan != nil {
 				update.Span = *inSpan
-				num, resumeSpan, err := storage.MVCCResolveWriteIntentRange(
-					ctx, readWriter, ms, update, resolveAllowance)
+				numKeys, _, resumeSpan, _, err := storage.MVCCResolveWriteIntentRange(ctx, readWriter, ms, update,
+					storage.MVCCResolveWriteIntentRangeOptions{MaxKeys: resolveAllowance})
 				if err != nil {
 					return err
 				}
 				if evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution != nil {
-					atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, num)
+					atomic.AddInt64(evalCtx.EvalKnobs().NumKeysEvaluatedForRangeIntentResolution, numKeys)
 				}
-				resolveAllowance -= num
+				resolveAllowance -= numKeys
 				if resumeSpan != nil {
 					if resolveAllowance != 0 {
 						log.Fatalf(ctx, "expected resolve allowance to be exactly 0 resolving %s; got %d", update.Span, resolveAllowance)

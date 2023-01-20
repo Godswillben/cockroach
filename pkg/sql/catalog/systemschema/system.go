@@ -294,8 +294,8 @@ CREATE TABLE system.role_members (
   "role"    STRING NOT NULL,
   "member"  STRING NOT NULL,
   "isAdmin" BOOL NOT NULL,
-  role_id   OID,
-  member_id OID,
+  role_id   OID NOT NULL,
+  member_id OID NOT NULL,
   CONSTRAINT "primary" PRIMARY KEY ("role", "member"),
   INDEX ("role"),
   INDEX ("member"),
@@ -678,8 +678,9 @@ CREATE TABLE system.sql_instances (
     addr         STRING,
     session_id   BYTES,
     locality     JSONB,
+    sql_addr     STRING,
     CONSTRAINT "primary" PRIMARY KEY (id),
-    FAMILY "primary" (id, addr, session_id, locality)
+    FAMILY "primary" (id, addr, session_id, locality, sql_addr)
 )`
 
 	MrSQLInstancesTableSchema = `
@@ -689,8 +690,9 @@ CREATE TABLE system.sql_instances (
     session_id   BYTES,
     locality     JSONB,
     crdb_region  BYTES NOT NULL,
+    sql_addr     STRING,
     CONSTRAINT "primary" PRIMARY KEY (crdb_region, id),
-    FAMILY "primary" (crdb_region, id, addr, session_id, locality)
+    FAMILY "primary" (crdb_region, id, addr, session_id, locality, sql_addr)
 )`
 
 	SpanConfigurationsTableSchema = `
@@ -1653,8 +1655,8 @@ var (
 				{Name: "role", ID: 1, Type: types.String},
 				{Name: "member", ID: 2, Type: types.String},
 				{Name: "isAdmin", ID: 3, Type: types.Bool},
-				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
-				{Name: "member_id", ID: 5, Type: types.Oid, Nullable: true},
+				{Name: "role_id", ID: 4, Type: types.Oid},
+				{Name: "member_id", ID: 5, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2665,13 +2667,14 @@ var (
 						{Name: "session_id", ID: 3, Type: types.Bytes, Nullable: true},
 						{Name: "locality", ID: 4, Type: types.Jsonb, Nullable: true},
 						{Name: "crdb_region", ID: 5, Type: types.Bytes, Nullable: false},
+						{Name: "sql_addr", ID: 6, Type: types.String, Nullable: true},
 					},
 					[]descpb.ColumnFamilyDescriptor{
 						{
 							Name:            "primary",
 							ID:              0,
-							ColumnNames:     []string{"id", "addr", "session_id", "locality", "crdb_region"},
-							ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5},
+							ColumnNames:     []string{"id", "addr", "session_id", "locality", "crdb_region", "sql_addr"},
+							ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6},
 							DefaultColumnID: 0,
 						},
 					},
@@ -2695,13 +2698,14 @@ var (
 					{Name: "addr", ID: 2, Type: types.String, Nullable: true},
 					{Name: "session_id", ID: 3, Type: types.Bytes, Nullable: true},
 					{Name: "locality", ID: 4, Type: types.Jsonb, Nullable: true},
+					{Name: "sql_addr", ID: 5, Type: types.String, Nullable: true},
 				},
 				[]descpb.ColumnFamilyDescriptor{
 					{
 						Name:            "primary",
 						ID:              0,
-						ColumnNames:     []string{"id", "addr", "session_id", "locality"},
-						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4},
+						ColumnNames:     []string{"id", "addr", "session_id", "locality", "sql_addr"},
+						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5},
 						DefaultColumnID: 0,
 					},
 				},

@@ -7,6 +7,7 @@ start_test "Check --multitenant flag runs as expected"
 spawn $argv demo --no-line-editor --empty --nodes 3 --multitenant
 
 eexpect "Welcome"
+eexpect "You are connected to tenant \"demo-tenant\""
 eexpect "(sql)"
 eexpect "127.0.0.1:26257/defaultdb"
 eexpect "defaultdb>"
@@ -15,10 +16,10 @@ send "\\demo ls\r"
 eexpect "Application tenant"
 eexpect "127.0.0.1:26257/defaultdb"
 eexpect "rpc"
-eexpect "127.0.0.1:26257"
+eexpect "127.0.0.1:26357"
 
 eexpect "System tenant"
-eexpect "127.0.0.1:26260/defaultdb"
+eexpect "127.0.0.1:26257/defaultdb"
 eexpect "rpc"
 eexpect "127.0.0.1:26360"
 

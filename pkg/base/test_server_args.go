@@ -59,6 +59,11 @@ type TestServerArgs struct {
 	// DisableTLSForHTTP if set, disables TLS for the HTTP interface.
 	DisableTLSForHTTP bool
 
+	// SecondaryTenantPortOffset if non-zero forces the network addresses
+	// generated for servers started by the serverController to be offset
+	// from the base addressed by the specified amount.
+	SecondaryTenantPortOffset int
+
 	// JoinAddr is the address of a node we are joining.
 	//
 	// If left empty and the TestServer is being added to a nonempty cluster, this
@@ -231,16 +236,28 @@ func DefaultTestTempStorageConfigWithSize(
 	}
 }
 
-// TestTenantArgs are the arguments used when creating a tenant from a
-// TestServer.
+// TestSharedProcessTenantArgs are the arguments to
+// TestServer.StartSharedProcessTenant.
+type TestSharedProcessTenantArgs struct {
+	// TenantName is the name of the tenant to be created. It must be set.
+	TenantName roachpb.TenantName
+	// TenantID is the ID of the tenant to be created. If not set, an ID is
+	// assigned automatically.
+	TenantID roachpb.TenantID
+
+	Knobs TestingKnobs
+
+	// If set, this will be appended to the Postgres URL by functions that
+	// automatically open a connection to the server. That's equivalent to running
+	// SET DATABASE=foo, which works even if the database doesn't (yet) exist.
+	UseDatabase string
+}
+
+// TestTenantArgs are the arguments to TestServer.StartTenant.
 type TestTenantArgs struct {
 	TenantName roachpb.TenantName
 
 	TenantID roachpb.TenantID
-
-	// Existing, if true, indicates an existing tenant, rather than a new tenant
-	// to be created by StartTenant.
-	Existing bool
 
 	// DisableCreateTenant disables the explicit creation of a tenant when
 	// StartTenant is attempted. It's used in cases where we want to validate

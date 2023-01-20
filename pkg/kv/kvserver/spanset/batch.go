@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -229,6 +230,11 @@ func (i *MVCCIterator) IsPrefix() bool {
 	return i.i.IsPrefix()
 }
 
+// UnsafeLazyValue is part of the storage.MVCCIterator interface.
+func (i *MVCCIterator) UnsafeLazyValue() pebble.LazyValue {
+	return i.i.UnsafeLazyValue()
+}
+
 // EngineIterator wraps a storage.EngineIterator and ensures that it can
 // only be used to access spans in a SpanSet.
 type EngineIterator struct {
@@ -401,7 +407,7 @@ func (i *EngineIterator) UnsafeRawEngineKey() []byte {
 }
 
 // GetRawIter is part of the storage.EngineIterator interface.
-func (i *EngineIterator) GetRawIter() *pebble.Iterator {
+func (i *EngineIterator) GetRawIter() pebbleiter.Iterator {
 	return i.i.GetRawIter()
 }
 
@@ -694,6 +700,10 @@ func (s spanSetWriter) LogLogicalOp(
 
 func (s spanSetWriter) ShouldWriteLocalTimestamps(ctx context.Context) bool {
 	return s.w.ShouldWriteLocalTimestamps(ctx)
+}
+
+func (s spanSetWriter) BufferedSize() int {
+	return s.w.BufferedSize()
 }
 
 // ReadWriter is used outside of the spanset package internally, in ccl.

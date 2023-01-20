@@ -28,9 +28,12 @@ import { TransactionInsightDetailsOverviewTab } from "./transactionInsightDetail
 import { TransactionInsightsDetailsStmtsTab } from "./transactionInsightDetailsStmtsTab";
 
 import "antd/lib/tabs/style";
+import { executionInsightsRequestFromTimeScale } from "../utils";
 export interface TransactionInsightDetailsStateProps {
   insightDetails: TxnInsightDetails;
   insightError: Error | null;
+  timeScale?: TimeScale;
+  hasAdminRole: boolean;
 }
 
 export interface TransactionInsightDetailsDispatchProps {
@@ -38,6 +41,7 @@ export interface TransactionInsightDetailsDispatchProps {
     req: TxnContentionInsightDetailsRequest,
   ) => void;
   setTimeScale: (ts: TimeScale) => void;
+  refreshUserSQLRoles: () => void;
 }
 
 export type TransactionInsightDetailsProps =
@@ -58,18 +62,31 @@ export const TransactionInsightDetails: React.FC<
   history,
   insightDetails,
   insightError,
+  timeScale,
   match,
+  hasAdminRole,
+  refreshUserSQLRoles,
 }) => {
   const executionID = getMatchParamByName(match, idAttr);
   const noInsights = !insightDetails;
   useEffect(() => {
+    refreshUserSQLRoles();
+    const execReq = executionInsightsRequestFromTimeScale(timeScale);
     if (noInsights) {
       // Only refresh if we have no data (e.g. refresh the page)
       refreshTransactionInsightDetails({
         id: executionID,
+        start: execReq.start,
+        end: execReq.end,
       });
     }
-  }, [executionID, refreshTransactionInsightDetails, noInsights]);
+  }, [
+    executionID,
+    refreshTransactionInsightDetails,
+    noInsights,
+    timeScale,
+    refreshUserSQLRoles,
+  ]);
 
   const prevPage = (): void => history.goBack();
 
@@ -95,7 +112,7 @@ export const TransactionInsightDetails: React.FC<
       </div>
       <section>
         <Loading
-          loading={insightDetails == null}
+          loading={!insightDetails || insightDetails === null}
           page={"Transaction Insight details"}
           error={insightError}
           renderError={() => InsightsError()}
@@ -108,6 +125,7 @@ export const TransactionInsightDetails: React.FC<
               <TransactionInsightDetailsOverviewTab
                 insightDetails={insightDetails}
                 setTimeScale={setTimeScale}
+                hasAdminRole={hasAdminRole}
               />
             </Tabs.TabPane>
             {insightDetails?.statementInsights?.length && (

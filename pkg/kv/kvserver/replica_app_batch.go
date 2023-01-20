@@ -334,10 +334,11 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		// required for correctness, since the merge protocol should guarantee that
 		// no new replicas of the RHS can ever be created, but it doesn't hurt to
 		// be careful.
-		const clearRangeIDLocalOnly = true
-		const mustClearRange = false
 		if err := rhsRepl.preDestroyRaftMuLocked(
-			ctx, b.batch, b.batch, mergedTombstoneReplicaID, clearRangeIDLocalOnly, mustClearRange,
+			ctx, b.batch, b.batch, mergedTombstoneReplicaID, clearRangeDataOptions{
+				ClearReplicatedByRangeID:   true,
+				ClearUnreplicatedByRangeID: true,
+			},
 		); err != nil {
 			return errors.Wrapf(err, "unable to destroy replica before merge")
 		}
@@ -466,21 +467,25 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		b.r.mu.destroyStatus.Set(
 			roachpb.NewRangeNotFoundError(b.r.RangeID, b.r.store.StoreID()),
 			destroyReasonRemoved)
+		span := b.r.descRLocked().RSpan()
 		b.r.mu.Unlock()
 		b.r.readOnlyCmdMu.Unlock()
 		b.changeRemovesReplica = true
 
-		// Delete all of the local data. We're going to delete the hard state too.
-		// In order for this to be safe we need code above this to promise that we're
-		// never going to write hard state in response to a message for a later
-		// replica (with a different replica ID) to this range state.
+		// Delete all of the Replica's data. We're going to delete the hard state too.
+		// We've set the replica's in-mem status to reflect the pending destruction
+		// above, and preDestroyRaftMuLocked will also add a range tombstone to the
+		// batch, so that when we commit it, the removal is finalized.
 		if err := b.r.preDestroyRaftMuLocked(
 			ctx,
 			b.batch,
 			b.batch,
 			change.NextReplicaID(),
-			false, /* clearRangeIDLocalOnly */
-			false, /* mustUseClearRange */
+			clearRangeDataOptions{
+				ClearReplicatedBySpan:      span,
+				ClearReplicatedByRangeID:   true,
+				ClearUnreplicatedByRangeID: true,
+			},
 		); err != nil {
 			return errors.Wrapf(err, "unable to destroy replica before removal")
 		}
@@ -513,6 +518,9 @@ func (b *replicaAppBatch) stageTrivialReplicatedEvalResult(
 	b.state.RaftAppliedIndex = cmd.Index()
 	b.state.RaftAppliedIndexTerm = cmd.Term
 
+	// NB: since the command is "trivial" we know the LeaseIndex field is set to
+	// something meaningful if it's nonzero (e.g. cmd is not a lease request). For
+	// a rejected command, cmd.LeaseIndex was zeroed out earlier.
 	if leaseAppliedIndex := cmd.LeaseIndex; leaseAppliedIndex != 0 {
 		b.state.LeaseAppliedIndex = leaseAppliedIndex
 	}
@@ -604,11 +612,8 @@ func (b *replicaAppBatch) ApplyToStateMachine(ctx context.Context) error {
 	deltaStats.Subtract(prevStats)
 	r.store.metrics.addMVCCStats(ctx, r.tenantMetricsRef, deltaStats)
 
-	// Record the write activity, passing a 0 nodeID because replica.writeStats
-	// intentionally doesn't track the origin of the writes.
-	//
-	// This also records the number of keys ingested via AddSST.
-	b.r.loadStats.writeKeys.RecordCount(float64(b.ab.numMutations), 0)
+	// Record the number of keys written to the replica.
+	b.r.loadStats.RecordWriteKeys(float64(b.ab.numMutations))
 
 	now := timeutil.Now()
 	if needsSplitBySize && r.splitQueueThrottle.ShouldProcess(now) {
@@ -768,6 +773,9 @@ func (mb *ephemeralReplicaAppBatch) Stage(
 	)
 	fr = replicaApplyTestingFilters(ctx, mb.r, cmd, fr)
 	cmd.ForcedErrResult = fr
+	if !cmd.Rejected() && cmd.LeaseIndex > mb.state.LeaseAppliedIndex {
+		mb.state.LeaseAppliedIndex = cmd.LeaseIndex
+	}
 
 	return cmd, nil
 }

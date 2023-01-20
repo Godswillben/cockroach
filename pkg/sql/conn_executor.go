@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -374,8 +375,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		nil, /* reportedProvider */
 		cfg.SQLStatsTestingKnobs,
 	)
-	reportedSQLStatsController :=
-		reportedSQLStats.GetController(cfg.SQLStatusServer, cfg.DB, cfg.InternalExecutor)
+	reportedSQLStatsController := reportedSQLStats.GetController(cfg.SQLStatusServer)
 	memSQLStats := sslocal.New(
 		cfg.Settings,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -415,27 +415,30 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 
 	sqlStatsInternalExecutorMonitor := MakeInternalExecutorMemMonitor(MemoryMetrics{}, s.GetExecutorConfig().Settings)
 	sqlStatsInternalExecutorMonitor.StartNoReserved(context.Background(), s.GetBytesMonitor())
-	sqlStatsInternalExecutor := MakeInternalExecutor(s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor)
 	persistedSQLStats := persistedsqlstats.New(&persistedsqlstats.Config{
 		Settings:                s.cfg.Settings,
-		InternalExecutor:        &sqlStatsInternalExecutor,
 		InternalExecutorMonitor: sqlStatsInternalExecutorMonitor,
-		KvDB:                    cfg.DB,
-		SQLIDContainer:          cfg.NodeInfo.NodeID,
-		JobRegistry:             s.cfg.JobRegistry,
-		Knobs:                   cfg.SQLStatsTestingKnobs,
-		FlushCounter:            serverMetrics.StatsMetrics.SQLStatsFlushStarted,
-		FailureCounter:          serverMetrics.StatsMetrics.SQLStatsFlushFailure,
-		FlushDuration:           serverMetrics.StatsMetrics.SQLStatsFlushDuration,
+		DB: NewInternalDB(
+			s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor,
+		),
+		SQLIDContainer: cfg.NodeInfo.NodeID,
+		JobRegistry:    s.cfg.JobRegistry,
+		Knobs:          cfg.SQLStatsTestingKnobs,
+		FlushCounter:   serverMetrics.StatsMetrics.SQLStatsFlushStarted,
+		FailureCounter: serverMetrics.StatsMetrics.SQLStatsFlushFailure,
+		FlushDuration:  serverMetrics.StatsMetrics.SQLStatsFlushDuration,
 	}, memSQLStats)
 
 	s.sqlStats = persistedSQLStats
 	s.sqlStatsController = persistedSQLStats.GetController(cfg.SQLStatusServer)
 	schemaTelemetryIEMonitor := MakeInternalExecutorMemMonitor(MemoryMetrics{}, s.GetExecutorConfig().Settings)
 	schemaTelemetryIEMonitor.StartNoReserved(context.Background(), s.GetBytesMonitor())
-	schemaTelemetryIE := MakeInternalExecutor(s, MemoryMetrics{}, schemaTelemetryIEMonitor)
 	s.schemaTelemetryController = schematelemetrycontroller.NewController(
-		s.cfg.DB, &schemaTelemetryIE, schemaTelemetryIEMonitor, s.cfg.Settings, s.cfg.JobRegistry,
+		NewInternalDB(
+			s, MemoryMetrics{}, schemaTelemetryIEMonitor,
+		),
+		schemaTelemetryIEMonitor,
+		s.cfg.Settings, s.cfg.JobRegistry,
 		s.cfg.NodeInfo.LogicalClusterID,
 	)
 	s.indexUsageStatsController = idxusage.NewController(cfg.SQLStatusServer)
@@ -578,31 +581,6 @@ func (s *Server) GetTxnIDCache() *txnidcache.Cache {
 	return s.txnIDCache
 }
 
-// addToRecentStatementsCache adds a completed statement to the
-// RecentStatementsCache on the Server ExecutorConfig.
-func (s *Server) addToRecentStatementsCache(
-	ctx context.Context,
-	sessionID clusterunique.ID,
-	appName atomic.Value,
-	username string,
-	clientAddr string,
-	queryID clusterunique.ID,
-	qm *queryMeta,
-	timeNow time.Time,
-) {
-	activeQuery, err := qm.toActiveQuery(ctx, queryID, sessionID, appName, username, clientAddr, timeNow)
-	if err != nil {
-		// We can't just log the SQL as it could contain sensitive information.
-		log.Warningf(ctx, "failed to re-parse sql while adding to recent statements cache")
-		return
-	}
-	err = s.cfg.RecentStatementsCache.Add(ctx, activeQuery)
-	if err != nil {
-		log.Warningf(ctx, "could not add to recent statements cache due to memory allocation error")
-		return
-	}
-}
-
 // GetScrubbedStmtStats returns the statement statistics by app, with the
 // queries scrubbed of their identifiers. Any statements which cannot be
 // scrubbed will be omitted from the returned map.
@@ -742,7 +720,7 @@ func (s *Server) SetupConn(
 	memMetrics MemoryMetrics,
 	onDefaultIntSizeChange func(newSize int32),
 ) (ConnectionHandler, error) {
-	sd := s.newSessionData(args)
+	sd := newSessionData(args)
 	sds := sessiondata.NewStack(sd)
 	// Set the SessionData from args.SessionDefaults. This also validates the
 	// respective values.
@@ -864,7 +842,7 @@ func (s *Server) GetLocalIndexStatistics() *idxusage.LocalIndexUsageStats {
 }
 
 // newSessionData a SessionData that can be passed to newConnExecutor.
-func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
+func newSessionData(args SessionArgs) *sessiondata.SessionData {
 	sd := &sessiondata.SessionData{
 		SessionData: sessiondatapb.SessionData{
 			UserProto: args.User.EncodeProto(),
@@ -884,7 +862,7 @@ func (s *Server) newSessionData(args SessionArgs) *sessiondata.SessionData {
 			sd.CustomOptions[k] = v
 		}
 	}
-	s.populateMinimalSessionData(sd)
+	populateMinimalSessionData(sd)
 	return sd
 }
 
@@ -903,7 +881,7 @@ func (s *Server) makeSessionDataMutatorIterator(
 
 // populateMinimalSessionData populates sd with some minimal values needed for
 // not crashing. Fields of sd that are already set are not overwritten.
-func (s *Server) populateMinimalSessionData(sd *sessiondata.SessionData) {
+func populateMinimalSessionData(sd *sessiondata.SessionData) {
 	if sd.SequenceState == nil {
 		sd.SequenceState = sessiondata.NewSequenceState()
 	}
@@ -1152,9 +1130,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	if ex.hasCreatedTemporarySchema && !ex.server.cfg.TestingKnobs.DisableTempObjectsCleanupOnSessionExit {
 		err := cleanupSessionTempObjects(
 			ctx,
-			ex.server.cfg.Settings,
-			ex.server.cfg.InternalExecutorFactory,
-			ex.server.cfg.DB,
+			ex.server.cfg.InternalDB,
 			ex.server.cfg.Codec,
 			ex.sessionID,
 		)
@@ -1786,7 +1762,7 @@ func (ex *connExecutor) Ctx() context.Context {
 	if _, ok := ex.machine.CurState().(stateNoTxn); ok {
 		ctx = ex.ctxHolder.ctx()
 	}
-	// stateInternalError is used by the InternalExecutor.
+	// stateInternalError is used by the Executor.
 	if _, ok := ex.machine.CurState().(stateInternalError); ok {
 		ctx = ex.ctxHolder.ctx()
 	}
@@ -2446,6 +2422,9 @@ func (ex *connExecutor) execCopyIn(
 		if retErr == nil && !payloadHasError(retPayload) {
 			ex.incrementExecutedStmtCounter(cmd.Stmt)
 		}
+		if p, ok := retPayload.(payloadWithError); ok {
+			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, p.errorCause())
+		}
 		if retErr != nil {
 			log.SqlExec.Errorf(ctx, "error executing %s: %+v", cmd, retErr)
 		}
@@ -2573,9 +2552,10 @@ func (ex *connExecutor) execCopyIn(
 	if copyErr = ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
 		return cm.run(ctx)
 	}); copyErr != nil {
-		// TODO(andrei): We don't have a retriable error story for the copy machine.
+		// TODO(andrei): We don't have a full retriable error story for the copy machine.
 		// When running outside of a txn, the copyMachine should probably do retries
-		// internally. When not, it's unclear what we should do. For now, we abort
+		// internally - this is partially done, see `copyMachine.insertRows`.
+		// When not, it's unclear what we should do. For now, we abort
 		// the txn (if any).
 		// We also don't have a story for distinguishing communication errors (which
 		// should terminate the connection) from query errors. For now, we treat all
@@ -3099,9 +3079,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionStartPostCommitJob, timeutil.Now())
 		if err := ex.server.cfg.JobRegistry.Run(
-			ex.ctxHolder.connCtx,
-			ex.server.cfg.InternalExecutor,
-			*ex.extraTxnState.jobs,
+			ex.ctxHolder.connCtx, *ex.extraTxnState.jobs,
 		); err != nil {
 			handleErr(err)
 		}
@@ -3251,32 +3229,54 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		return sql
 	}
 
-	// We always use base here as the fields from the SessionData should always
-	// be that of the root session.
-	sd := ex.sessionDataStack.Base()
-
-	remoteStr := "<admin>"
-	if sd.RemoteAddr != nil {
-		remoteStr = sd.RemoteAddr.String()
-	}
-	userName := sd.SessionUser().Normalized()
-
 	for id, query := range ex.mu.ActiveQueries {
 		if query.hidden {
 			continue
 		}
-
-		activeQuery, err := query.toActiveQuery(ex.Ctx(), id, ex.sessionID, ex.applicationName, userName, remoteStr, timeNow)
+		// Note: while it may seem tempting to just use query.stmt.AST instead of
+		// re-parsing the original SQL, it's unfortunately NOT SAFE to do so because
+		// the AST is currently not immutable - doing so will produce data races.
+		// See issue https://github.com/cockroachdb/cockroach/issues/90965 for the
+		// last time this was hit.
+		// This can go away if we resolve https://github.com/cockroachdb/cockroach/issues/22847.
+		parsed, err := parser.ParseOne(query.stmt.SQL)
 		if err != nil {
 			// This shouldn't happen, but might as well not completely give up if we
-			// fail to parse a parseable sql for some reason.
-			// We can't just log the SQL as it could contain sensitive information.
-			log.Warningf(ex.Ctx(), "failed to re-parse sql during session serialization")
+			// fail to parse a parseable sql for some reason. We unfortunately can't
+			// just log the SQL either as it could contain sensitive information.
+			log.Warningf(ex.Ctx(), "failed to re-parse sql during session "+
+				"serialization")
 			continue
 		}
-		activeQueries = append(activeQueries, activeQuery)
+		sqlNoConstants := truncateSQL(formatStatementHideConstants(parsed.AST))
+		nPlaceholders := 0
+		if query.placeholders != nil {
+			nPlaceholders = len(query.placeholders.Values)
+		}
+		placeholders := make([]string, nPlaceholders)
+		for i := range placeholders {
+			placeholders[i] = tree.AsStringWithFlags(query.placeholders.Values[i], tree.FmtSimple)
+		}
+		sql := truncateSQL(query.stmt.SQL)
+		progress := math.Float64frombits(atomic.LoadUint64(&query.progressAtomic))
+		queryStart := query.start.UTC()
+		activeQueries = append(activeQueries, serverpb.ActiveQuery{
+			TxnID:          query.txnID,
+			ID:             id.String(),
+			Start:          queryStart,
+			ElapsedTime:    timeNow.Sub(queryStart),
+			Sql:            sql,
+			SqlNoConstants: sqlNoConstants,
+			SqlSummary:     formatStatementSummary(parsed.AST),
+			Placeholders:   placeholders,
+			IsDistributed:  query.isDistributed,
+			Phase:          (serverpb.ActiveQuery_Phase)(query.phase),
+			Progress:       float32(progress),
+			IsFullScan:     query.isFullScan,
+			PlanGist:       query.planGist,
+			Database:       query.database,
+		})
 	}
-
 	lastActiveQuery := ""
 	lastActiveQueryNoConstants := ""
 	if ex.mu.LastActiveQuery != nil {
@@ -3288,6 +3288,15 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		status = serverpb.Session_ACTIVE
 	}
 
+	// We always use base here as the fields from the SessionData should always
+	// be that of the root session.
+	sd := ex.sessionDataStack.Base()
+
+	remoteStr := "<admin>"
+	if sd.RemoteAddr != nil {
+		remoteStr = sd.RemoteAddr.String()
+	}
+
 	txnFingerprintIDs := ex.txnFingerprintIDCache.GetAllTxnFingerprintIDs()
 	sessionActiveTime := ex.totalActiveTimeStopWatch.Elapsed()
 	if startedAt, started := ex.totalActiveTimeStopWatch.LastStartedAt(); started {
@@ -3295,7 +3304,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 	}
 
 	return serverpb.Session{
-		Username:                   userName,
+		Username:                   sd.SessionUser().Normalized(),
 		ClientAddress:              remoteStr,
 		ApplicationName:            ex.applicationName.Load().(string),
 		Start:                      ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionInit).UTC(),
@@ -3369,7 +3378,7 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 		ex.planner.SessionData(),
 		ex.planner.User(),
 		ex.server.cfg,
-		ex.planner.txn,
+		ex.planner.InternalSQLTxn(),
 		ex.extraTxnState.descCollection,
 		ex.planner.EvalContext(),
 		ex.planner.ExtendedEvalContext().Tracing.KVTracingEnabled(),
@@ -3433,6 +3442,13 @@ type StatementCounters struct {
 	// CopyCount counts all COPY statements.
 	CopyCount telemetry.CounterWithMetric
 
+	// CopyNonAtomicCount counts all non-atomic COPY statements (prior to 22.2
+	// non-atomic was the default, in 22.2 COPY became atomic by default
+	// but we want to know if there's customers using the
+	// 'CopyFromAtomicEnabled' session variable to go back to non-atomic
+	// COPYs.
+	CopyNonAtomicCount telemetry.CounterWithMetric
+
 	// DdlCount counts all statements whose StatementReturnType is DDL.
 	DdlCount telemetry.CounterWithMetric
 
@@ -3472,6 +3488,8 @@ func makeStartedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlStarted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyStarted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicStarted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscStarted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3511,6 +3529,8 @@ func makeExecutedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaDdlExecuted, internal)),
 		CopyCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaCopyExecuted, internal)),
+		CopyNonAtomicCount: telemetry.NewCounterWithMetric(
+			getMetricMeta(MetaCopyNonAtomicExecuted, internal)),
 		MiscCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaMiscExecuted, internal)),
 		QueryCount: telemetry.NewCounterWithMetric(
@@ -3561,6 +3581,9 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 		}
 	case *tree.CopyFrom:
 		sc.CopyCount.Inc()
+		if !ex.sessionData().CopyFromAtomicEnabled {
+			sc.CopyNonAtomicCount.Inc()
+		}
 	default:
 		if tree.CanModifySchema(stmt) {
 			sc.DdlCount.Inc()

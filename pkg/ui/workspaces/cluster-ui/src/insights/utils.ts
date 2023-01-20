@@ -9,7 +9,10 @@
 // licenses/APL.txt.
 
 import { limitStringArray, unset } from "src/util";
-import { FlattenedStmtInsights } from "src/api/insightsApi";
+import {
+  ExecutionInsightsRequest,
+  FlattenedStmtInsights,
+} from "src/api/insightsApi";
 import {
   ExecutionDetails,
   FlattenedStmtInsightEvent,
@@ -28,6 +31,7 @@ import {
   TxnInsightEvent,
   WorkloadInsightEventFilters,
 } from "./types";
+import { TimeScale, toDateRange } from "../timeScaleDropdown";
 
 export const filterTransactionInsights = (
   transactions: MergedTxnInsightEvent[] | null,
@@ -58,6 +62,19 @@ export const filterTransactionInsights = (
     });
   } else {
     filteredTransactions = filteredTransactions.filter(txn => !isInternal(txn));
+  }
+  if (filters.workloadInsightType && filters.workloadInsightType.length > 0) {
+    const workloadInsightTypes = filters.workloadInsightType
+      .toString()
+      .split(",");
+
+    filteredTransactions = filteredTransactions.filter(transaction =>
+      workloadInsightTypes.some(workloadType =>
+        transaction.insights.some(
+          txnInsight => workloadType === txnInsight.label,
+        ),
+      ),
+    );
   }
   if (search) {
     search = search.toLowerCase();
@@ -201,6 +218,19 @@ export const filterStatementInsights = (
       stmt => !isInternal(stmt.application),
     );
   }
+  if (filters.workloadInsightType && filters.workloadInsightType.length > 0) {
+    const workloadInsightTypes = filters.workloadInsightType
+      .toString()
+      .split(",");
+
+    filteredStatements = filteredStatements.filter(statement =>
+      workloadInsightTypes.some(workloadType =>
+        statement.insights.some(
+          stmtInsight => workloadType === stmtInsight.label,
+        ),
+      ),
+    );
+  }
   if (search) {
     search = search.toLowerCase();
     filteredStatements = filteredStatements.filter(
@@ -275,7 +305,7 @@ export function getInsightsFromProblemsAndCauses(
 
 /**
  * flattenTxnInsightsToStmts flattens the txn insights array
- * into its stmt insights, including the txn level ifnormation.
+ * into its stmt insights, including the txn level information.
  * Only stmts with non-empty insights array will be included.
  * @param txnInsights array of transaction insights
  * @returns An array of FlattenedStmtInsightEvent where each elem
@@ -287,11 +317,18 @@ export function flattenTxnInsightsToStmts(
 ): FlattenedStmtInsightEvent[] {
   if (!txnInsights?.length) return [];
   const stmtInsights: FlattenedStmtInsightEvent[] = [];
+  const seenExecutions = new Set<string>();
   txnInsights.forEach(txnInsight => {
     const { statementInsights, ...txnInfo } = txnInsight;
     statementInsights?.forEach(stmt => {
-      if (!stmt.insights?.length) return;
+      if (
+        !stmt.insights?.length ||
+        seenExecutions.has(stmt.statementExecutionID)
+      ) {
+        return;
+      }
       stmtInsights.push({ ...txnInfo, ...stmt, query: stmt.query });
+      seenExecutions.add(stmt.statementExecutionID);
     });
   });
   return stmtInsights;
@@ -509,4 +546,15 @@ export function dedupInsights(insights: Insight[]): Insight[] {
     deduped.push(i);
     return deduped;
   }, []);
+}
+
+export function executionInsightsRequestFromTimeScale(
+  ts: TimeScale,
+): ExecutionInsightsRequest {
+  if (ts === null) return {};
+  const [startTime, endTime] = toDateRange(ts);
+  return {
+    start: startTime,
+    end: endTime,
+  };
 }

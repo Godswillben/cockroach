@@ -27,7 +27,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
@@ -60,15 +63,34 @@ type onDemandServer interface {
 	// requests for this server.
 	getHTTPHandlerFn() http.HandlerFunc
 
-	// testingGetSQLAddr retrieves the address of the SQL listener.
-	// Used until the following issue is resolved:
-	// https://github.com/cockroachdb/cockroach/issues/84585
-	testingGetSQLAddr() string
+	// handleCancel processes a SQL async cancel query.
+	handleCancel(ctx context.Context, cancelKey pgwirecancel.BackendKeyData) error
+
+	// serveConn handles an incoming SQL connection.
+	serveConn(ctx context.Context, conn net.Conn, status pgwire.PreServeStatus) error
+
+	// getSQLAddr returns the SQL address for this server.
+	getSQLAddr() string
+
+	// getRPCAddr() returns the RPC address for this server.
+	getRPCAddr() string
+
+	// getTenantID returns the TenantID for this server.
+	getTenantID() roachpb.TenantID
 }
 
 type serverEntry struct {
 	// server is the actual server.
 	server onDemandServer
+
+	// nameContainer holds a shared reference to the current
+	// name of the tenant within this serverEntry. If the
+	// tenant's name is updated, the `Set` method on
+	// nameContainer should be called in order to update
+	// any subscribers within the tenant. These are typically
+	// observability-related features that label data with
+	// the current tenant name.
+	nameContainer *roachpb.TenantNameContainer
 
 	// shouldStop indicates whether shutting down the controller
 	// should cause this server to stop. This is true for all
@@ -79,27 +101,19 @@ type serverEntry struct {
 	shouldStop bool
 }
 
-// newServerFn is the type of a constructor for on-demand server.
-//
-// The value provided for index is guaranteed to be different for each
-// simultaneously running server. This can be used to allocate
-// distinct but predictable network listeners.
-//
-// If the specified tenant name is invalid (tenant does not exist or
-// is not active), the returned error will contain the
-// ErrInvalidTenant mark, which can be checked with errors.Is.
-type newServerFn func(ctx context.Context, tenantName string, index int, deregister func()) (onDemandServer, error)
-
 // serverController manages a fleet of multiple servers side-by-side.
 // They are instantiated on demand the first time they are accessed.
 // Instantiation can fail, e.g. if the target tenant doesn't exist or
 // is not active.
 type serverController struct {
-	// newServerFn instantiates a new server.
-	newServerFn newServerFn
+	// tenantCreator instantiates tenant servers.
+	tenantCreator tenantCreator
 
 	// stopper is the parent stopper.
 	stopper *stop.Stopper
+
+	// st refers to the applicable cluster settings.
+	st *cluster.Settings
 
 	mu struct {
 		syncutil.Mutex
@@ -108,7 +122,7 @@ type serverController struct {
 		//
 		// TODO(knz): Detect when the mapping of name to tenant ID has
 		// changed, and invalidate the entry.
-		servers map[string]serverEntry
+		servers map[roachpb.TenantName]serverEntry
 
 		// nextServerIdx is the index to provide to the next call to
 		// newServerFn.
@@ -116,20 +130,42 @@ type serverController struct {
 	}
 }
 
+// tenantCreator is used by the serverController to instantiate tenant servers.
+type tenantCreator interface {
+	// newTenant instantiates a tenant server.
+	//
+	// The value provided for index is guaranteed to be different for each
+	// simultaneously running server. This can be used to allocate distinct but
+	// predictable network listeners.
+	//
+	// If the specified tenant name is invalid (tenant does not exist or is not
+	// active), the returned error will contain the ErrInvalidTenant mark, which
+	// can be checked with errors.Is.
+	//
+	// testArgs is used by tests to tweak the tenant server.
+	newTenant(ctx context.Context, tenantNameContainer *roachpb.TenantNameContainer, index int, deregister func(),
+		testArgs base.TestSharedProcessTenantArgs,
+	) (onDemandServer, error)
+}
+
 func newServerController(
 	ctx context.Context,
 	parentStopper *stop.Stopper,
-	newServerFn newServerFn,
+	st *cluster.Settings,
+	tenantCreator tenantCreator,
 	systemServer onDemandServer,
+	systemTenantNameContainer *roachpb.TenantNameContainer,
 ) *serverController {
 	c := &serverController{
-		stopper:     parentStopper,
-		newServerFn: newServerFn,
+		st:            st,
+		stopper:       parentStopper,
+		tenantCreator: tenantCreator,
 	}
-	c.mu.servers = map[string]serverEntry{
+	c.mu.servers = map[roachpb.TenantName]serverEntry{
 		catconstants.SystemTenantName: {
-			server:     systemServer,
-			shouldStop: false,
+			server:        systemServer,
+			shouldStop:    false,
+			nameContainer: systemTenantNameContainer,
 		},
 	}
 	parentStopper.AddCloser(c)
@@ -140,12 +176,34 @@ func newServerController(
 // the given tenant name, and instantiates the server if none exists
 // yet.
 func (c *serverController) getOrCreateServer(
-	ctx context.Context, tenantName string,
+	ctx context.Context, tenantName roachpb.TenantName,
 ) (onDemandServer, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if s, ok := c.mu.servers[tenantName]; ok {
 		return s.server, nil
+	}
+	return c.createServerLocked(ctx, tenantName, base.TestSharedProcessTenantArgs{})
+}
+
+// createServer creates a tenant server. An error is returned if a server for
+// the given tenant name already exists.
+func (c *serverController) createServer(
+	ctx context.Context, tenantName roachpb.TenantName, testArgs base.TestSharedProcessTenantArgs,
+) (onDemandServer, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.mu.servers[tenantName]; ok {
+		return nil, errors.Newf("tenant %s already exists", tenantName)
+	}
+	return c.createServerLocked(ctx, tenantName, testArgs)
+}
+
+func (c *serverController) createServerLocked(
+	ctx context.Context, tenantName roachpb.TenantName, testArgs base.TestSharedProcessTenantArgs,
+) (onDemandServer, error) {
+	if _, ok := c.mu.servers[tenantName]; ok {
+		return nil, errors.AssertionFailedf("tenant %s already exists", tenantName)
 	}
 
 	// deregisterFn will remove the server from
@@ -159,13 +217,15 @@ func (c *serverController) getOrCreateServer(
 	// Server does not exist yet: instantiate and start it.
 	c.mu.nextServerIdx++
 	idx := c.mu.nextServerIdx
-	s, err := c.newServerFn(ctx, tenantName, idx, deregisterFn)
+	nameContainer := roachpb.NewTenantNameContainer(tenantName)
+	s, err := c.tenantCreator.newTenant(ctx, nameContainer, idx, deregisterFn, testArgs)
 	if err != nil {
 		return nil, err
 	}
 	c.mu.servers[tenantName] = serverEntry{
-		server:     s,
-		shouldStop: true,
+		server:        s,
+		shouldStop:    true,
+		nameContainer: nameContainer,
 	}
 	return s, nil
 }
@@ -179,17 +239,19 @@ func (c *serverController) Close() {
 	// on the map.
 	servers := c.getServers()
 	for _, s := range servers {
-		s.stop(context.Background())
+		if s.shouldStop {
+			s.server.stop(context.Background())
+		}
 	}
 }
 
-func (c *serverController) getServers() (res []onDemandServer) {
+// getServers retrieves all the currently instantiated in-memory
+// servers.
+func (c *serverController) getServers() (res []serverEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, e := range c.mu.servers {
-		if e.shouldStop {
-			res = append(res, e.server)
-		}
+		res = append(res, e)
 	}
 	return res
 }
@@ -197,26 +259,35 @@ func (c *serverController) getServers() (res []onDemandServer) {
 // TenantSelectHeader is the HTTP header used to select a particular tenant.
 const TenantSelectHeader = `X-Cockroach-Tenant`
 
+// TenantNameParamInQueryURL is the HTTP query URL parameter used to select a particular tenant.
+const TenantNameParamInQueryURL = "tenant_name"
+
 // TenantSelectCookieName is the name of the HTTP cookie used to select a particular tenant,
 // if the custom header is not specified.
 const TenantSelectCookieName = `tenant`
+
+// DefaultTenantSelectSettingName is the name of the setting that
+// configures the default tenant to use when a client does not specify
+// a specific tenant.
+var DefaultTenantSelectSettingName = "server.controller.default_tenant"
+
+var defaultTenantSelect = settings.RegisterStringSetting(
+	settings.SystemOnly,
+	DefaultTenantSelectSettingName,
+	"name of the tenant to use to serve requests when clients don't specify a tenant",
+	catconstants.SystemTenantName,
+).WithPublic()
 
 // httpMux redirects incoming HTTP requests to the server selected by
 // the special HTTP request header.
 // If no tenant is specified, the default tenant is used.
 func (c *serverController) httpMux(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantName, nameProvided := getTenantNameFromHTTPRequest(r)
-	s, err := c.getOrCreateServer(ctx, tenantName)
-	if err != nil {
-		log.Warningf(ctx, "unable to start server for tenant %q: %v", tenantName, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	tenantName, nameProvided := getTenantNameFromHTTPRequest(c.st, r)
 	// if the client didnt specify tenant name call these for login/logout.
 	if !nameProvided {
 		switch r.URL.Path {
-		case loginPath:
+		case loginPath, DemoLoginPath:
 			c.attemptLoginToAllTenants().ServeHTTP(w, r)
 			return
 		case logoutPath:
@@ -224,35 +295,54 @@ func (c *serverController) httpMux(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s, err := c.getOrCreateServer(ctx, tenantName)
+	if err != nil {
+		log.Warningf(ctx, "unable to start server for tenant %q: %v", tenantName, err)
+		// Clear session and tenant cookies after all logouts have completed.
+		http.SetCookie(w, &http.Cookie{
+			Name:     MultitenantSessionCookieName,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			Expires:  timeutil.Unix(0, 0),
+		})
+		http.SetCookie(w, &http.Cookie{
+			Name:     TenantSelectCookieName,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: false,
+			Expires:  timeutil.Unix(0, 0),
+		})
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	s.getHTTPHandlerFn()(w, r)
 }
 
-func getTenantNameFromHTTPRequest(r *http.Request) (string, bool) {
+func getTenantNameFromHTTPRequest(
+	st *cluster.Settings, r *http.Request,
+) (roachpb.TenantName, bool) {
 	// Highest priority is manual override on the URL query parameters.
-	const tenantNameParamInQueryURL = "tenant_name"
-	if tenantName := r.URL.Query().Get(tenantNameParamInQueryURL); tenantName != "" {
-		return tenantName, true
+	if tenantName := r.URL.Query().Get(TenantNameParamInQueryURL); tenantName != "" {
+		return roachpb.TenantName(tenantName), true
 	}
 
 	// If not in parameters, try an explicit header.
 	if tenantName := r.Header.Get(TenantSelectHeader); tenantName != "" {
-		return tenantName, true
+		return roachpb.TenantName(tenantName), true
 	}
 
 	// No parameter, no explicit header. Is there a cookie?
 	if c, _ := r.Cookie(TenantSelectCookieName); c != nil && c.Value != "" {
-		return c.Value, true
+		return roachpb.TenantName(c.Value), true
 	}
 
-	// No luck so far.
-	//
-	// TODO(knz): Make the default tenant route for HTTP configurable.
-	// See: https://github.com/cockroachdb/cockroach/issues/91741
-	return catconstants.SystemTenantName, false
+	// No luck so far. Use the configured default.
+	return roachpb.TenantName(defaultTenantSelect.Get(&st.SV)), false
 }
 
-func (c *serverController) getCurrentTenantNames() []string {
-	var serverNames []string
+func (c *serverController) getCurrentTenantNames() []roachpb.TenantName {
+	var serverNames []roachpb.TenantName
 	c.mu.Lock()
 	for name := range c.mu.servers {
 		serverNames = append(serverNames, name)
@@ -261,10 +351,10 @@ func (c *serverController) getCurrentTenantNames() []string {
 	return serverNames
 }
 
-func getSessionFromCookie(sessionStr string, name string) string {
+func getSessionFromCookie(sessionStr string, name roachpb.TenantName) string {
 	sessionsInfo := strings.Split(sessionStr, ",")
 	for idx, info := range sessionsInfo {
-		if info == name && idx != 0 {
+		if info == string(name) && idx != 0 {
 			return sessionsInfo[idx-1]
 		}
 	}
@@ -311,7 +401,7 @@ func (c *serverController) attemptLoginToAllTenants() http.Handler {
 				log.Warningf(ctx, "unable to find session cookie for tenant %q", name)
 			} else {
 				tenantNameToSetCookieSlice = append(tenantNameToSetCookieSlice, sessionCookieValue{
-					name:      name,
+					name:      string(name),
 					setCookie: setCookieHeader,
 				})
 			}
@@ -329,11 +419,10 @@ func (c *serverController) attemptLoginToAllTenants() http.Handler {
 			}
 			http.SetCookie(w, &cookie)
 			// The tenant cookie needs to be set at some point in order for
-			// the dropdown to have a current selection on first load. Subject to change
-			// once this issue is resolved: https://github.com/cockroachdb/cockroach/issues/91741.
+			// the dropdown to have a current selection on first load.
 			cookie = http.Cookie{
 				Name:     TenantSelectCookieName,
-				Value:    catconstants.SystemTenantName,
+				Value:    defaultTenantSelect.Get(&c.st.SV),
 				Path:     "/",
 				HttpOnly: false,
 			}
@@ -432,14 +521,79 @@ func (c *serverController) attemptLogoutFromAllTenants() http.Handler {
 	})
 }
 
-// TestingGetSQLAddrForTenant extracts the SQL address for the target tenant.
-// Used in tests until https://github.com/cockroachdb/cockroach/issues/84585 is resolved.
-func (s *Server) TestingGetSQLAddrForTenant(ctx context.Context, tenant string) string {
-	ts, err := s.serverController.getOrCreateServer(ctx, tenant)
-	if err != nil {
-		panic(err)
+// sqlMux redirects incoming SQL connections to the server selected
+// by the client-provided SQL parameters.
+// If no tenant is specifeid, the default tenant is used.
+func (c *serverController) sqlMux(
+	ctx context.Context, conn net.Conn, status pgwire.PreServeStatus,
+) error {
+	switch status.State {
+	case pgwire.PreServeCancel:
+		// Cancel requests do not contain enough data for routing; we
+		// simply broadcast them to all servers. One of the servers will
+		// pick it up.
+		servers := c.getServers()
+		errCh := make(chan error, len(servers))
+		for i := range servers {
+			s := servers[i]
+			// We dispatch the request concurrently to all the servers.
+			//
+			// This concurrency is needed for UX. If there is more than 1
+			// server, even if one server accepts the cancel request, at
+			// least another will fail the cancel request and wait. If we
+			// dispatch sequentially, and the server that fails is called
+			// before the one that succeeds in the sequence, the client
+			// would need to wait that extra delay to see their query
+			// effectively cancelled. We don't want this extra wait for UX.
+			//
+			// The concurrent dispatch gives a chance to the succeeding
+			// servers to see and process the cancel at approximately the
+			// same time as every other.
+			if err := c.stopper.RunAsyncTask(ctx, "cancel", func(ctx context.Context) {
+				errCh <- s.server.handleCancel(ctx, status.CancelKey)
+			}); err != nil {
+				return err
+			}
+		}
+		// Wait for the cancellation to be processed.
+		return c.stopper.RunAsyncTask(ctx, "wait-cancel", func(ctx context.Context) {
+			var err error
+			sawSuccess := false
+			for i := 0; i < len(servers); i++ {
+				select {
+				case thisErr := <-errCh:
+					err = errors.CombineErrors(err, thisErr)
+					sawSuccess = sawSuccess || thisErr == nil
+				case <-c.stopper.ShouldQuiesce():
+					return
+				}
+			}
+			if !sawSuccess {
+				// We don't want to log a warning if cancellation has succeeded.
+				log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %+v", err)
+			}
+		})
+
+	case pgwire.PreServeReady:
+		tenantName := status.GetTenantName()
+		if tenantName == "" {
+			tenantName = defaultTenantSelect.Get(&c.st.SV)
+		}
+
+		s, err := c.getOrCreateServer(ctx, roachpb.TenantName(tenantName))
+		if err != nil {
+			log.Warningf(ctx, "unable to start server for tenant %q: %v", tenantName, err)
+			// TODO(knz): we might want to send a pg error to the client here.
+			// See: https://github.com/cockroachdb/cockroach/issues/92525
+			_ = conn.Close()
+			return err
+		}
+
+		return s.serveConn(ctx, conn, status)
+
+	default:
+		return errors.AssertionFailedf("programming error: missing case %v", status.State)
 	}
-	return ts.testingGetSQLAddr()
 }
 
 type errInvalidTenantMarker struct{}
@@ -453,15 +607,9 @@ func (errInvalidTenantMarker) Error() string { return "invalid tenant" }
 // not exist or it is not currently active.
 var ErrInvalidTenant error = errInvalidTenantMarker{}
 
-// newServerForTenant is a constructor function suitable for use with
-// newTenantController. It instantiates SQL servers for secondary
-// tenants.
-// If the specified tenant name is invalid (tenant does not exist or
-// is not active), the returned error will contain the
-// ErrInvalidTenant mark, which can be checked with errors.Is.
-func (s *Server) newServerForTenant(
-	ctx context.Context, tenantName string, index int, deregister func(),
-) (onDemandServer, error) {
+func (s *Server) getTenantID(
+	ctx context.Context, tenantName roachpb.TenantName,
+) (roachpb.TenantID, error) {
 	// Look up the ID of the requested tenant.
 	//
 	// TODO(knz): use a flag or capability to decide whether to start in-memory.
@@ -469,26 +617,49 @@ func (s *Server) newServerForTenant(
 	datums, err := ie.QueryRow(ctx, "get-tenant-id", nil, /* txn */
 		`SELECT id, active FROM system.tenants WHERE name = $1 LIMIT 1`, tenantName)
 	if err != nil {
-		return nil, err
+		return roachpb.TenantID{}, err
 	}
 	if datums == nil {
-		return nil, errors.Mark(errors.Newf("no tenant found with name %q", tenantName), ErrInvalidTenant)
+		return roachpb.TenantID{}, errors.Mark(errors.Newf("no tenant found with name %q", tenantName), ErrInvalidTenant)
 	}
 
 	tenantIDi := uint64(tree.MustBeDInt(datums[0]))
 	isActive := tree.MustBeDBool(datums[1])
 	if !isActive {
-		return nil, errors.Mark(errors.Newf("tenant %q is not active", tenantName), ErrInvalidTenant)
+		return roachpb.TenantID{}, errors.Mark(errors.Newf("tenant %q is not active", tenantName), ErrInvalidTenant)
 	}
 	tenantID, err := roachpb.MakeTenantID(tenantIDi)
 	if err != nil {
-		return nil, errors.Mark(
+		return roachpb.TenantID{}, errors.Mark(
 			errors.NewAssertionErrorWithWrappedErrf(err, "stored tenant ID %d does not convert to TenantID", tenantIDi),
 			ErrInvalidTenant)
 	}
+	return tenantID, nil
+}
 
-	// Start the tenant server.
-	tenantStopper, tenantServer, err := s.startInMemoryTenantServerInternal(ctx, tenantID, index)
+var _ tenantCreator = &Server{}
+
+// newTenant implements the tenantCreator interface.
+func (s *Server) newTenant(
+	ctx context.Context,
+	tenantNameContainer *roachpb.TenantNameContainer,
+	index int,
+	deregister func(),
+	testArgs base.TestSharedProcessTenantArgs,
+) (onDemandServer, error) {
+	tenantID, err := s.getTenantID(ctx, tenantNameContainer.Get())
+	if err != nil {
+		return nil, err
+	}
+	tenantStopper, baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, index)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply the TestTenantArgs, if any.
+	baseCfg.TestingKnobs = testArgs.Knobs
+
+	tenantServer, err := s.startInMemoryTenantServerInternal(ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer)
 	if err != nil {
 		// Abandon any work done so far.
 		tenantStopper.Stop(ctx)
@@ -517,8 +688,32 @@ func (t *tenantServerWrapper) getHTTPHandlerFn() http.HandlerFunc {
 	return t.server.http.baseHandler
 }
 
-func (t *tenantServerWrapper) testingGetSQLAddr() string {
-	return t.server.sqlServer.cfg.SQLAddr
+func (t *tenantServerWrapper) handleCancel(
+	ctx context.Context, cancelKey pgwirecancel.BackendKeyData,
+) error {
+	pgCtx := t.server.sqlServer.AnnotateCtx(context.Background())
+	pgCtx = logtags.AddTags(pgCtx, logtags.FromContext(ctx))
+	return t.server.sqlServer.pgServer.HandleCancel(pgCtx, cancelKey)
+}
+
+func (t *tenantServerWrapper) serveConn(
+	ctx context.Context, conn net.Conn, status pgwire.PreServeStatus,
+) error {
+	pgCtx := t.server.sqlServer.AnnotateCtx(context.Background())
+	pgCtx = logtags.AddTags(pgCtx, logtags.FromContext(ctx))
+	return t.server.sqlServer.pgServer.ServeConn(pgCtx, conn, status)
+}
+
+func (t *tenantServerWrapper) getSQLAddr() string {
+	return t.server.sqlServer.cfg.SQLAdvertiseAddr
+}
+
+func (t *tenantServerWrapper) getRPCAddr() string {
+	return t.server.sqlServer.cfg.AdvertiseAddr
+}
+
+func (t *tenantServerWrapper) getTenantID() roachpb.TenantID {
+	return t.server.sqlCfg.TenantID
 }
 
 // systemServerWrapper implements the onDemandServer interface for Server.
@@ -544,32 +739,76 @@ func (t *systemServerWrapper) getHTTPHandlerFn() http.HandlerFunc {
 	return t.server.http.baseHandler
 }
 
-func (t *systemServerWrapper) testingGetSQLAddr() string {
-	return t.server.cfg.SQLAddr
+func (t *systemServerWrapper) handleCancel(
+	ctx context.Context, cancelKey pgwirecancel.BackendKeyData,
+) error {
+	pgCtx := t.server.sqlServer.AnnotateCtx(context.Background())
+	pgCtx = logtags.AddTags(pgCtx, logtags.FromContext(ctx))
+	return t.server.sqlServer.pgServer.HandleCancel(pgCtx, cancelKey)
 }
 
-// startInMemoryTenantServerInternal starts an in-memory server for
-// the given target tenant ID. The resulting stopper should be closed
-// in any case, even when an error is returned.
-//
-// The value provided for index is guaranteed to be different for each
-// simultaneously running server. This can be used to allocate
-// distinct but predictable network listeners.
-func (s *Server) startInMemoryTenantServerInternal(
+func (t *systemServerWrapper) serveConn(
+	ctx context.Context, conn net.Conn, status pgwire.PreServeStatus,
+) error {
+	pgCtx := t.server.sqlServer.AnnotateCtx(context.Background())
+	pgCtx = logtags.AddTags(pgCtx, logtags.FromContext(ctx))
+	return t.server.sqlServer.pgServer.ServeConn(pgCtx, conn, status)
+}
+
+func (s *systemServerWrapper) getSQLAddr() string {
+	return s.server.sqlServer.cfg.SQLAdvertiseAddr
+}
+
+func (s *systemServerWrapper) getRPCAddr() string {
+	return s.server.sqlServer.cfg.AdvertiseAddr
+}
+
+func (s *systemServerWrapper) getTenantID() roachpb.TenantID {
+	return s.server.cfg.TenantID
+}
+
+func (s *Server) makeSharedProcessTenantConfig(
 	ctx context.Context, tenantID roachpb.TenantID, index int,
-) (stopper *stop.Stopper, tenantServer *SQLServerWrapper, err error) {
-	stopper = stop.NewStopper()
+) (*stop.Stopper, BaseConfig, SQLConfig, error) {
+	stopper := stop.NewStopper()
+	defer func() {
+		if stopper != nil {
+			stopper.Stop(ctx)
+		}
+	}()
 
 	// Create a configuration for the new tenant.
 	// TODO(knz): Maybe enforce the SQL Instance ID to be equal to the KV node ID?
 	// See: https://github.com/cockroachdb/cockroach/issues/84602
 	parentCfg := s.cfg
-	baseCfg, sqlCfg, err := makeInMemoryTenantServerConfig(ctx, tenantID, index, parentCfg, stopper)
-	if err != nil {
-		return stopper, nil, err
+	localServerInfo := LocalKVServerInfo{
+		InternalServer:     s.node,
+		ServerInterceptors: s.grpc.serverInterceptorsInfo,
 	}
+	baseCfg, sqlCfg, err := makeInMemoryTenantServerConfig(ctx, tenantID, index, parentCfg, localServerInfo, stopper)
+	if err != nil {
+		return nil, BaseConfig{}, SQLConfig{}, err
+	}
+	st := stopper
+	stopper = nil // inhibit the deferred Stop()
+	return st, baseCfg, sqlCfg, nil
+}
 
-	// Create a child stopper for this tenant's server.
+// startInMemoryTenantServerInternal starts an in-memory server for
+// the given target tenant ID.
+//
+// The value provided needs to be different for each simultaneously running
+// server; it is used to allocate distinct but predictable network ports.
+//
+// Note that even if an error is returned, tasks might have been started with
+// the stopper, so the caller needs to Stop() it.
+func (s *Server) startInMemoryTenantServerInternal(
+	ctx context.Context,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	stopper *stop.Stopper,
+	tenantNameContainer *roachpb.TenantNameContainer,
+) (*SQLServerWrapper, error) {
 	ambientCtx := baseCfg.AmbientCtx
 	stopper.SetTracer(baseCfg.Tracer)
 
@@ -581,9 +820,9 @@ func (s *Server) startInMemoryTenantServerInternal(
 	log.Infof(startCtx, "starting tenant server")
 
 	// Now start the tenant proper.
-	tenantServer, err = NewTenantServer(startCtx, stopper, baseCfg, sqlCfg)
+	tenantServer, err := NewTenantServer(startCtx, stopper, baseCfg, sqlCfg, s.recorder, tenantNameContainer)
 	if err != nil {
-		return stopper, tenantServer, err
+		return nil, err
 	}
 
 	// Start a goroutine that watches for shutdown requests issued by
@@ -595,23 +834,23 @@ func (s *Server) startInMemoryTenantServerInternal(
 		case req := <-tenantServer.ShutdownRequested():
 			log.Warningf(startCtx,
 				"in-memory server for tenant %v is requesting shutdown: %d %v",
-				tenantID, req.Reason, req.ShutdownCause())
+				sqlCfg.TenantID, req.Reason, req.ShutdownCause())
 			stopper.Stop(startCtx)
 		case <-stopper.ShouldQuiesce():
 		}
 	}()
 
 	if err := tenantServer.Start(startCtx); err != nil {
-		return stopper, tenantServer, err
+		return tenantServer, err
 	}
 
 	// Show the tenant details in logs.
 	// TODO(knz): Remove this once we can use a single listener.
 	if err := reportTenantInfo(startCtx, baseCfg, sqlCfg); err != nil {
-		return stopper, tenantServer, err
+		return tenantServer, err
 	}
 
-	return stopper, tenantServer, nil
+	return tenantServer, nil
 }
 
 func makeInMemoryTenantServerConfig(
@@ -619,6 +858,7 @@ func makeInMemoryTenantServerConfig(
 	tenantID roachpb.TenantID,
 	index int,
 	kvServerCfg Config,
+	kvServerInfo LocalKVServerInfo,
 	stopper *stop.Stopper,
 ) (baseCfg BaseConfig, sqlCfg SQLConfig, err error) {
 	st := cluster.MakeClusterSettings()
@@ -637,26 +877,35 @@ func makeInMemoryTenantServerConfig(
 
 	tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
 
-	// Find a suitable store directory.
-	tenantDir := "tenant-" + tenantID.String()
-	storeDir := ""
+	// Define a tenant store. This will be used to write the
+	// listener addresses.
+	//
+	// First, determine if there's a disk store or whether we will
+	// use an in-memory store.
+	candidateSpec := kvServerCfg.Stores.Specs[0]
 	for _, storeSpec := range kvServerCfg.Stores.Specs {
 		if storeSpec.InMemory {
 			continue
 		}
-		storeDir = filepath.Join(storeSpec.Path, tenantDir)
+		candidateSpec = storeSpec
 		break
 	}
-	if storeDir == "" {
-		storeDir = tenantDir
-	}
-	if err := os.MkdirAll(storeDir, 0700); err != nil {
-		return baseCfg, sqlCfg, err
-	}
-
-	storeSpec, err := base.NewStoreSpec(storeDir)
-	if err != nil {
-		return baseCfg, sqlCfg, errors.Wrap(err, "cannot create store spec")
+	// Then construct a spec. The logic above either selected an
+	// in-memory store (e.g. in tests) or the first on-disk store. In
+	// the on-disk case, we reuse the original spec; this propagates
+	// all the common store parameters.
+	storeSpec := candidateSpec
+	if !storeSpec.InMemory {
+		storeDir := filepath.Join(storeSpec.Path, "tenant-"+tenantID.String())
+		if err := os.MkdirAll(storeDir, 0700); err != nil {
+			return baseCfg, sqlCfg, err
+		}
+		stopper.AddCloser(stop.CloserFn(func() {
+			if err := os.RemoveAll(storeDir); err != nil {
+				log.Warningf(context.Background(), "unable to delete tenant directory: %v", err)
+			}
+		}))
+		storeSpec.Path = storeDir
 	}
 	baseCfg = MakeBaseConfig(st, tr, storeSpec)
 
@@ -679,16 +928,12 @@ func makeInMemoryTenantServerConfig(
 	baseCfg.EnableDemoLoginEndpoint = kvServerCfg.BaseConfig.EnableDemoLoginEndpoint
 
 	// TODO(knz): use a single network interface for all tenant servers.
-	// See: https://github.com/cockroachdb/cockroach/issues/84585
+	// See: https://github.com/cockroachdb/cockroach/issues/92524
 	portOffset := kvServerCfg.Config.SecondaryTenantPortOffset
-	var err1, err2, err3, err4 error
+	var err1, err2 error
 	baseCfg.Addr, err1 = rederivePort(index, kvServerCfg.Config.Addr, "", portOffset)
 	baseCfg.AdvertiseAddr, err2 = rederivePort(index, kvServerCfg.Config.AdvertiseAddr, baseCfg.Addr, portOffset)
-	baseCfg.SQLAddr, err3 = rederivePort(index, kvServerCfg.Config.SQLAddr, "", portOffset)
-	baseCfg.SQLAdvertiseAddr, err4 = rederivePort(index, kvServerCfg.Config.SQLAdvertiseAddr, baseCfg.SQLAddr, portOffset)
-	if err := errors.CombineErrors(err1,
-		errors.CombineErrors(err2,
-			errors.CombineErrors(err3, err4))); err != nil {
+	if err := errors.CombineErrors(err1, err2); err != nil {
 		return baseCfg, sqlCfg, err
 	}
 
@@ -698,11 +943,16 @@ func makeInMemoryTenantServerConfig(
 	baseCfg.HTTPAddr = kvServerCfg.Config.HTTPAddr
 	baseCfg.HTTPAdvertiseAddr = kvServerCfg.Config.HTTPAdvertiseAddr
 
+	// The parent server will route SQL connections to us.
+	baseCfg.DisableSQLListener = true
+	baseCfg.SplitListenSQL = true
+	// Nevertheless, we like to know our own HTTP address.
+	baseCfg.SQLAddr = kvServerCfg.Config.SQLAddr
+	baseCfg.SQLAdvertiseAddr = kvServerCfg.Config.SQLAdvertiseAddr
+
 	// Define the unix socket intelligently.
 	// See: https://github.com/cockroachdb/cockroach/issues/84585
 	baseCfg.SocketFile = ""
-
-	baseCfg.SplitListenSQL = false
 
 	// TODO(knz): Make the TLS config separate per tenant.
 	// See https://cockroachlabs.atlassian.net/browse/CRDB-14539.
@@ -750,6 +1000,8 @@ func makeInMemoryTenantServerConfig(
 	sqlCfg.MemoryPoolSize = kvServerCfg.SQLConfig.MemoryPoolSize
 	sqlCfg.TableStatCacheSize = kvServerCfg.SQLConfig.TableStatCacheSize
 	sqlCfg.QueryCacheSize = kvServerCfg.SQLConfig.QueryCacheSize
+
+	sqlCfg.LocalKVServerInfo = &kvServerInfo
 
 	return baseCfg, sqlCfg, nil
 }

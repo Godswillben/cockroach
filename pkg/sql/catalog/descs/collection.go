@@ -25,18 +25,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesccache"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,6 +48,9 @@ import (
 // collection is cleared using ReleaseAll() which is called at the
 // end of each transaction on the session, or on hitting conditions such
 // as errors, or retries that result in transaction timestamp changes.
+//
+// TODO(ajwerner): Remove the txn argument from the Collection by more tightly
+// binding a collection to a *kv.Txn.
 type Collection struct {
 
 	// settings dictate whether we validate descriptors on write.
@@ -115,7 +118,7 @@ type Collection struct {
 
 	// hydrated is node-level cache of table descriptors which utilize
 	// user-defined types.
-	hydrated *hydrateddesc.Cache
+	hydrated *hydrateddesccache.Cache
 
 	// skipValidationOnWrite should only be set to true during forced descriptor
 	// repairs.
@@ -134,6 +137,15 @@ type Collection struct {
 	// It must be set in the multi-tenant environment for ephemeral
 	// SQL pods. It should not be set otherwise.
 	sqlLivenessSession sqlliveness.Session
+}
+
+// FromTxn is a convenience function to extract a descs.Collection which is
+// being interface-smuggled through an isql.Txn. It may return nil.
+func FromTxn(txn isql.Txn) *Collection {
+	if g, ok := txn.(Txn); ok {
+		return g.Descriptors()
+	}
+	return nil
 }
 
 // GetDeletedDescs returns the deleted descriptors of the collection.
@@ -202,6 +214,12 @@ func (tc *Collection) HasUncommittedTables() (has bool) {
 		return nil
 	})
 	return has
+}
+
+// HasUncommittedDescriptors returns true if the collection contains any
+// uncommitted descriptors.
+func (tc *Collection) HasUncommittedDescriptors() bool {
+	return tc.uncommitted.uncommitted.Len() > 0
 }
 
 // HasUncommittedTypes returns true if the Collection contains uncommitted
@@ -1183,14 +1201,14 @@ func MakeTestCollection(ctx context.Context, leaseManager *lease.Manager) Collec
 }
 
 // InternalExecFn is the type of functions that operates using an internalExecutor.
-type InternalExecFn func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor, descriptors *Collection) error
+type InternalExecFn func(ctx context.Context, txn isql.Txn, descriptors *Collection) error
 
 // HistoricalInternalExecTxnRunnerFn callback for executing with the internal executor
 // at a fixed timestamp.
 type HistoricalInternalExecTxnRunnerFn = func(ctx context.Context, fn InternalExecFn) error
 
 // HistoricalInternalExecTxnRunner is like historicalTxnRunner except it only
-// passes the fn the exported InternalExecutor instead of the whole unexported
+// passes the fn the exported Executor instead of the whole unexported
 // extendedEvalContext, so it can be implemented outside pkg/sql.
 type HistoricalInternalExecTxnRunner interface {
 	// Exec executes the callback at a given timestamp.

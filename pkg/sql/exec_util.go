@@ -17,15 +17,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"math"
 	"net"
 	"net/url"
 	"reflect"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -70,6 +67,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob/gcjobnotifier"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
@@ -80,7 +78,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
-	"github.com/cockroachdb/cockroach/pkg/sql/recent"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
@@ -103,6 +100,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -202,19 +200,34 @@ var allowCrossDatabaseSeqReferences = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-// SecondaryTenantsZoneConfigsEnabledSettingName controls if secondary tenants
-// are allowed to set zone configurations. It has no effect for the system
-// tenant.
-const SecondaryTenantsZoneConfigsEnabledSettingName = "sql.zone_configs.allow_for_secondary_tenant.enabled"
-
 // SecondaryTenantZoneConfigsEnabled controls if secondary tenants are allowed
 // to set zone configurations. It has no effect for the system tenant.
 //
 // This setting has no effect on zone configurations that have already been set.
 var SecondaryTenantZoneConfigsEnabled = settings.RegisterBoolSetting(
 	settings.TenantReadOnly,
-	SecondaryTenantsZoneConfigsEnabledSettingName,
+	"sql.zone_configs.allow_for_secondary_tenant.enabled",
 	"allow secondary tenants to set zone configurations; does not affect the system tenant",
+	false,
+)
+
+// SecondaryTenantSplitAtEnabled controls if secondary tenants are allowed to
+// run ALTER TABLE/INDEX ... SPLIT AT statements. It has no effect for the
+// system tenant.
+var SecondaryTenantSplitAtEnabled = settings.RegisterBoolSetting(
+	settings.TenantReadOnly,
+	"sql.split_at.allow_for_secondary_tenant.enabled",
+	"allow secondary tenants to run ALTER TABLE/INDEX ... SPLIT AT commands; does not affect the system tenant",
+	false,
+)
+
+// SecondaryTenantScatterEnabled controls if secondary tenants are allowed to
+// run ALTER TABLE/INDEX ... SCATTER statements. It has no effect for the
+// system tenant.
+var SecondaryTenantScatterEnabled = settings.RegisterBoolSetting(
+	settings.TenantReadOnly,
+	"sql.scatter.allow_for_secondary_tenant.enabled",
+	"allow secondary tenants to run ALTER TABLE/INDEX ... SCATTER commands; does not affect the system tenant",
 	false,
 )
 
@@ -922,6 +935,12 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaCopyNonAtomicStarted = metric.Metadata{
+		Name:        "sql.copy.nonatomic.started.count",
+		Help:        "Number of non-atomic COPY SQL statements started",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaMiscStarted = metric.Metadata{
 		Name:        "sql.misc.started.count",
 		Help:        "Number of other SQL statements started",
@@ -1023,6 +1042,12 @@ var (
 	MetaCopyExecuted = metric.Metadata{
 		Name:        "sql.copy.count",
 		Help:        "Number of COPY SQL statements successfully executed",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaCopyNonAtomicExecuted = metric.Metadata{
+		Name:        "sql.copy.nonatomic.count",
+		Help:        "Number of non-atomic COPY SQL statements successfully executed",
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -1180,20 +1205,18 @@ type ExecutorConfig struct {
 	NodesStatusServer serverpb.OptionalNodesStatusServer
 	// SQLStatusServer gives access to a subset of the Status service and is
 	// available when not running as a system tenant.
-	SQLStatusServer       serverpb.SQLStatusServer
-	TenantStatusServer    serverpb.TenantStatusServer
-	MetricsRecorder       nodeStatusGenerator
-	SessionRegistry       *SessionRegistry
-	ClosedSessionCache    *ClosedSessionCache
-	RecentStatementsCache *recent.StatementsCache
-	SQLLiveness           sqlliveness.Liveness
-	JobRegistry           *jobs.Registry
-	VirtualSchemas        *VirtualSchemaHolder
-	DistSQLPlanner        *DistSQLPlanner
-	TableStatsCache       *stats.TableStatisticsCache
-	StatsRefresher        *stats.Refresher
-	InternalExecutor      *InternalExecutor
-	QueryCache            *querycache.C
+	SQLStatusServer    serverpb.SQLStatusServer
+	TenantStatusServer serverpb.TenantStatusServer
+	MetricsRecorder    nodeStatusGenerator
+	SessionRegistry    *SessionRegistry
+	ClosedSessionCache *ClosedSessionCache
+	SQLLiveness        sqlliveness.Liveness
+	JobRegistry        *jobs.Registry
+	VirtualSchemas     *VirtualSchemaHolder
+	DistSQLPlanner     *DistSQLPlanner
+	TableStatsCache    *stats.TableStatisticsCache
+	StatsRefresher     *stats.Refresher
+	QueryCache         *querycache.C
 
 	SchemaChangerMetrics *SchemaChangerMetrics
 	FeatureFlagMetrics   *featureflag.DenialMetrics
@@ -1324,9 +1347,9 @@ type ExecutorConfig struct {
 	// records.
 	SpanConfigKVAccessor spanconfig.KVAccessor
 
-	// InternalExecutorFactory is used to create an InternalExecutor bound with
-	// SessionData and other ExtraTxnState.
-	InternalExecutorFactory descs.TxnManager
+	// InternalDB is used to create an isql.Executor bound with SessionData and
+	// other ExtraTxnState.
+	InternalDB *InternalDB
 
 	// ConsistencyChecker is to generate the results in calls to
 	// crdb_internal.check_consistency.
@@ -1385,6 +1408,11 @@ func (cfg *ExecutorConfig) GetFeatureFlagMetrics() *featureflag.DenialMetrics {
 // SV returns the setting values.
 func (cfg *ExecutorConfig) SV() *settings.Values {
 	return &cfg.Settings.SV
+}
+
+func (cfg *ExecutorConfig) JobsKnobs() *jobs.TestingKnobs {
+	knobs, _ := cfg.DistSQLSrv.TestingKnobs.JobsTestingKnobs.(*jobs.TestingKnobs)
+	return knobs
 }
 
 var _ base.ModuleTestingKnobs = &ExecutorTestingKnobs{}
@@ -1514,6 +1542,9 @@ type ExecutorTestingKnobs struct {
 	// to use a transaction, and, in doing so, more deterministically allocate
 	// descriptor IDs at the cost of decreased parallelism.
 	UseTransactionalDescIDGenerator bool
+
+	// BeforeCopyFromInsert, if set, will be called during a COPY FROM insert statement.
+	BeforeCopyFromInsert func() error
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -1548,12 +1579,8 @@ type TenantTestingKnobs struct {
 	// can optionally forward requests to the real provider).
 	OverrideTokenBucketProvider func(origProvider kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider
 
-	// AllowSplitAndScatter, if set, allows secondary tenants to execute ALTER
-	// TABLE ... SPLIT AT and SCATTER SQL commands.
-	AllowSplitAndScatter bool
-
 	// SkipSQLSystemTentantCheck is a temporary knob to test which admin functions fail for secondary tenants.
-	// TODO(ewall): Remove when https://github.com/cockroachdb/cockroach/issues/91434 is fixed.
+	// TODO(ewall): Remove when usages in multitenant_admin_function_test.go are removed.
 	SkipSQLSystemTentantCheck bool
 
 	// BeforeCheckingForDescriptorIDSequence, if set, is called before
@@ -1643,6 +1670,10 @@ type StreamingTestingKnobs struct {
 	// frontier specs generated for the replication job.
 	AfterReplicationFlowPlan func([]*execinfrapb.StreamIngestionDataSpec,
 		*execinfrapb.StreamIngestionFrontierSpec)
+
+	// OverrideRevertRangeBatchSize allows overriding the `MaxSpanRequestKeys`
+	// used when sending a RevertRange request.
+	OverrideRevertRangeBatchSize int64
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -1937,6 +1968,17 @@ func isSetTransaction(ast tree.Statement) bool {
 	return isSet
 }
 
+// queryPhase represents a phase during a query's execution.
+type queryPhase int
+
+const (
+	// The phase before start of execution (includes parsing, building a plan).
+	preparing queryPhase = 0
+
+	// Execution phase.
+	executing queryPhase = 1
+)
+
 // queryMeta stores metadata about a query. Stored as reference in
 // session.mu.ActiveQueries.
 type queryMeta struct {
@@ -1966,7 +2008,7 @@ type queryMeta struct {
 	isFullScan bool
 
 	// Current phase of execution of query.
-	phase serverpb.ActiveQuery_Phase
+	phase queryPhase
 
 	// Cancellation function for the context associated with this query's
 	// statement.
@@ -1990,77 +2032,6 @@ type queryMeta struct {
 // associated stmt context.
 func (q *queryMeta) cancel() {
 	q.cancelQuery()
-}
-
-// toActiveQuery translates the queryMeta to a serverpb.ActiveQuery.
-func (q *queryMeta) toActiveQuery(
-	ctx context.Context,
-	stmtID clusterunique.ID,
-	sessionID clusterunique.ID,
-	appName atomic.Value,
-	username string,
-	clientAddr string,
-	timeNow time.Time,
-) (serverpb.ActiveQuery, error) {
-	truncateSQL := func(sql string) string {
-		if len(sql) > MaxSQLBytes {
-			sql = sql[:MaxSQLBytes-utf8.RuneLen('…')]
-			// Ensure the resulting string is valid utf8.
-			for {
-				if r, _ := utf8.DecodeLastRuneInString(sql); r != utf8.RuneError {
-					break
-				}
-				sql = sql[:len(sql)-1]
-			}
-			sql += "…"
-		}
-		return sql
-	}
-
-	// Note: while it may seem tempting to just use query.stmt.AST instead of
-	// re-parsing the original SQL, it's unfortunately NOT SAFE to do so because
-	// the AST is currently not immutable - doing so will produce data races.
-	// See issue https://github.com/cockroachdb/cockroach/issues/90965 for the
-	// last time this was hit.
-	// This can go away if we resolve https://github.com/cockroachdb/cockroach/issues/22847.
-	parsed, err := parser.ParseOne(q.stmt.SQL)
-	if err != nil {
-		return serverpb.ActiveQuery{}, err
-	}
-
-	sqlNoConstants := truncateSQL(formatStatementHideConstants(parsed.AST))
-	nPlaceholders := 0
-	if q.placeholders != nil {
-		nPlaceholders = len(q.placeholders.Values)
-	}
-	placeholders := make([]string, nPlaceholders)
-	for i := range placeholders {
-		placeholders[i] = tree.AsStringWithFlags(q.placeholders.Values[i], tree.FmtSimple)
-	}
-	sql := truncateSQL(q.stmt.SQL)
-	progress := math.Float64frombits(atomic.LoadUint64(&q.progressAtomic))
-	queryStart := q.start.UTC()
-	activeQuery := serverpb.ActiveQuery{
-		TxnID:          q.txnID,
-		ID:             stmtID.String(),
-		Start:          queryStart,
-		ElapsedTime:    timeNow.Sub(queryStart),
-		Sql:            sql,
-		SqlNoConstants: sqlNoConstants,
-		SqlSummary:     formatStatementSummary(parsed.AST),
-		Placeholders:   placeholders,
-		IsDistributed:  q.isDistributed,
-		Phase:          q.phase,
-		Progress:       float32(progress),
-		IsFullScan:     q.isFullScan,
-		PlanGist:       q.planGist,
-		Database:       q.database,
-		SessionID:      sessionID.GetBytes(),
-		AppName:        appName.Load().(string),
-		Username:       username,
-		ClientAddress:  clientAddr,
-	}
-	return activeQuery, nil
 }
 
 // SessionDefaults mirrors fields in Session, for restoring default
@@ -3430,6 +3401,10 @@ func (m *sessionDataMutator) SetCopyFromAtomicEnabled(val bool) {
 	m.data.CopyFromAtomicEnabled = val
 }
 
+func (m *sessionDataMutator) SetCopyFromRetriesEnabled(val bool) {
+	m.data.CopyFromRetriesEnabled = val
+}
+
 func (m *sessionDataMutator) SetEnforceHomeRegion(val bool) {
 	m.data.EnforceHomeRegion = val
 }
@@ -3448,6 +3423,10 @@ func (m *sessionDataMutator) SetAllowOrdinalColumnReference(val bool) {
 
 func (m *sessionDataMutator) SetOptimizerUseImprovedDisjunctionStats(val bool) {
 	m.data.OptimizerUseImprovedDisjunctionStats = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseLimitOrderingForStreamingGroupBy(val bool) {
+	m.data.OptimizerUseLimitOrderingForStreamingGroupBy = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.
@@ -3551,12 +3530,16 @@ func formatStatementSummary(ast tree.Statement) string {
 
 // DescsTxn is a convenient method for running a transaction on descriptors
 // when you have an ExecutorConfig.
+//
+// TODO(ajwerner): Remove this now that it is such a thin shim.
 func DescsTxn(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
-	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
+	f func(ctx context.Context, txn isql.Txn, col *descs.Collection) error,
 ) error {
-	return execCfg.InternalExecutorFactory.DescsTxn(ctx, execCfg.DB, f)
+	return execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
+		return f(ctx, txn, txn.Descriptors())
+	})
 }
 
 // TestingDescsTxn is a convenience function for running a transaction on
@@ -3564,7 +3547,7 @@ func DescsTxn(
 func TestingDescsTxn(
 	ctx context.Context,
 	s serverutils.TestServerInterface,
-	f func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error,
+	f func(ctx context.Context, txn isql.Txn, col *descs.Collection) error,
 ) error {
 	execCfg := s.ExecutorConfig().(ExecutorConfig)
 	return DescsTxn(ctx, &execCfg, f)
@@ -3588,12 +3571,28 @@ func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 	return cfg.RowMetrics
 }
 
-// IsSystemTenant returns true either if TenantTestingKnobs.SkipSQLSystemTentantCheck is true
-// or if the ExecutorConfig tenant is the system tenant.
-func (cfg *ExecutorConfig) IsSystemTenant() bool {
+// RequireSystemTenant returns an unsupported error if executed from inside a
+// secondary tenant. Tests may circumvent this check using a testing knob.
+// TODO(ewall): Replace usages of this with tenant capability checks in KV.
+func (cfg *ExecutorConfig) RequireSystemTenant() error {
+	if cfg.Codec.ForSystemTenant() {
+		return nil
+	}
 	knobs := cfg.TenantTestingKnobs
 	if knobs != nil && knobs.SkipSQLSystemTentantCheck {
-		return true
+		return nil
 	}
-	return cfg.Codec.ForSystemTenant()
+	return errorutil.UnsupportedWithMultiTenancy(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
+}
+
+// RequireSystemTenantOrClusterSetting returns a setting disabled error if
+// executed from inside a secondary tenant that does not have the specified
+// cluster setting.
+func (cfg *ExecutorConfig) RequireSystemTenantOrClusterSetting(
+	setting *settings.BoolSetting,
+) error {
+	if cfg.Codec.ForSystemTenant() || setting.Get(&cfg.Settings.SV) {
+		return nil
+	}
+	return errors.Newf("tenant cluster setting %s disabled", setting.Key())
 }

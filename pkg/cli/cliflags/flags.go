@@ -1291,6 +1291,16 @@ can also be specified (e.g. .25).`,
 		Description: `Run a demo workload against the pre-loaded database.`,
 	}
 
+	ExpandDemoSchema = FlagInfo{
+		Name:        "expand-schema",
+		Description: `Expand the workload schema up to the specified size.`,
+	}
+
+	DemoNameGenOpts = FlagInfo{
+		Name:        "name-gen-options",
+		Description: `Use the specified options for the name generation during schema expansion (JSON syntax).`,
+	}
+
 	DemoWorkloadMaxQPS = FlagInfo{
 		Name:        "workload-max-qps",
 		Description: "The maximum QPS when a workload is running.",
@@ -1334,6 +1344,13 @@ More information about the geo-partitioned replicas topology can be found at:
 If set, cockroach demo will start separate in-memory KV and SQL servers in multi-tenancy mode.
 The SQL shell will be connected to the first tenant, and can be switched between tenants
 and the system tenant using the \connect command.`,
+	}
+
+	DemoDisableServerController = FlagInfo{
+		Name: "disable-server-controller",
+		Description: `
+If set, the server controller will not be used to start secondary
+tenant servers.`,
 	}
 
 	DemoNoLicense = FlagInfo{
@@ -1805,8 +1822,7 @@ See start --help for more flag details and examples.
 	}
 
 	ConfirmActions = FlagInfo{
-		Name:      "confirm",
-		Shorthand: "p",
+		Name: "confirm",
 		Description: `
 Confirm action:
 <PRE>

@@ -2142,10 +2142,6 @@ ActiveQuery represents a query in flight on some Session.
 | plan_gist | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The compressed plan that can be converted back into the statement's logical plan. Empty if the statement is in the PREPARING state. | [reserved](#support-status) |
 | placeholders | [string](#cockroach.server.serverpb.ListSessionsResponse-string) | repeated | The placeholders if any. | [reserved](#support-status) |
 | database | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The database the statement was executed on. | [reserved](#support-status) |
-| session_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | The ID for the session that the statement was executed on (uint128 represented as raw bytes). | [reserved](#support-status) |
-| app_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The application name for the session that the statement was executed on. | [reserved](#support-status) |
-| username | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The user name for the session that the statement was executed on. | [reserved](#support-status) |
-| client_address | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The client address for the session that the statement was executed on. | [reserved](#support-status) |
 
 
 
@@ -2291,10 +2287,6 @@ ActiveQuery represents a query in flight on some Session.
 | plan_gist | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The compressed plan that can be converted back into the statement's logical plan. Empty if the statement is in the PREPARING state. | [reserved](#support-status) |
 | placeholders | [string](#cockroach.server.serverpb.ListSessionsResponse-string) | repeated | The placeholders if any. | [reserved](#support-status) |
 | database | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The database the statement was executed on. | [reserved](#support-status) |
-| session_id | [bytes](#cockroach.server.serverpb.ListSessionsResponse-bytes) |  | The ID for the session that the statement was executed on (uint128 represented as raw bytes). | [reserved](#support-status) |
-| app_name | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The application name for the session that the statement was executed on. | [reserved](#support-status) |
-| username | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The user name for the session that the statement was executed on. | [reserved](#support-status) |
-| client_address | [string](#cockroach.server.serverpb.ListSessionsResponse-string) |  | The client address for the session that the statement was executed on. | [reserved](#support-status) |
 
 
 
@@ -3417,6 +3409,7 @@ of ranges currently considered “hot” by the node(s).
 | node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is possible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
 | page_size | [int32](#cockroach.server.serverpb.HotRangesRequest-int32) |  |  | [reserved](#support-status) |
 | page_token | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
+| tenant_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -3530,6 +3523,7 @@ of ranges currently considered “hot” by the node(s).
 | node_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  | NodeID indicates which node to query for a hot range report. It is possible to populate any node ID; if the node receiving the request is not the target node, it will forward the request to the target node.<br><br>If left empty, the request is forwarded to every node in the cluster. | [alpha](#support-status) |
 | page_size | [int32](#cockroach.server.serverpb.HotRangesRequest-int32) |  |  | [reserved](#support-status) |
 | page_token | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
+| tenant_id | [string](#cockroach.server.serverpb.HotRangesRequest-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -4754,6 +4748,8 @@ Response object returned by TableIndexStatsResponse.
 | index_type | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_type is the type of the index i.e. primary, secondary. | [reserved](#support-status) |
 | create_statement | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | create_statement is the SQL statement that would re-create the current index if executed. | [reserved](#support-status) |
 | created_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TableIndexStatsResponse-google.protobuf.Timestamp) |  | CreatedAt is an approximate timestamp at which the index was created. Note that it may not always be populated. | [reserved](#support-status) |
+| index_id | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | index_id is the ID of the index. | [reserved](#support-status) |
+| table_id | [string](#cockroach.server.serverpb.TableIndexStatsResponse-string) |  | table_id is the ID of the table which the index belongs to. | [reserved](#support-status) |
 
 
 
@@ -7245,7 +7241,26 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | range_descriptor | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.roachpb.RangeDescriptor) |  |  | [reserved](#support-status) |
 | replica_info | [cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaInfo](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaInfo) |  |  | [reserved](#support-status) |
+| node_stream_restarted | [RecoveryCollectReplicaRestartNodeStream](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.server.serverpb.RecoveryCollectReplicaRestartNodeStream) |  |  | [reserved](#support-status) |
 
+
+
+
+
+
+<a name="cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.server.serverpb.RecoveryCollectReplicaRestartNodeStream"></a>
+#### RecoveryCollectReplicaRestartNodeStream
+
+RecoveryCollectReplicaRestartNodeStream is sent by collector node to client
+if it experiences a transient failure collecting data from one of the nodes.
+This message instructs client to drop any data that it collected locally
+for specified node as streaming for this node would be restarted.
+This mechanism is needed to avoid restarting the whole collection procedure
+in large cluster if one of the nodes fails transiently.
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| node_id | [int32](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-int32) |  |  | [reserved](#support-status) |
 
 
 
@@ -7425,6 +7440,62 @@ Support status: [reserved](#support-status)
 | unavailable_ranges | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.RecoveryVerifyResponse-cockroach.roachpb.RangeDescriptor) | repeated | Unavailable ranges contains descriptors of ranges that failed health checks. | [reserved](#support-status) |
 | decommissioned_node_ids | [int32](#cockroach.server.serverpb.RecoveryVerifyResponse-int32) | repeated | DecommissionedNodeIDs contains list of decommissioned node id's. Only nodes that were decommissioned by the plan would be listed here, not all historically decommissioned ones. | [reserved](#support-status) |
 
+
+
+
+
+
+
+## ListTenants
+
+`GET /_admin/v1/tenants`
+
+ListTenants returns a list of active tenants in the cluster.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tenants | [Tenant](#cockroach.server.serverpb.ListTenantsResponse-cockroach.server.serverpb.Tenant) | repeated |  | [reserved](#support-status) |
+
+
+
+
+
+
+<a name="cockroach.server.serverpb.ListTenantsResponse-cockroach.server.serverpb.Tenant"></a>
+#### Tenant
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| tenant_id | [cockroach.roachpb.TenantID](#cockroach.server.serverpb.ListTenantsResponse-cockroach.roachpb.TenantID) |  |  | [reserved](#support-status) |
+| tenant_name | [string](#cockroach.server.serverpb.ListTenantsResponse-string) |  |  | [reserved](#support-status) |
+| sql_addr | [string](#cockroach.server.serverpb.ListTenantsResponse-string) |  |  | [reserved](#support-status) |
+| rpc_addr | [string](#cockroach.server.serverpb.ListTenantsResponse-string) |  |  | [reserved](#support-status) |
 
 
 

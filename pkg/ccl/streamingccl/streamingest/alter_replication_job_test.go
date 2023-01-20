@@ -30,7 +30,7 @@ func TestAlterTenantPauseResume(t *testing.T) {
 
 	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
 	defer cleanup()
-	producerJobID, ingestionJobID := c.StartStreamReplication()
+	producerJobID, ingestionJobID := c.StartStreamReplication(ctx)
 
 	jobutils.WaitForJobToRun(t, c.SrcSysSQL, jobspb.JobID(producerJobID))
 	jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
@@ -49,7 +49,11 @@ func TestAlterTenantPauseResume(t *testing.T) {
 	var cutoverTime time.Time
 	c.DestSysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&cutoverTime)
 
-	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, args.DestTenantName, cutoverTime)
+	var cutoverStr string
+	c.DestSysSQL.QueryRow(c.T, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
+		args.DestTenantName, cutoverTime).Scan(&cutoverStr)
+	cutoverOutput := replicationtestutils.DecimalTimeToHLC(t, cutoverStr)
+	require.Equal(t, cutoverTime, cutoverOutput.GoTime())
 	jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 	cleanupTenant := c.CreateDestTenantSQL(ctx)
 	defer func() {
@@ -62,9 +66,9 @@ func TestAlterTenantPauseResume(t *testing.T) {
 
 	t.Run("pause-resume-tenant-with-no-replication", func(t *testing.T) {
 		c.DestSysSQL.Exec(t, `CREATE TENANT noreplication`)
-		c.DestSysSQL.ExpectErr(t, "tenant \"noreplication\" does not have an active replication job",
+		c.DestSysSQL.ExpectErr(t, `tenant "noreplication" \(3\) does not have an active replication job`,
 			`ALTER TENANT $1 PAUSE REPLICATION`, "noreplication")
-		c.DestSysSQL.ExpectErr(t, "tenant \"noreplication\" does not have an active replication job",
+		c.DestSysSQL.ExpectErr(t, `tenant "noreplication" \(3\) does not have an active replication job`,
 			`ALTER TENANT $1 RESUME REPLICATION`, "noreplication")
 	})
 

@@ -326,7 +326,7 @@ func (r *Replica) leasePostApplyLocked(
 		// Reset the request counts used to make lease placement decisions and
 		// load-based splitting/merging decisions whenever starting a new lease.
 		if r.loadStats != nil {
-			r.loadStats.reset()
+			r.loadStats.Reset()
 		}
 		r.loadBasedSplitter.Reset(r.Clock().PhysicalTime())
 	}
@@ -398,12 +398,12 @@ func (r *Replica) leasePostApplyLocked(
 	currentOwner := newLease.OwnedBy(r.store.StoreID())
 	if leaseChangingHands && (prevOwner || currentOwner) {
 		if currentOwner {
-			r.store.maybeGossipOnCapacityChange(ctx, leaseAddEvent)
+			r.store.storeGossip.MaybeGossipOnCapacityChange(ctx, LeaseAddEvent)
 		} else if prevOwner {
-			r.store.maybeGossipOnCapacityChange(ctx, leaseRemoveEvent)
+			r.store.storeGossip.MaybeGossipOnCapacityChange(ctx, LeaseRemoveEvent)
 		}
 		if r.loadStats != nil {
-			r.loadStats.reset()
+			r.loadStats.Reset()
 		}
 	}
 

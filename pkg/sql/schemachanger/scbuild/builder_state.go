@@ -343,7 +343,9 @@ func (b *builderState) IndexPartitioningDescriptor(
 		b.ctx,
 		b.clusterSettings,
 		b.evalCtx,
-		tbl.FindColumnWithName,
+		func(name tree.Name) (catalog.Column, error) {
+			return catalog.MustFindColumnByTreeName(tbl, name)
+		},
 		oldNumImplicitColumns,
 		oldKeyColumnNames,
 		partBy,
@@ -382,15 +384,7 @@ func (b *builderState) ResolveTypeRef(ref tree.ResolvableTypeReference) scpb.Typ
 }
 
 func newTypeT(t *types.T) scpb.TypeT {
-	m, err := typedesc.GetTypeDescriptorClosure(t)
-	if err != nil {
-		panic(err)
-	}
-	var ids catalog.DescriptorIDSet
-	for id := range m {
-		ids.Add(id)
-	}
-	return scpb.TypeT{Type: t, ClosedTypeIDs: ids.Ordered()}
+	return scpb.TypeT{Type: t, ClosedTypeIDs: typedesc.GetTypeDescriptorClosure(t).Ordered()}
 }
 
 // WrapExpression implements the scbuildstmt.TableHelpers interface.
@@ -415,10 +409,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			if !types.IsOIDUserDefinedType(oid) {
 				continue
 			}
-			id, err := typedesc.UserDefinedTypeOIDToID(oid)
-			if err != nil {
-				panic(err)
-			}
+			id := typedesc.UserDefinedTypeOIDToID(oid)
 			b.ensureDescriptor(id)
 			desc := b.descCache[id].desc
 			// Implicit record types will lead to table references, which will be
@@ -442,13 +433,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			if err != nil {
 				panic(err)
 			}
-			ids, err := typ.GetIDClosure()
-			if err != nil {
-				panic(err)
-			}
-			for id = range ids {
-				typeIDs.Add(id)
-			}
+			typ.GetIDClosure().ForEach(typeIDs.Add)
 		}
 	}
 	// Collect sequence IDs.
@@ -655,8 +640,8 @@ func (b *builderState) ResolveSchema(
 	return b.descCache[sc.GetID()].ers
 }
 
-// ResolveEnumType implements the scbuildstmt.NameResolver interface.
-func (b *builderState) ResolveEnumType(
+// ResolveUserDefinedTypeType implements the scbuildstmt.NameResolver interface.
+func (b *builderState) ResolveUserDefinedTypeType(
 	name *tree.UnresolvedObjectName, p scbuildstmt.ResolveParams,
 ) scbuildstmt.ElementResultSet {
 	prefix, typ := b.cr.MayResolveType(b.ctx, *name)
@@ -680,12 +665,13 @@ func (b *builderState) ResolveEnumType(
 	case descpb.TypeDescriptor_ENUM:
 		b.ensureDescriptor(typ.GetID())
 		b.mustOwn(typ.GetID())
+	case descpb.TypeDescriptor_COMPOSITE:
+		b.ensureDescriptor(typ.GetID())
+		b.mustOwn(typ.GetID())
 	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
 		// Implicit record types are not directly modifiable.
 		panic(pgerror.Newf(pgcode.DependentObjectsStillExist,
 			"cannot modify table record type %q", typ.GetName()))
-	case descpb.TypeDescriptor_COMPOSITE:
-		panic(scerrors.NotImplementedErrorf(name, "composite types not supported in new schema changer"))
 	default:
 		panic(errors.AssertionFailedf("unknown type kind %s", typ.GetKind()))
 	}

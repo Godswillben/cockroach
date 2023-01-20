@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -26,11 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -48,11 +48,10 @@ import (
 func validateCheckExpr(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	txn *kv.Txn,
+	txn isql.Txn,
 	sessionData *sessiondata.SessionData,
 	exprStr string,
 	tableDesc *tabledesc.Mutable,
-	ie sqlutil.InternalExecutor,
 	indexIDForValidation descpb.IndexID,
 ) error {
 	expr, err := schemaexpr.FormatExprForDisplay(ctx, tableDesc, exprStr, semaCtx, sessionData, tree.FmtParsable)
@@ -66,10 +65,10 @@ func validateCheckExpr(
 		queryStr = fmt.Sprintf(`SELECT %s FROM [%d AS t]@[%d] WHERE NOT (%s) LIMIT 1`, columns, tableDesc.GetID(), indexIDForValidation, exprStr)
 	}
 	log.Infof(ctx, "validating check constraint %q with query %q", expr, queryStr)
-	rows, err := ie.QueryRowEx(
+	rows, err := txn.QueryRowEx(
 		ctx,
 		"validate check constraint",
-		txn,
+		txn.KV(),
 		sessiondata.RootUserSessionDataOverride,
 		queryStr)
 	if err != nil {
@@ -107,7 +106,7 @@ func matchFullUnacceptableKeyQuery(
 
 	returnedCols := srcCols
 	for i := 0; i < nCols; i++ {
-		col, err := srcTbl.FindColumnWithID(fk.OriginColumnIDs[i])
+		col, err := catalog.MustFindColumnByID(srcTbl, fk.OriginColumnIDs[i])
 		if err != nil {
 			return "", nil, err
 		}
@@ -126,7 +125,7 @@ func matchFullUnacceptableKeyQuery(
 			}
 		}
 		if !alreadyPresent {
-			col, err := tabledesc.FindPublicColumnWithID(srcTbl, id)
+			col, err := catalog.MustFindPublicColumnByID(srcTbl, id)
 			if err != nil {
 				return "", nil, err
 			}
@@ -170,15 +169,21 @@ func matchFullUnacceptableKeyQuery(
 // WHERE t.a IS NULL
 // LIMIT 1  -- if limitResults is set
 //
+// It is possible to force FK validation query to perform against a particular
+// index, as specified in `indexIDForValidation` when it's non zero. This is necessary
+// if we are validating a FK constraint on a primary index that's being added (e.g.
+// `ADD COLUMN ... REFERENCES other_table(...)`).
+//
 // TODO(radu): change this to a query which executes as an anti-join when we
 // remove the heuristic planner.
 func nonMatchingRowQuery(
 	srcTbl catalog.TableDescriptor,
 	fk *descpb.ForeignKeyConstraint,
 	targetTbl catalog.TableDescriptor,
+	indexIDForValidation descpb.IndexID,
 	limitResults bool,
 ) (sql string, originColNames []string, _ error) {
-	originColNames, err := srcTbl.NamesForColumnIDs(fk.OriginColumnIDs)
+	originColNames, err := catalog.ColumnNamesForIDs(srcTbl, fk.OriginColumnIDs)
 	if err != nil {
 		return "", nil, err
 	}
@@ -193,7 +198,7 @@ func nonMatchingRowQuery(
 			}
 		}
 		if !found {
-			column, err := tabledesc.FindPublicColumnWithID(srcTbl, pkColID)
+			column, err := catalog.MustFindPublicColumnByID(srcTbl, pkColID)
 			if err != nil {
 				return "", nil, err
 			}
@@ -208,7 +213,7 @@ func nonMatchingRowQuery(
 		qualifiedSrcCols[i] = fmt.Sprintf("s.%s", srcCols[i])
 	}
 
-	referencedColNames, err := targetTbl.NamesForColumnIDs(fk.ReferencedColumnIDs)
+	referencedColNames, err := catalog.ColumnNamesForIDs(targetTbl, fk.ReferencedColumnIDs)
 	if err != nil {
 		return "", nil, err
 	}
@@ -228,7 +233,7 @@ func nonMatchingRowQuery(
 	if limitResults {
 		limit = " LIMIT 1"
 	}
-	return fmt.Sprintf(
+	query := fmt.Sprintf(
 		`SELECT %[1]s FROM 
 		  (SELECT %[2]s FROM [%[3]d AS src]@{IGNORE_FOREIGN_KEYS} WHERE %[4]s) AS s
 			LEFT OUTER JOIN
@@ -244,7 +249,28 @@ func nonMatchingRowQuery(
 		// Sufficient to check the first column to see whether there was no matching row
 		targetCols[0], // 7
 		limit,         // 8
-	), originColNames, nil
+	)
+	if indexIDForValidation != 0 {
+		query = fmt.Sprintf(
+			`SELECT %[1]s FROM 
+		  (SELECT %[2]s FROM [%[3]d AS src]@{IGNORE_FOREIGN_KEYS, FORCE_INDEX=[%[4]d]} WHERE %[5]s) AS s
+			LEFT OUTER JOIN
+			[%[6]d AS target] AS t
+			ON %[7]s
+		 WHERE %[8]s IS NULL %[9]s`,
+			strings.Join(qualifiedSrcCols, ", "), // 1
+			strings.Join(srcCols, ", "),          // 2
+			srcTbl.GetID(),                       // 3
+			indexIDForValidation,                 // 4
+			strings.Join(srcWhere, " AND "),      // 5
+			targetTbl.GetID(),                    // 6
+			strings.Join(on, " AND "),            // 7
+			// Sufficient to check the first column to see whether there was no matching row
+			targetCols[0], // 8
+			limit,         // 9
+		)
+	}
+	return query, originColNames, nil
 }
 
 // validateForeignKey verifies that all the rows in the srcTable
@@ -254,15 +280,15 @@ func nonMatchingRowQuery(
 // reuse an existing kv.Txn safely.
 func validateForeignKey(
 	ctx context.Context,
+	txn isql.Txn,
 	srcTable *tabledesc.Mutable,
 	targetTable catalog.TableDescriptor,
 	fk *descpb.ForeignKeyConstraint,
-	ie sqlutil.InternalExecutor,
-	txn *kv.Txn,
+	indexIDForValidation descpb.IndexID,
 ) error {
 	nCols := len(fk.OriginColumnIDs)
 
-	referencedColumnNames, err := targetTable.NamesForColumnIDs(fk.ReferencedColumnIDs)
+	referencedColumnNames, err := catalog.ColumnNamesForIDs(targetTable, fk.ReferencedColumnIDs)
 	if err != nil {
 		return err
 	}
@@ -270,7 +296,7 @@ func validateForeignKey(
 	// For MATCH FULL FKs, first check whether any disallowed keys containing both
 	// null and non-null values exist.
 	// (The matching options only matter for FKs with more than one column.)
-	if nCols > 1 && fk.Match == descpb.ForeignKeyReference_FULL {
+	if nCols > 1 && fk.Match == semenumpb.Match_FULL {
 		query, colNames, err := matchFullUnacceptableKeyQuery(
 			srcTable, fk, true, /* limitResults */
 		)
@@ -285,8 +311,8 @@ func validateForeignKey(
 			query,
 		)
 
-		values, err := ie.QueryRowEx(ctx, "validate foreign key constraint",
-			txn,
+		values, err := txn.QueryRowEx(ctx, "validate foreign key constraint",
+			txn.KV(),
 			sessiondata.NodeUserSessionDataOverride, query)
 		if err != nil {
 			return err
@@ -298,10 +324,7 @@ func validateForeignKey(
 			), fk.Name)
 		}
 	}
-	query, colNames, err := nonMatchingRowQuery(
-		srcTable, fk, targetTable,
-		true, /* limitResults */
-	)
+	query, colNames, err := nonMatchingRowQuery(srcTable, fk, targetTable, indexIDForValidation, true /* limitResults */)
 	if err != nil {
 		return err
 	}
@@ -312,7 +335,7 @@ func validateForeignKey(
 		query,
 	)
 
-	values, err := ie.QueryRowEx(ctx, "validate fk constraint", txn,
+	values, err := txn.QueryRowEx(ctx, "validate fk constraint", txn.KV(),
 		sessiondata.NodeUserSessionDataOverride, query)
 	if err != nil {
 		return err
@@ -342,10 +365,17 @@ func validateForeignKey(
 // The pred argument is a partial unique constraint predicate, which filters the
 // subset of rows that are guaranteed unique by the constraint. If the unique
 // constraint is not partial, pred should be empty.
+//
+// `indexIDForValidation`, if non-zero, will be used to force the sql query to
+// use this particular index by hinting the query.
 func duplicateRowQuery(
-	srcTbl catalog.TableDescriptor, columnIDs []descpb.ColumnID, pred string, limitResults bool,
+	srcTbl catalog.TableDescriptor,
+	columnIDs []descpb.ColumnID,
+	pred string,
+	indexIDForValidation descpb.IndexID,
+	limitResults bool,
 ) (sql string, colNames []string, _ error) {
-	colNames, err := srcTbl.NamesForColumnIDs(columnIDs)
+	colNames, err := catalog.ColumnNamesForIDs(srcTbl, columnIDs)
 	if err != nil {
 		return "", nil, err
 	}
@@ -371,13 +401,24 @@ func duplicateRowQuery(
 	if limitResults {
 		limit = " LIMIT 1"
 	}
-	return fmt.Sprintf(
+	query := fmt.Sprintf(
 		`SELECT %[1]s FROM [%[2]d AS tbl] WHERE %[3]s GROUP BY %[1]s HAVING count(*) > 1 %[4]s`,
 		strings.Join(srcCols, ", "),     // 1
 		srcTbl.GetID(),                  // 2
 		strings.Join(srcWhere, " AND "), // 3
 		limit,                           // 4
-	), colNames, nil
+	)
+	if indexIDForValidation != 0 {
+		query = fmt.Sprintf(
+			`SELECT %[1]s FROM [%[2]d AS tbl]@[%[3]d] WHERE %[4]s GROUP BY %[1]s HAVING count(*) > 1 %[5]s`,
+			strings.Join(srcCols, ", "),     // 1
+			srcTbl.GetID(),                  // 2
+			indexIDForValidation,            // 3
+			strings.Join(srcWhere, " AND "), // 4
+			limit,                           // 5
+		)
+	}
+	return query, colNames, nil
 }
 
 // RevalidateUniqueConstraintsInCurrentDB verifies that all unique constraints
@@ -388,9 +429,7 @@ func duplicateRowQuery(
 func (p *planner) RevalidateUniqueConstraintsInCurrentDB(ctx context.Context) error {
 	dbName := p.CurrentDatabase()
 	log.Infof(ctx, "validating unique constraints in database %s", dbName)
-	db, err := p.Descriptors().GetImmutableDatabaseByName(
-		ctx, p.Txn(), dbName, tree.DatabaseLookupFlags{Required: true},
-	)
+	db, err := p.Descriptors().ByNameWithLeased(p.Txn()).Get().Database(ctx, dbName)
 	if err != nil {
 		return err
 	}
@@ -404,7 +443,7 @@ func (p *planner) RevalidateUniqueConstraintsInCurrentDB(ctx context.Context) er
 			return err
 		}
 		return RevalidateUniqueConstraintsInTable(
-			ctx, p.Txn(), p.User(), p.ExecCfg().InternalExecutor, tableDesc,
+			ctx, p.InternalSQLTxn(), p.User(), tableDesc,
 		)
 	})
 }
@@ -414,17 +453,12 @@ func (p *planner) RevalidateUniqueConstraintsInCurrentDB(ctx context.Context) er
 // rows in the table have unique values for every unique constraint defined on
 // the table.
 func (p *planner) RevalidateUniqueConstraintsInTable(ctx context.Context, tableID int) error {
-	tableDesc, err := p.Descriptors().GetImmutableTableByID(
-		ctx,
-		p.Txn(),
-		descpb.ID(tableID),
-		tree.ObjectLookupFlagsWithRequired(),
-	)
+	tableDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 	if err != nil {
 		return err
 	}
 	return RevalidateUniqueConstraintsInTable(
-		ctx, p.Txn(), p.User(), p.ExecCfg().InternalExecutor, tableDesc,
+		ctx, p.InternalSQLTxn(), p.User(), tableDesc,
 	)
 }
 
@@ -436,12 +470,7 @@ func (p *planner) RevalidateUniqueConstraintsInTable(ctx context.Context, tableI
 func (p *planner) RevalidateUniqueConstraint(
 	ctx context.Context, tableID int, constraintName string,
 ) error {
-	tableDesc, err := p.Descriptors().GetImmutableTableByID(
-		ctx,
-		p.Txn(),
-		descpb.ID(tableID),
-		tree.ObjectLookupFlagsWithRequired(),
-	)
+	tableDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 	if err != nil {
 		return err
 	}
@@ -459,8 +488,8 @@ func (p *planner) RevalidateUniqueConstraint(
 					index.GetName(),
 					index.IndexDesc().KeyColumnIDs[index.ImplicitPartitioningColumnCount():],
 					index.GetPredicate(),
-					p.ExecCfg().InternalExecutor,
-					p.Txn(),
+					0, /* indexIDForValidation */
+					p.InternalSQLTxn(),
 					p.User(),
 					true, /* preExisting */
 				)
@@ -479,8 +508,8 @@ func (p *planner) RevalidateUniqueConstraint(
 				uc.GetName(),
 				uc.CollectKeyColumnIDs().Ordered(),
 				uc.GetPredicate(),
-				p.ExecCfg().InternalExecutor,
-				p.Txn(),
+				0, /* indexIDForValidation */
+				p.InternalSQLTxn(),
 				p.User(),
 				true, /* preExisting */
 			)
@@ -495,16 +524,11 @@ func (p *planner) RevalidateUniqueConstraint(
 func (p *planner) IsConstraintActive(
 	ctx context.Context, tableID int, constraintName string,
 ) (bool, error) {
-	tableDesc, err := p.Descriptors().GetImmutableTableByID(
-		ctx,
-		p.Txn(),
-		descpb.ID(tableID),
-		tree.ObjectLookupFlagsWithRequired(),
-	)
+	tableDesc, err := p.Descriptors().ByIDWithLeased(p.Txn()).WithoutNonPublic().Get().Table(ctx, descpb.ID(tableID))
 	if err != nil {
 		return false, err
 	}
-	constraint, _ := tableDesc.FindConstraintWithName(constraintName)
+	constraint := catalog.FindConstraintByName(tableDesc, constraintName)
 	return constraint != nil && constraint.IsEnforced(), nil
 }
 
@@ -533,11 +557,7 @@ func HasVirtualUniqueConstraints(tableDesc catalog.TableDescriptor) bool {
 // enforced by an index. This includes implicitly partitioned UNIQUE indexes
 // and UNIQUE WITHOUT INDEX constraints.
 func RevalidateUniqueConstraintsInTable(
-	ctx context.Context,
-	txn *kv.Txn,
-	user username.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	tableDesc catalog.TableDescriptor,
+	ctx context.Context, txn isql.Txn, user username.SQLUsername, tableDesc catalog.TableDescriptor,
 ) error {
 	// Check implicitly partitioned UNIQUE indexes.
 	for _, index := range tableDesc.ActiveIndexes() {
@@ -548,7 +568,7 @@ func RevalidateUniqueConstraintsInTable(
 				index.GetName(),
 				index.IndexDesc().KeyColumnIDs[index.ImplicitPartitioningColumnCount():],
 				index.GetPredicate(),
-				ie,
+				0, /* indexIDForValidation */
 				txn,
 				user,
 				true, /* preExisting */
@@ -568,7 +588,7 @@ func RevalidateUniqueConstraintsInTable(
 				uc.GetName(),
 				uc.CollectKeyColumnIDs().Ordered(),
 				uc.GetPredicate(),
-				ie,
+				0, /* indexIDForValidation */
 				txn,
 				user,
 				true, /* preExisting */
@@ -586,6 +606,11 @@ func RevalidateUniqueConstraintsInTable(
 // validateUniqueConstraint verifies that all the rows in the srcTable
 // have unique values for the given columns.
 //
+// `indexIDForValidation`, if non-zero, will be used to force validation
+// against this particular index. This is used to facilitate the declarative
+// schema changer when the validation should be against a yet non-public
+// primary index.
+//
 // It operates entirely on the current goroutine and is thus able to
 // reuse an existing kv.Txn safely.
 //
@@ -597,13 +622,13 @@ func validateUniqueConstraint(
 	constraintName string,
 	columnIDs []descpb.ColumnID,
 	pred string,
-	ie sqlutil.InternalExecutor,
-	txn *kv.Txn,
+	indexIDForValidation descpb.IndexID,
+	txn isql.Txn,
 	user username.SQLUsername,
 	preExisting bool,
 ) error {
 	query, colNames, err := duplicateRowQuery(
-		srcTable, columnIDs, pred, true, /* limitResults */
+		srcTable, columnIDs, pred, indexIDForValidation, true, /* limitResults */
 	)
 	if err != nil {
 		return err
@@ -635,7 +660,7 @@ func validateUniqueConstraint(
 		MaxRetries:     5,
 	}
 	for r := retry.StartWithCtx(ctx, retryOptions); r.Next(); {
-		values, err = ie.QueryRowEx(ctx, "validate unique constraint", txn, sessionDataOverride, query)
+		values, err = txn.QueryRowEx(ctx, "validate unique constraint", txn.KV(), sessionDataOverride, query)
 		if err == nil {
 			break
 		}
@@ -678,9 +703,7 @@ func validateUniqueConstraint(
 func (p *planner) ValidateTTLScheduledJobsInCurrentDB(ctx context.Context) error {
 	dbName := p.CurrentDatabase()
 	log.Infof(ctx, "validating scheduled jobs in database %s", dbName)
-	db, err := p.Descriptors().GetImmutableDatabaseByName(
-		ctx, p.Txn(), dbName, tree.DatabaseLookupFlags{Required: true},
-	)
+	db, err := p.Descriptors().ByNameWithLeased(p.Txn()).Get().Database(ctx, dbName)
 	if err != nil {
 		return err
 	}
@@ -709,7 +732,7 @@ func (p *planner) validateTTLScheduledJobInTable(
 	ttl := tableDesc.GetRowLevelTTL()
 
 	execCfg := p.ExecCfg()
-	env := JobSchedulerEnv(execCfg)
+	env := JobSchedulerEnv(execCfg.JobsKnobs())
 
 	wrapError := func(origErr error) error {
 		return errors.WithHintf(
@@ -719,13 +742,7 @@ func (p *planner) validateTTLScheduledJobInTable(
 		)
 	}
 
-	sj, err := jobs.LoadScheduledJob(
-		ctx,
-		env,
-		ttl.ScheduleID,
-		execCfg.InternalExecutor,
-		p.txn,
-	)
+	sj, err := jobs.ScheduledJobTxn(p.InternalSQLTxn()).Load(ctx, env, ttl.ScheduleID)
 	if err != nil {
 		if jobs.HasScheduledJobNotFoundError(err) {
 			return wrapError(
@@ -770,7 +787,7 @@ func (p *planner) validateTTLScheduledJobInTable(
 
 // RepairTTLScheduledJobForTable is part of the EvalPlanner interface.
 func (p *planner) RepairTTLScheduledJobForTable(ctx context.Context, tableID int64) error {
-	tableDesc, err := p.Descriptors().GetMutableTableByID(ctx, p.txn, descpb.ID(tableID), tree.ObjectLookupFlagsWithRequired())
+	tableDesc, err := p.Descriptors().MutableByID(p.txn).Table(ctx, descpb.ID(tableID))
 	if err != nil {
 		return err
 	}
@@ -783,8 +800,8 @@ func (p *planner) RepairTTLScheduledJobForTable(ctx context.Context, tableID int
 	}
 	sj, err := CreateRowLevelTTLScheduledJob(
 		ctx,
-		p.ExecCfg(),
-		p.txn,
+		p.ExecCfg().JobsKnobs(),
+		jobs.ScheduledJobTxn(p.InternalSQLTxn()),
 		p.User(),
 		tableDesc.GetID(),
 		tableDesc.GetRowLevelTTL(),

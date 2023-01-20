@@ -497,6 +497,8 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 			return nil, nil, pErr
 		}
 
+		log.VErrEventf(ctx, 2, "concurrency retry error: %s", pErr)
+
 		// The batch execution func returned a server-side concurrency retry error.
 		// It may have either handed back ownership of the concurrency guard without
 		// having already released the guard's latches, or in case of certain types
@@ -1023,8 +1025,8 @@ func (r *Replica) recordBatchRequestLoad(ctx context.Context, ba *roachpb.BatchR
 	// calculation.
 	adjustedQPS := r.getBatchRequestQPS(ctx, ba)
 
-	r.loadStats.batchRequests.RecordCount(adjustedQPS, ba.Header.GatewayNodeID)
-	r.loadStats.requests.RecordCount(float64(len(ba.Requests)), ba.Header.GatewayNodeID)
+	r.loadStats.RecordBatchRequests(adjustedQPS, ba.Header.GatewayNodeID)
+	r.loadStats.RecordRequests(float64(len(ba.Requests)))
 }
 
 // getBatchRequestQPS calculates the cost estimation of a BatchRequest. The
@@ -1065,10 +1067,7 @@ func (r *Replica) recordRequestWriteBytes(writeBytes *kvadmission.StoreWriteByte
 	}
 	// TODO(kvoli): Consider recording the ingested bytes (AddSST) separately
 	// to the write bytes.
-	r.loadStats.writeBytes.RecordCount(
-		float64(writeBytes.WriteBytes+writeBytes.IngestedBytes),
-		0,
-	)
+	r.loadStats.RecordWriteBytes(float64(writeBytes.WriteBytes + writeBytes.IngestedBytes))
 }
 
 // checkBatchRequest verifies BatchRequest validity requirements. In particular,

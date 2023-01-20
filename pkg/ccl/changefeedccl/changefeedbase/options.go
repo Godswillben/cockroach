@@ -211,6 +211,16 @@ func makeStringSet(opts ...string) map[string]struct{} {
 	return res
 }
 
+func unionStringSets(sets ...map[string]struct{}) map[string]struct{} {
+	res := make(map[string]struct{})
+	for _, s := range sets {
+		for k := range s {
+			res[k] = struct{}{}
+		}
+	}
+	return res
+}
+
 // OptionType is an enum of the ways changefeed options can be provided in WITH.
 type OptionType int
 
@@ -348,12 +358,7 @@ var PubsubValidOptions = makeStringSet()
 // TODO(adityamaru): Some of these options should be supported when creating the
 // external connection rather than when setting up the changefeed. Move them once
 // we support `CREATE EXTERNAL CONNECTION ... WITH <options>`.
-var ExternalConnectionValidOptions = makeStringSet(
-	// Options valid for a kafka sink.
-	OptAvroSchemaPrefix,
-	OptConfluentSchemaRegistry,
-	OptKafkaSinkConfig,
-)
+var ExternalConnectionValidOptions = unionStringSets(SQLValidOptions, KafkaValidOptions, CloudStorageValidOptions, WebhookValidOptions, PubsubValidOptions)
 
 // CaseInsensitiveOpts options which supports case Insensitive value
 var CaseInsensitiveOpts = makeStringSet(OptFormat, OptEnvelope, OptCompression, OptSchemaChangeEvents,
@@ -879,6 +884,20 @@ func (s StatementOptions) ForceDiff() {
 	s.cache.EncodingOptions = EncodingOptions{}
 }
 
+// SetTopics stashes the list of topics in the options as a handy place
+// to serialize it.
+// TODO: Have a separate metadata map on the details proto for things
+// like this.
+func (s StatementOptions) SetTopics(topics []string) {
+	s.m[Topics] = strings.Join(topics, ",")
+}
+
+// ClearDiff clears diff option.
+func (s StatementOptions) ClearDiff() {
+	delete(s.m, OptDiff)
+	s.cache.EncodingOptions = EncodingOptions{}
+}
+
 // SetDefaultEnvelope sets the envelope if not already set.
 func (s StatementOptions) SetDefaultEnvelope(t EnvelopeType) {
 	if _, ok := s.m[OptEnvelope]; !ok {
@@ -920,7 +939,7 @@ func describeEnum(strs ...string) string {
 // ValidateForCreateChangefeed checks that the provided options are
 // valid for a CREATE CHANGEFEED statement using the type assertions
 // in ChangefeedOptionExpectValues.
-func (s StatementOptions) ValidateForCreateChangefeed() error {
+func (s StatementOptions) ValidateForCreateChangefeed(isPredicateChangefeed bool) error {
 	err := s.validateAgainst(ChangefeedOptionExpectValues)
 	if err != nil {
 		return err
@@ -948,8 +967,17 @@ func (s StatementOptions) ValidateForCreateChangefeed() error {
 	}
 	// Right now parquet does not support any of these options
 	if s.m[OptFormat] == string(OptFormatParquet) {
-		if err := validateInitialScanUnsupportedOptions(string(OptFormatParquet)); err != nil {
-			return err
+		if isPredicateChangefeed {
+			// Diff option is allowed when using predicate changefeeds with parquet format.
+			for o := range InitialScanOnlyUnsupportedOptions {
+				if _, ok := s.m[o]; ok && o != OptDiff {
+					return errors.Newf(`cannot specify both format='%s' and %s`, OptFormatParquet, o)
+				}
+			}
+		} else {
+			if err := validateInitialScanUnsupportedOptions(string(OptFormatParquet)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

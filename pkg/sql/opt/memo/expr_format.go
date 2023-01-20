@@ -690,12 +690,11 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *WithExpr:
-		if t.Mtr.Set {
-			if t.Mtr.Materialize {
-				tp.Child("materialized")
-			} else {
-				tp.Child("not-materialized")
-			}
+		switch t.Mtr {
+		case tree.CTEMaterializeAlways:
+			tp.Child("materialized")
+		case tree.CTEMaterializeNever:
+			tp.Child("not-materialized")
 		}
 
 	case *WithScanExpr:
@@ -1569,10 +1568,7 @@ func (f *ExprFmtCtx) formatDependencies(
 		n.Child(f.Buffer.String())
 	}
 	for _, typ := range f.Memo.Metadata().AllUserDefinedTypes() {
-		typeID, err := catid.UserDefinedOIDToID(typ.Oid())
-		if err != nil {
-			panic(err)
-		}
+		typeID := catid.UserDefinedOIDToID(typ.Oid())
 		if typeDeps.Contains(int(typeID)) {
 			n.Child(typ.Name())
 		}

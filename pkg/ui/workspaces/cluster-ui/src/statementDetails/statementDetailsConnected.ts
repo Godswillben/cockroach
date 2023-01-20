@@ -24,6 +24,7 @@ import {
 import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
 } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import { actions as sqlDetailsStatsActions } from "src/store/statementDetails";
@@ -36,7 +37,7 @@ import { actions as analyticsActions } from "src/store/analytics";
 import { actions as localStorageActions } from "src/store/localStorage";
 import { actions as nodesActions } from "../store/nodes";
 import { actions as nodeLivenessActions } from "../store/liveness";
-import { selectTimeScale } from "../statementsPage/statementsPage.selectors";
+import { selectTimeScale } from "../store/utils/selectors";
 import {
   InsertStmtDiagnosticRequest,
   StatementDetailsRequest,
@@ -48,16 +49,15 @@ import { getMatchParamByName, statementAttr } from "../util";
 // For tenant cases, we don't show information about node, regions and
 // diagnostics.
 const mapStateToProps = (state: AppState, props: RouteComponentProps) => {
-  const { statementDetails, isLoading, lastError } = selectStatementDetails(
-    state,
-    props,
-  );
+  const { statementDetails, isLoading, lastError, lastUpdated } =
+    selectStatementDetails(state, props);
   const statementFingerprint = statementDetails?.statement.metadata.query;
   return {
     statementFingerprintID: getMatchParamByName(props.match, statementAttr),
     statementDetails,
     isLoading: isLoading,
     statementsError: lastError,
+    lastUpdated: lastUpdated,
     timeScale: selectTimeScale(state),
     nodeRegions: nodeRegionsByIDSelector(state),
     diagnosticsReports:
@@ -70,6 +70,7 @@ const mapStateToProps = (state: AppState, props: RouteComponentProps) => {
     uiConfig: selectStatementDetailsUiConfig(state),
     isTenant: selectIsTenant(state),
     hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+    hasAdminRole: selectHasAdminRole(state),
   };
 };
 

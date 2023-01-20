@@ -30,8 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
-	"github.com/cockroachdb/cockroach/pkg/sql/contention"
-	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -49,7 +47,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -57,7 +54,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	pbtypes "github.com/gogo/protobuf/types"
 )
 
 var settingDistSQLNumRunners = settings.RegisterIntSetting(
@@ -103,23 +99,25 @@ type runnerResult struct {
 // run executes the request. An error, if encountered, is both sent on the
 // result channel and returned.
 func (req runnerRequest) run() error {
-	defer physicalplan.ReleaseFlowSpec(&req.flowReq.Flow)
 	res := runnerResult{nodeID: req.sqlInstanceID}
+	defer func() {
+		req.resultChan <- res
+		physicalplan.ReleaseFlowSpec(&req.flowReq.Flow)
+	}()
 
 	conn, err := req.podNodeDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
 	if err != nil {
 		res.err = err
-	} else {
-		client := execinfrapb.NewDistSQLClient(conn)
-		// TODO(radu): do we want a timeout here?
-		resp, err := client.SetupFlow(req.ctx, req.flowReq)
-		if err != nil {
-			res.err = err
-		} else {
-			res.err = resp.Error.ErrorDetail(req.ctx)
-		}
+		return err
 	}
-	req.resultChan <- res
+	client := execinfrapb.NewDistSQLClient(conn)
+	// TODO(radu): do we want a timeout here?
+	resp, err := client.SetupFlow(req.ctx, req.flowReq)
+	if err != nil {
+		res.err = err
+	} else {
+		res.err = resp.Error.ErrorDetail(req.ctx)
+	}
 	return res.err
 }
 
@@ -470,6 +468,10 @@ func (dsp *DistSQLPlanner) setupFlows(
 	// usedWorker indicates whether we used at least one DistSQL worker
 	// goroutine to issue the SetupFlow RPC.
 	var usedWorker bool
+	// numIssuedRequests tracks the number of the SetupFlow RPCs that were
+	// issued (either by the current goroutine directly or delegated to the
+	// DistSQL workers).
+	var numIssuedRequests int
 	if sp := tracing.SpanFromContext(origCtx); sp != nil && !sp.IsNoop() {
 		setupReq.TraceInfo = sp.Meta().ToProto()
 	}
@@ -494,6 +496,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 	var runnerSpan *tracing.Span
 	// This span is necessary because it can outlive its parent.
 	runnerCtx, runnerSpan = tracing.ChildSpan(runnerCtx, "setup-flow-async" /* opName */)
+	// runnerCleanup can only be executed _after_ all issued RPCs are complete.
 	runnerCleanup := func() {
 		cancelRunnerCtx()
 		runnerSpan.Finish()
@@ -503,6 +506,23 @@ func (dsp *DistSQLPlanner) setupFlows(
 	var listenerGoroutineWillCleanup bool
 	defer func() {
 		if !listenerGoroutineWillCleanup {
+			// Make sure to receive from the result channel as many times as
+			// there were total SetupFlow RPCs issued, regardless of whether
+			// they were executed concurrently by a DistSQL worker or serially
+			// in the current goroutine. This is needed in order to block
+			// finishing the runner span (in runnerCleanup) until all concurrent
+			// requests are done since the runner span is used as the parent for
+			// the RPC span, and, thus, the runner span can only be finished
+			// when we know that all SetupFlow RPCs have already been completed.
+			//
+			// Note that even in case of an error in runnerRequest.run we still
+			// send on the result channel.
+			for i := 0; i < numIssuedRequests; i++ {
+				<-resultChan
+			}
+			// At this point, we know that all concurrent requests (if there
+			// were any) are complete, so we can safely perform the runner
+			// cleanup.
 			runnerCleanup()
 		}
 	}()
@@ -523,6 +543,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 
 		// Send out a request to the workers; if no worker is available, run
 		// directly.
+		numIssuedRequests++
 		select {
 		case dsp.runnerCoordinator.runnerChan <- runReq:
 			usedWorker = true
@@ -559,7 +580,7 @@ func (dsp *DistSQLPlanner) setupFlows(
 		syncutil.Mutex
 		called bool
 	}{}
-	flow.AddOnCleanup(func() {
+	flow.AddOnCleanupStart(func() {
 		cleanupCalledMu.Lock()
 		defer cleanupCalledMu.Unlock()
 		cleanupCalledMu.called = true
@@ -569,29 +590,38 @@ func (dsp *DistSQLPlanner) setupFlows(
 		cancelRunnerCtx()
 	})
 	err = dsp.stopper.RunAsyncTask(origCtx, "distsql-remote-flows-setup-listener", func(ctx context.Context) {
+		// Note that in the loop below we always receive from the result channel
+		// as many times as there were SetupFlow RPCs issued, thus, by the time
+		// this defer is executed, we are certain that all RPCs were complete,
+		// and runnerCleanup() is safe to be executed.
 		defer runnerCleanup()
 		var seenError bool
 		for i := 0; i < len(flows)-1; i++ {
 			res := <-resultChan
 			if res.err != nil && !seenError {
-				seenError = true
 				// The setup of at least one remote flow failed.
-				cleanupCalledMu.Lock()
-				skipCancel := cleanupCalledMu.called
-				cleanupCalledMu.Unlock()
-				if skipCancel {
-					continue
-				}
-				// First, we update the DistSQL receiver with the error to be
-				// returned to the client eventually.
-				//
-				// In order to not protect DistSQLReceiver.status with a mutex,
-				// we do not update the status here and, instead, rely on the
-				// DistSQLReceiver detecting the error the next time an object
-				// is pushed into it.
-				recv.setErrorWithoutStatusUpdate(res.err, true /* willDeferStatusUpdate */)
-				// Now explicitly cancel the local flow.
-				flow.Cancel()
+				seenError = true
+				func() {
+					cleanupCalledMu.Lock()
+					// Flow.Cancel cannot be called after or concurrently with
+					// Flow.Cleanup.
+					defer cleanupCalledMu.Unlock()
+					if cleanupCalledMu.called {
+						// Cleanup of the local flow has already been performed,
+						// so there is nothing to do.
+						return
+					}
+					// First, we update the DistSQL receiver with the error to
+					// be returned to the client eventually.
+					//
+					// In order to not protect DistSQLReceiver.status with a
+					// mutex, we do not update the status here and, instead,
+					// rely on the DistSQLReceiver detecting the error the next
+					// time an object is pushed into it.
+					recv.setErrorWithoutStatusUpdate(res.err, true /* willDeferStatusUpdate */)
+					// Now explicitly cancel the local flow.
+					flow.Cancel()
+				}()
 			}
 		}
 	})
@@ -658,7 +688,8 @@ func (dsp *DistSQLPlanner) Run(
 	// a transaction that has already created or updated some types. If we do not
 	// use the local descs.Collection, we would attempt to acquire a lease on
 	// modified types when accessing them, which would error out.
-	if planCtx.planner != nil && !planCtx.planner.isInternalPlanner {
+	if planCtx.planner != nil &&
+		(!planCtx.planner.isInternalPlanner || planCtx.usePlannerDescriptorsForLocalFlow) {
 		localState.Collection = planCtx.planner.Descriptors()
 	}
 
@@ -761,7 +792,6 @@ func (dsp *DistSQLPlanner) Run(
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.GetResultTypes()
-	recv.contendedQueryMetric = dsp.distSQLSrv.Metrics.ContendedQueriesCount
 	if multitenant.TenantRUEstimateEnabled.Get(&dsp.st.SV) &&
 		dsp.distSQLSrv.TenantCostController != nil && planCtx.planner != nil {
 		if instrumentation := planCtx.planner.curPlan.instrumentation; instrumentation != nil {
@@ -908,12 +938,6 @@ type DistSQLReceiver struct {
 
 	expectedRowsRead int64
 	progressAtomic   *uint64
-
-	// contendedQueryMetric is a Counter that is incremented at most once if the
-	// query produces at least one contention event.
-	contendedQueryMetric *metric.Counter
-	// contentionRegistry is a Registry that contention events are added to.
-	contentionRegistry *contention.Registry
 
 	testingKnobs struct {
 		// pushCallback, if set, will be called every time DistSQLReceiver.Push
@@ -1129,7 +1153,6 @@ func MakeDistSQLReceiver(
 	txn *kv.Txn,
 	clockUpdater clockUpdater,
 	tracing *SessionTracing,
-	contentionRegistry *contention.Registry,
 ) *DistSQLReceiver {
 	consumeCtx, cleanup := tracing.TraceExecConsume(ctx)
 	r := receiverSyncPool.Get().(*DistSQLReceiver)
@@ -1142,15 +1165,14 @@ func MakeDistSQLReceiver(
 		}
 	}
 	*r = DistSQLReceiver{
-		ctx:                consumeCtx,
-		cleanup:            cleanup,
-		rangeCache:         rangeCache,
-		txn:                txn,
-		clockUpdater:       clockUpdater,
-		stats:              &topLevelQueryStats{},
-		stmtType:           stmtType,
-		tracing:            tracing,
-		contentionRegistry: contentionRegistry,
+		ctx:          consumeCtx,
+		cleanup:      cleanup,
+		rangeCache:   rangeCache,
+		txn:          txn,
+		clockUpdater: clockUpdater,
+		stats:        &topLevelQueryStats{},
+		stmtType:     stmtType,
+		tracing:      tracing,
 	}
 	r.resultWriterMu.row = resultWriter
 	r.resultWriterMu.batch = batchWriter
@@ -1169,15 +1191,14 @@ func (r *DistSQLReceiver) Release() {
 func (r *DistSQLReceiver) clone() *DistSQLReceiver {
 	ret := receiverSyncPool.Get().(*DistSQLReceiver)
 	*ret = DistSQLReceiver{
-		ctx:                r.ctx,
-		cleanup:            func() {},
-		rangeCache:         r.rangeCache,
-		txn:                r.txn,
-		clockUpdater:       r.clockUpdater,
-		stats:              r.stats,
-		stmtType:           tree.Rows,
-		tracing:            r.tracing,
-		contentionRegistry: r.contentionRegistry,
+		ctx:          r.ctx,
+		cleanup:      func() {},
+		rangeCache:   r.rangeCache,
+		txn:          r.txn,
+		clockUpdater: r.clockUpdater,
+		stats:        r.stats,
+		stmtType:     tree.Rows,
+		tracing:      r.tracing,
 	}
 	return ret
 }
@@ -1290,30 +1311,6 @@ func (r *DistSQLReceiver) pushMeta(meta *execinfrapb.ProducerMetadata) execinfra
 	if len(meta.TraceData) > 0 {
 		if span := tracing.SpanFromContext(r.ctx); span != nil {
 			span.ImportRemoteRecording(meta.TraceData)
-		}
-		var ev roachpb.ContentionEvent
-		for i := range meta.TraceData {
-			meta.TraceData[i].Structured(func(any *pbtypes.Any, _ time.Time) {
-				if !pbtypes.Is(any, &ev) {
-					return
-				}
-				if err := pbtypes.UnmarshalAny(any, &ev); err != nil {
-					return
-				}
-				if r.contendedQueryMetric != nil {
-					// Increment the contended query metric at most once
-					// if the query sees at least one contention event.
-					r.contendedQueryMetric.Inc(1)
-					r.contendedQueryMetric = nil
-				}
-				contentionEvent := contentionpb.ExtendedContentionEvent{
-					BlockingEvent: ev,
-				}
-				if r.txn != nil {
-					contentionEvent.WaitingTxnID = r.txn.ID()
-				}
-				r.contentionRegistry.AddContentionEvent(contentionEvent)
-			})
 		}
 	}
 	if meta.Metrics != nil {
@@ -1545,7 +1542,7 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 	}
 	recv.discardRows = planner.instrumentation.ShouldDiscardRows()
 	dsp.PlanAndRun(
-		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
+		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv, nil, /* finishedSetupFn */
 	)
 	if recv.commErr != nil || recv.getError() != nil {
 		return recv.commErr
@@ -1781,6 +1778,7 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	txn *kv.Txn,
 	plan planMaybePhysical,
 	recv *DistSQLReceiver,
+	finishedSetupFn func(),
 ) {
 	log.VEventf(ctx, 2, "creating DistSQL plan with isLocal=%v", planCtx.isLocal)
 
@@ -1792,7 +1790,7 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	}
 	dsp.finalizePlanWithRowCount(planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
 	recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
-	dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtx, nil /* finishedSetupFn */)
+	dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtx, finishedSetupFn)
 }
 
 // PlanAndRunCascadesAndChecks runs any cascade and check queries.

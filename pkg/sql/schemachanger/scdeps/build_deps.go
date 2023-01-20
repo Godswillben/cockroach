@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -43,8 +42,7 @@ import (
 func NewBuilderDependencies(
 	clusterID uuid.UUID,
 	codec keys.SQLCodec,
-	txn *kv.Txn,
-	descsCollection *descs.Collection,
+	txn descs.Txn,
 	schemaResolverFactory scbuild.SchemaResolverFactory,
 	authAccessor scbuild.AuthorizationAccessor,
 	astFormatter scbuild.AstFormatter,
@@ -52,23 +50,21 @@ func NewBuilderDependencies(
 	sessionData *sessiondata.SessionData,
 	settings *cluster.Settings,
 	statements []string,
-	internalExecutor sqlutil.InternalExecutor,
 	clientNoticeSender eval.ClientNoticeSender,
 ) scbuild.Dependencies {
 	return &buildDeps{
-		clusterID:        clusterID,
-		codec:            codec,
-		txn:              txn,
-		descsCollection:  descsCollection,
-		authAccessor:     authAccessor,
-		sessionData:      sessionData,
-		settings:         settings,
-		statements:       statements,
-		astFormatter:     astFormatter,
-		featureChecker:   featureChecker,
-		internalExecutor: internalExecutor,
+		clusterID:       clusterID,
+		codec:           codec,
+		txn:             txn.KV(),
+		descsCollection: txn.Descriptors(),
+		authAccessor:    authAccessor,
+		sessionData:     sessionData,
+		settings:        settings,
+		statements:      statements,
+		astFormatter:    astFormatter,
+		featureChecker:  featureChecker,
 		schemaResolver: schemaResolverFactory(
-			descsCollection, sessiondata.NewStack(sessionData), txn, authAccessor,
+			txn.Descriptors(), sessiondata.NewStack(sessionData), txn.KV(), authAccessor,
 		),
 		clientNoticeSender: clientNoticeSender,
 	}
@@ -86,7 +82,6 @@ type buildDeps struct {
 	statements         []string
 	astFormatter       scbuild.AstFormatter
 	featureChecker     scbuild.FeatureChecker
-	internalExecutor   sqlutil.InternalExecutor
 	clientNoticeSender eval.ClientNoticeSender
 }
 
@@ -96,9 +91,7 @@ var _ scbuild.CatalogReader = (*buildDeps)(nil)
 func (d *buildDeps) MayResolveDatabase(
 	ctx context.Context, name tree.Name,
 ) catalog.DatabaseDescriptor {
-	db, err := d.descsCollection.GetImmutableDatabaseByName(ctx, d.txn, string(name), tree.DatabaseLookupFlags{
-		AvoidLeased: true,
-	})
+	db, err := d.descsCollection.ByName(d.txn).MaybeGet().Database(ctx, string(name))
 	if err != nil {
 		panic(err)
 	}
@@ -113,9 +106,7 @@ func (d *buildDeps) MayResolveSchema(
 		name.CatalogName = tree.Name(d.schemaResolver.CurrentDatabase())
 	}
 	db := d.MayResolveDatabase(ctx, name.CatalogName)
-	schema, err := d.descsCollection.GetImmutableSchemaByName(ctx, d.txn, db, name.Schema(), tree.SchemaLookupFlags{
-		AvoidLeased: true,
-	})
+	schema, err := d.descsCollection.ByName(d.txn).MaybeGet().Schema(ctx, db, name.Schema())
 	if err != nil {
 		panic(err)
 	}
@@ -127,9 +118,7 @@ func (d *buildDeps) MayResolveTable(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidLeased: true,
-		},
+		AvoidLeased:       true,
 		DesiredObjectKind: tree.TableObject,
 	})
 	if err != nil {
@@ -146,9 +135,7 @@ func (d *buildDeps) MayResolveType(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidLeased: true,
-		},
+		AvoidLeased:       true,
 		DesiredObjectKind: tree.TypeObject,
 	})
 	if err != nil {
@@ -230,14 +217,7 @@ func (d *buildDeps) CurrentDatabase() string {
 
 // MustReadDescriptor implements the scbuild.CatalogReader interface.
 func (d *buildDeps) MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor {
-	flags := tree.CommonLookupFlags{
-		Required:       true,
-		RequireMutable: false,
-		AvoidLeased:    true,
-		IncludeOffline: true,
-		IncludeDropped: true,
-	}
-	desc, err := d.descsCollection.GetImmutableDescriptorByID(ctx, d.txn, id, flags)
+	desc, err := d.descsCollection.ByID(d.txn).Get().Desc(ctx, id)
 	if err != nil {
 		panic(err)
 	}

@@ -20,6 +20,7 @@ import { PageConfig, PageConfigItem } from "src/pageConfig/pageConfig";
 import { Search } from "src/search/search";
 import {
   calculateActiveFilters,
+  defaultFilters,
   Filter,
   getFullFiltersAsStringRecord,
 } from "src/queryFilter/filter";
@@ -34,14 +35,21 @@ import {
   getAppsFromTransactionInsights,
   WorkloadInsightEventFilters,
   MergedTxnInsightEvent,
+  executionInsightsRequestFromTimeScale,
 } from "src/insights";
 import { EmptyInsightsTablePlaceholder } from "../util";
 import { TransactionInsightsTable } from "./transactionInsightsTable";
 import { InsightsError } from "../../insightsErrorComponent";
+import {
+  TimeScale,
+  defaultTimeScaleOptions,
+  TimeScaleDropdown,
+} from "../../../timeScaleDropdown";
+import { ExecutionInsightsRequest } from "src/api";
 
 import styles from "src/statementsPage/statementsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
-import { TimeScale } from "../../../timeScaleDropdown";
+import { commonStyles } from "../../../common";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
@@ -49,15 +57,18 @@ const sortableTableCx = classNames.bind(sortableTableStyles);
 export type TransactionInsightsViewStateProps = {
   transactions: MergedTxnInsightEvent[];
   transactionsError: Error | null;
+  insightTypes: string[];
   filters: WorkloadInsightEventFilters;
   sortSetting: SortSetting;
+  isLoading?: boolean;
   dropDownSelect?: React.ReactElement;
+  timeScale?: TimeScale;
 };
 
 export type TransactionInsightsViewDispatchProps = {
   onFiltersChange: (filters: WorkloadInsightEventFilters) => void;
   onSortChange: (ss: SortSetting) => void;
-  refreshTransactionInsights: () => void;
+  refreshTransactionInsights: (req: ExecutionInsightsRequest) => void;
   setTimeScale: (ts: TimeScale) => void;
 };
 
@@ -74,7 +85,10 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
     sortSetting,
     transactions,
     transactionsError,
+    insightTypes,
     filters,
+    timeScale,
+    isLoading,
     refreshTransactionInsights,
     onFiltersChange,
     onSortChange,
@@ -92,13 +106,23 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
   );
 
   useEffect(() => {
-    // Refresh every 20 seconds.
-    refreshTransactionInsights();
-    const interval = setInterval(refreshTransactionInsights, 20 * 1000);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [refreshTransactionInsights]);
+    if (timeScale.key !== "Custom") {
+      const req = executionInsightsRequestFromTimeScale(timeScale);
+      refreshTransactionInsights(req);
+      // Refresh every 10 seconds.
+      const interval = setInterval(refreshTransactionInsights, 10 * 1000, req);
+      return () => {
+        clearInterval(interval);
+      };
+    }
+  }, [timeScale, refreshTransactionInsights]);
+
+  useEffect(() => {
+    if (transactions === null || transactions.length < 1) {
+      const req = executionInsightsRequestFromTimeScale(timeScale);
+      refreshTransactionInsights(req);
+    }
+  }, [transactions, timeScale, refreshTransactionInsights]);
 
   useEffect(() => {
     // We use this effect to sync settings defined on the URL (sort, filters),
@@ -173,7 +197,8 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
 
   const clearFilters = () =>
     onSubmitFilters({
-      app: "",
+      app: defaultFilters.app,
+      workloadInsightType: defaultFilters.workloadInsightType,
     });
 
   const transactionInsights = transactions;
@@ -207,15 +232,24 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
             onSubmitFilters={onSubmitFilters}
             appNames={apps}
             filters={filters}
+            workloadInsightTypes={insightTypes.sort()}
+            showWorkloadInsightTypes={true}
+          />
+        </PageConfigItem>
+        <PageConfigItem className={commonStyles("separator")}>
+          <TimeScaleDropdown
+            options={defaultTimeScaleOptions}
+            currentScale={timeScale}
+            setTimeScale={setTimeScale}
           />
         </PageConfigItem>
       </PageConfig>
       <div className={cx("table-area")}>
         <Loading
-          loading={transactions === null}
+          loading={transactions === null || isLoading}
           page="transaction insights"
           error={transactionsError}
-          renderError={() => InsightsError()}
+          renderError={() => InsightsError(transactionsError?.message)}
         >
           <div>
             <section className={sortableTableCx("cl-table-container")}>
@@ -237,7 +271,8 @@ export const TransactionInsightsView: React.FC<TransactionInsightsViewProps> = (
                 renderNoResult={
                   <EmptyInsightsTablePlaceholder
                     isEmptySearchResults={
-                      search?.length > 0 && filteredTransactions?.length === 0
+                      (search?.length > 0 || countActiveFilters > 0) &&
+                      filteredTransactions?.length === 0
                     }
                   />
                 }

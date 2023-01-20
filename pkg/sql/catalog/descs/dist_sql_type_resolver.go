@@ -34,7 +34,7 @@ type DistSQLTypeResolver struct {
 // NewDistSQLTypeResolver creates a new DistSQLTypeResolver.
 func NewDistSQLTypeResolver(descs *Collection, txn *kv.Txn) DistSQLTypeResolver {
 	return DistSQLTypeResolver{
-		g: descs.ByID(txn).Immutable(),
+		g: descs.ByIDWithLeased(txn).Get(),
 	}
 }
 
@@ -49,15 +49,7 @@ func (dt *DistSQLTypeResolver) ResolveType(
 func (dt *DistSQLTypeResolver) ResolveTypeByOID(
 	ctx context.Context, oid oid.Oid,
 ) (*types.T, error) {
-	id, err := typedesc.UserDefinedTypeOIDToID(oid)
-	if err != nil {
-		return nil, err
-	}
-	name, desc, err := dt.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return desc.MakeTypesT(ctx, &name, dt)
+	return typedesc.ResolveHydratedTByOID(ctx, oid, dt)
 }
 
 // GetTypeDescriptor implements the catalog.TypeDescriptorResolver interface.

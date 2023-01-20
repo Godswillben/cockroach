@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
@@ -201,7 +202,7 @@ type Replica struct {
 	// Multiple types of throughput are accounted for. Where the localities of
 	// requests are tracked in order in addition to the aggregate, in order to
 	// inform load based lease and replica rebalancing decisions.
-	loadStats *ReplicaLoad
+	loadStats *load.ReplicaLoad
 
 	// Held in read mode during read-only commands. Held in exclusive mode to
 	// prevent read-only commands from executing. Acquired before the embedded
@@ -250,7 +251,8 @@ type Replica struct {
 		// Note that there are two StateLoaders, in raftMu and mu,
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
-		// on-disk storage for sideloaded SSTables. nil when there's no ReplicaID.
+		// on-disk storage for sideloaded SSTables. Always non-nil.
+		// TODO(pavelkalinnikov): remove sideloaded == nil checks.
 		sideloaded logstore.SideloadStorage
 		// stateMachine is used to apply committed raft entries.
 		stateMachine replicaStateMachine
@@ -1804,18 +1806,18 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 	// if one exists, regardless of what timestamp it is written at.
 	desc := r.descRLocked()
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	_, intent, err := storage.MVCCGet(ctx, r.Engine(), descKey, hlc.MaxTimestamp,
+	intentRes, err := storage.MVCCGet(ctx, r.Engine(), descKey, hlc.MaxTimestamp,
 		storage.MVCCGetOptions{Inconsistent: true})
 	if err != nil {
 		return false, err
-	} else if intent == nil {
+	} else if intentRes.Intent == nil {
 		return false, nil
 	}
-	val, _, err := storage.MVCCGetAsTxn(
-		ctx, r.Engine(), descKey, intent.Txn.WriteTimestamp, intent.Txn)
+	valRes, err := storage.MVCCGetAsTxn(
+		ctx, r.Engine(), descKey, intentRes.Intent.Txn.WriteTimestamp, intentRes.Intent.Txn)
 	if err != nil {
 		return false, err
-	} else if val != nil {
+	} else if valRes.Value != nil {
 		return false, nil
 	}
 
@@ -1832,7 +1834,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	r.mu.mergeComplete = mergeCompleteCh
-	r.mu.mergeTxnID = intent.Txn.ID
+	r.mu.mergeTxnID = intentRes.Intent.Txn.ID
 	// The RHS of a merge is not permitted to quiesce while a mergeComplete
 	// channel is installed. (If the RHS is quiescent when the merge commits, any
 	// orphaned followers would fail to queue themselves for GC.) Unquiesce the
@@ -1853,11 +1855,11 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 			b := &kv.Batch{}
 			b.Header.Timestamp = r.Clock().Now()
 			b.AddRawRequest(&roachpb.PushTxnRequest{
-				RequestHeader: roachpb.RequestHeader{Key: intent.Txn.Key},
+				RequestHeader: roachpb.RequestHeader{Key: intentRes.Intent.Txn.Key},
 				PusherTxn: roachpb.Transaction{
 					TxnMeta: enginepb.TxnMeta{Priority: enginepb.MinTxnPriority},
 				},
-				PusheeTxn: intent.Txn,
+				PusheeTxn: intentRes.Intent.Txn,
 				PushType:  roachpb.PUSH_ABORT,
 			})
 			if err := r.store.DB().Run(ctx, b); err != nil {
@@ -1881,7 +1883,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 		switch pushTxnRes.PusheeTxn.Status {
 		case roachpb.PENDING, roachpb.STAGING:
 			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
-				intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
+				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		case roachpb.COMMITTED:
 			// If PushTxn claims that the transaction committed, then the transaction
 			// definitely committed.
@@ -2089,7 +2091,7 @@ func init() {
 // requests.
 func (r *Replica) MeasureReqCPUNanos(start time.Duration) {
 	r.measureNanosRunning(start, func(dur float64) {
-		r.loadStats.reqCPUNanos.RecordCount(dur, 0 /* nodeID */)
+		r.loadStats.RecordReqCPUNanos(dur)
 	})
 }
 
@@ -2097,7 +2099,7 @@ func (r *Replica) MeasureReqCPUNanos(start time.Duration) {
 // raft work.
 func (r *Replica) MeasureRaftCPUNanos(start time.Duration) {
 	r.measureNanosRunning(start, func(dur float64) {
-		r.loadStats.raftCPUNanos.RecordCount(dur, 0 /* nodeID */)
+		r.loadStats.RecordRaftCPUNanos(dur)
 	})
 }
 
@@ -2106,8 +2108,14 @@ func (r *Replica) MeasureRaftCPUNanos(start time.Duration) {
 // is recorded against the replica's cpu time attribution.
 func (r *Replica) measureNanosRunning(start time.Duration, f func(float64)) {
 	end := grunning.Time()
-	dur := grunning.Difference(start, end).Nanoseconds()
+	dur := grunning.Elapsed(start, end).Nanoseconds()
 	f(float64(dur))
+}
+
+// GetLoadStatsForTesting is for use only by tests to read the Replicas' load
+// tracker state.
+func (r *Replica) GetLoadStatsForTesting() *load.ReplicaLoad {
+	return r.loadStats
 }
 
 // ReadProtectedTimestampsForTesting is for use only by tests to read and update

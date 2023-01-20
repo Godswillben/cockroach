@@ -13,6 +13,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,10 +51,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
-	"github.com/cockroachdb/cockroach/pkg/sql/recent"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -101,6 +102,13 @@ type SQLServerWrapper struct {
 
 	debug *debug.Server
 
+	// pgL is the SQL listener.
+	pgL net.Listener
+
+	// pgPreServer handles SQL connections prior to routing them to a
+	// specific tenant.
+	pgPreServer *pgwire.PreServeConnHandler
+
 	sqlServer *SQLServer
 	sqlCfg    *SQLConfig
 
@@ -112,6 +120,8 @@ type SQLServerWrapper struct {
 
 	// promRuleExporter is used by the tenant to expose the prometheus rules.
 	promRuleExporter *metric.PrometheusRuleExporter
+
+	tenantTimeSeries *ts.TenantServer
 }
 
 // Drain idempotently activates the draining mode.
@@ -141,7 +151,12 @@ func (s *SQLServerWrapper) Drain(
 // The caller is responsible for listening to the server's ShutdownRequested()
 // channel and stopping cfg.stopper when signaled.
 func NewTenantServer(
-	ctx context.Context, stopper *stop.Stopper, baseCfg BaseConfig, sqlCfg SQLConfig,
+	ctx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
 ) (*SQLServerWrapper, error) {
 	// TODO(knz): Make the license application a per-server thing
 	// instead of a global thing.
@@ -154,7 +169,7 @@ func NewTenantServer(
 	// for a tenant server.
 	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
 
-	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg)
+	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer)
 	if err != nil {
 		return nil, err
 	}
@@ -192,9 +207,6 @@ func NewTenantServer(
 	closedSessionCache := sql.NewClosedSessionCache(
 		baseCfg.Settings, args.monitorAndMetrics.rootSQLMemoryMonitor, time.Now)
 	args.closedSessionCache = closedSessionCache
-
-	args.recentStatementsCache = recent.NewStatementsCache(
-		baseCfg.Settings, args.monitorAndMetrics.rootSQLMemoryMonitor, time.Now)
 
 	// Instantiate the serverIterator to provide fanout to SQL instances. The
 	// serverIterator needs access to sqlServer which is assigned below once we
@@ -236,6 +248,25 @@ func NewTenantServer(
 	// This is the location in NewServer() where we would be creating
 	// the eventsServer. This is currently performed in
 	// makeTenantSQLServerArgs().
+
+	var pgPreServer *pgwire.PreServeConnHandler
+	if !baseCfg.DisableSQLListener {
+		// Initialize the pgwire pre-server, which initializes connections,
+		// sets up TLS and reads client status parameters.
+		ps := pgwire.MakePreServeConnHandler(
+			baseCfg.AmbientCtx,
+			baseCfg.Config,
+			args.Settings,
+			args.rpcContext.GetServerTLSConfig,
+			baseCfg.HistogramWindowInterval(),
+			args.monitorAndMetrics.rootSQLMemoryMonitor,
+			false, /* acceptTenantName */
+		)
+		for _, m := range ps.Metrics() {
+			args.registry.AddMetricStruct(m)
+		}
+		pgPreServer = &ps
+	}
 
 	// Instantiate the SQL server proper.
 	sqlServer, err := newSQLServer(ctx, args)
@@ -282,7 +313,7 @@ func NewTenantServer(
 	)
 
 	// Connect the various servers to RPC.
-	for _, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth} {
+	for _, gw := range []grpcGatewayServer{sAdmin, sStatus, sAuth, args.tenantTimeSeriesServer} {
 		gw.RegisterService(args.grpc.Server)
 	}
 
@@ -326,12 +357,15 @@ func NewTenantServer(
 
 		debug: debugServer,
 
+		pgPreServer: pgPreServer,
+
 		sqlServer: sqlServer,
 		sqlCfg:    args.SQLConfig,
 
 		externalStorageBuilder: args.externalStorageBuilder,
 		costController:         args.costController,
 		promRuleExporter:       args.promRuleExporter,
+		tenantTimeSeries:       args.tenantTimeSeriesServer,
 	}, nil
 }
 
@@ -376,7 +410,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	ieMon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
 	ieMon.StartNoReserved(ctx, s.PGServer().SQLServer.GetBytesMonitor())
 	s.stopper.AddCloser(stop.CloserFn(func() { ieMon.Stop(ctx) }))
-	fileTableInternalExecutor := sql.MakeInternalExecutor(s.PGServer().SQLServer, sql.MemoryMetrics{}, ieMon)
 	s.externalStorageBuilder.init(
 		ctx,
 		s.sqlCfg.ExternalIODirConfig,
@@ -384,9 +417,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		s.sqlServer.cfg.IDContainer,
 		s.nodeDialer,
 		s.sqlServer.cfg.TestingKnobs,
-		&fileTableInternalExecutor,
-		s.sqlServer.execCfg.InternalExecutorFactory,
-		s.db,
+		s.sqlServer.execCfg.InternalDB.
+			CloneWithMemoryMonitor(sql.MemoryMetrics{}, ieMon),
 		s.costController,
 		s.registry,
 	)
@@ -400,9 +432,13 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// and dispatches the server worker for the RPC.
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
-	pgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc)
+	enableSQLListener := !s.sqlServer.cfg.DisableSQLListener
+	pgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc, enableSQLListener)
 	if err != nil {
 		return err
+	}
+	if enableSQLListener {
+		s.pgL = pgL
 	}
 
 	// Tell the RPC context how to connect in-memory.
@@ -430,7 +466,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	}
 
 	// Connect the various RPC handlers to the gRPC gateway.
-	for _, gw := range []grpcGatewayServer{s.tenantAdmin, s.tenantStatus, s.authentication} {
+	for _, gw := range []grpcGatewayServer{s.tenantAdmin, s.tenantStatus, s.authentication, s.tenantTimeSeries} {
 		if err := gw.RegisterGateway(gwCtx, gwMux, conn); err != nil {
 			return err
 		}
@@ -607,7 +643,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		workersCtx,
 		s.stopper,
 		s.sqlServer.cfg.TestingKnobs,
-		pgL,
 		orphanedLeasesTimeThresholdNanos,
 	); err != nil {
 		return err
@@ -666,16 +701,37 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 // This mirrors the implementation of (*Server).AcceptClients.
 // TODO(knz): Find a way to implement this method only once for both.
 func (s *SQLServerWrapper) AcceptClients(ctx context.Context) error {
-	workersCtx := s.AnnotateCtx(context.Background())
+	if !s.sqlServer.cfg.DisableSQLListener {
+		workersCtx := s.AnnotateCtx(context.Background())
 
-	if err := s.sqlServer.startServeSQL(
-		workersCtx,
-		s.stopper,
-		s.sqlServer.pgL,
-		&s.sqlServer.cfg.SocketFile,
-	); err != nil {
-		return err
+		pgServer := s.sqlServer.pgServer
+		serveConn := func(ctx context.Context, conn net.Conn, status pgwire.PreServeStatus) error {
+			switch status.State {
+			case pgwire.PreServeCancel:
+				if err := pgServer.HandleCancel(ctx, status.CancelKey); err != nil {
+					log.Sessions.Warningf(ctx, "unexpected while handling pgwire cancellation request: %v", err)
+				}
+				return nil
+			case pgwire.PreServeReady:
+				return pgServer.ServeConn(ctx, conn, status)
+			default:
+				return errors.AssertionFailedf("programming error: missing case %v", status.State)
+			}
+		}
+
+		if err := startServeSQL(
+			workersCtx,
+			s.stopper,
+			s.pgPreServer,
+			serveConn,
+			s.pgL,
+			&s.sqlServer.cfg.SocketFile,
+		); err != nil {
+			return err
+		}
 	}
+
+	s.sqlServer.isReady.Set(true)
 
 	log.Event(ctx, "server ready")
 	return nil
@@ -732,7 +788,12 @@ func (s *SQLServerWrapper) ShutdownRequested() <-chan ShutdownRequest {
 }
 
 func makeTenantSQLServerArgs(
-	startupCtx context.Context, stopper *stop.Stopper, baseCfg BaseConfig, sqlCfg SQLConfig,
+	startupCtx context.Context,
+	stopper *stop.Stopper,
+	baseCfg BaseConfig,
+	sqlCfg SQLConfig,
+	parentRecorder *status.MetricsRecorder,
+	tenantNameContainer *roachpb.TenantNameContainer,
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 
@@ -762,6 +823,15 @@ func makeTenantSQLServerArgs(
 		Settings:         st,
 		Knobs:            rpcTestingKnobs,
 	})
+	// If there is a local KV server, hook this SQLServer to it so that the
+	// SQLServer can perform some RPCs directly, without going through gRPC.
+	if lsi := sqlCfg.LocalKVServerInfo; lsi != nil {
+		rpcContext.SetLocalInternalServer(
+			lsi.InternalServer,
+			true, // tenant
+			lsi.ServerInterceptors,
+			rpcContext.ClientInterceptors())
+	}
 
 	var dsKnobs kvcoord.ClientTestingKnobs
 	if dsKnobsP, ok := baseCfg.TestingKnobs.KVClient.(*kvcoord.ClientTestingKnobs); ok {
@@ -835,37 +905,49 @@ func makeTenantSQLServerArgs(
 		return sqlServerArgs{}, err
 	}
 
+	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect)
+
 	systemConfigWatcher := systemconfigwatcher.NewWithAdditionalProvider(
 		keys.MakeSQLCodec(sqlCfg.TenantID), clock, rangeFeedFactory, &baseCfg.DefaultZoneConfig,
 		tenantConnect,
 	)
 
+	// Define structures which have circular dependencies. The underlying structures
+	// will be filled in during the construction of the sql server.
 	circularInternalExecutor := &sql.InternalExecutor{}
-	internalExecutorFactory := &sql.InternalExecutorFactory{}
+	internalExecutorFactory := sql.NewShimInternalDB(db)
 	circularJobRegistry := &jobs.Registry{}
 
 	// Initialize the protectedts subsystem in multi-tenant clusters.
 	var protectedTSProvider protectedts.Provider
 	protectedtsKnobs, _ := baseCfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
 	pp, err := ptprovider.New(ptprovider.Config{
-		DB:               db,
-		InternalExecutor: circularInternalExecutor,
-		Settings:         st,
-		Knobs:            protectedtsKnobs,
+		DB:       internalExecutorFactory,
+		Settings: st,
+		Knobs:    protectedtsKnobs,
 		ReconcileStatusFuncs: ptreconcile.StatusFuncs{
 			jobsprotectedts.GetMetaType(jobsprotectedts.Jobs): jobsprotectedts.MakeStatusFunc(
-				circularJobRegistry, circularInternalExecutor, jobsprotectedts.Jobs),
+				circularJobRegistry, jobsprotectedts.Jobs,
+			),
 			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(
-				circularJobRegistry, circularInternalExecutor, jobsprotectedts.Schedules),
+				circularJobRegistry, jobsprotectedts.Schedules,
+			),
 		},
 	})
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
 	registry.AddMetricStruct(pp.Metrics())
-	protectedTSProvider = tenantProtectedTSProvider{Provider: pp, st: st}
+	protectedTSProvider = pp
 
-	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st)
+	recorder := status.NewMetricsRecorder(clock, nil, rpcContext, nil, st, tenantNameContainer)
+	// Note: If the tenant is in-process, we attach this tenant's metric
+	// recorder to the parentRecorder held by the system tenant. This
+	// ensures that generated Prometheus metrics from the system tenant
+	// include metrics from this in-process tenant.
+	if parentRecorder != nil {
+		parentRecorder.AddTenantRecorder(recorder)
+	}
 
 	runtime := status.NewRuntimeStatSampler(startupCtx, clock)
 	registry.AddMetricStruct(runtime)
@@ -944,7 +1026,7 @@ func makeTenantSQLServerArgs(
 		sessionRegistry:          sessionRegistry,
 		remoteFlowRunner:         remoteFlowRunner,
 		circularInternalExecutor: circularInternalExecutor,
-		internalExecutorFactory:  internalExecutorFactory,
+		internalDB:               internalExecutorFactory,
 		circularJobRegistry:      circularJobRegistry,
 		protectedtsProvider:      protectedTSProvider,
 		rangeFeedFactory:         rangeFeedFactory,
@@ -956,6 +1038,7 @@ func makeTenantSQLServerArgs(
 		externalStorageBuilder:   esb,
 		admissionPacerFactory:    noopElasticCPUGrantCoord,
 		rangeDescIteratorFactory: tenantConnect,
+		tenantTimeSeriesServer:   sTS,
 	}, nil
 }
 

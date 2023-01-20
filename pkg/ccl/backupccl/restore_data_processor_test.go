@@ -34,9 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/oppurpose"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -251,13 +251,11 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	evalCtx := eval.Context{Settings: s.ClusterSettings(), Tracer: s.AmbientCtx().Tracer}
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			DB: kvDB,
+			DB: s.InternalDB().(descs.DB),
 			ExternalStorage: func(ctx context.Context, dest cloudpb.ExternalStorage, opts ...cloud.ExternalStorageOption) (cloud.ExternalStorage, error) {
 				return cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{},
 					s.ClusterSettings(), blobs.TestBlobServiceClient(s.ClusterSettings().ExternalIODir),
-					nil, /* ie */
-					nil, /* ief */
-					nil, /* kvDB */
+					nil, /* db */
 					nil, /* limiters */
 					cloud.NilMetrics,
 					opts...)
@@ -365,7 +363,6 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				ctx,
 				reqMidKey1,
 				hlc.MaxTimestamp, /* expirationTime */
-				oppurpose.SplitBackup,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -373,7 +370,6 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 				ctx,
 				reqMidKey2,
 				hlc.MaxTimestamp, /* expirationTime */
-				oppurpose.SplitBackup,
 			); err != nil {
 				t.Fatal(err)
 			}

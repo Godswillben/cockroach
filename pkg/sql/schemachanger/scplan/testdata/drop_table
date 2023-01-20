@@ -41,6 +41,8 @@ StatementPhase stage 1 of 1 with 3 MutationType ops
     [[Column:{DescID: 109, ColumnID: 4294967294}, ABSENT], PUBLIC] -> WRITE_ONLY
     [[PrimaryIndex:{DescID: 109, IndexID: 1, ConstraintID: 1}, ABSENT], PUBLIC] -> VALIDATED
     [[SecondaryIndex:{DescID: 109, IndexID: 2, ConstraintID: 0}, ABSENT], PUBLIC] -> VALIDATED
+    [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], PUBLIC] -> VALIDATED
+    [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, ABSENT], PUBLIC] -> VALIDATED
     [[Sequence:{DescID: 110}, ABSENT], PUBLIC] -> TXN_DROPPED
     [[View:{DescID: 111}, ABSENT], PUBLIC] -> TXN_DROPPED
     [[Column:{DescID: 111, ColumnID: 1}, ABSENT], PUBLIC] -> WRITE_ONLY
@@ -54,7 +56,7 @@ StatementPhase stage 1 of 1 with 3 MutationType ops
       DescriptorID: 110
     *scop.MarkDescriptorAsSyntheticallyDropped
       DescriptorID: 111
-PreCommitPhase stage 1 of 1 with 42 MutationType ops
+PreCommitPhase stage 1 of 1 with 47 MutationType ops
   transitions:
     [[Namespace:{DescID: 109, Name: shipments, ReferencedDescID: 100}, ABSENT], PUBLIC] -> ABSENT
     [[Owner:{DescID: 109}, ABSENT], PUBLIC] -> ABSENT
@@ -103,10 +105,10 @@ PreCommitPhase stage 1 of 1 with 42 MutationType ops
     [[SecondaryIndexPartial:{DescID: 109, IndexID: 2}, ABSENT], PUBLIC] -> ABSENT
     [[SecondaryIndex:{DescID: 109, IndexID: 2, ConstraintID: 0}, ABSENT], VALIDATED] -> ABSENT
     [[IndexName:{DescID: 109, Name: partialidx, IndexID: 2}, ABSENT], PUBLIC] -> ABSENT
-    [[ForeignKeyConstraint:{DescID: 109, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], VALIDATED] -> ABSENT
     [[ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT], PUBLIC] -> ABSENT
     [[ConstraintComment:{DescID: 109, ConstraintID: 2, Comment: customer is not god}, ABSENT], PUBLIC] -> ABSENT
-    [[ForeignKeyConstraint:{DescID: 109, ConstraintID: 3, ReferencedDescID: 105}, ABSENT], PUBLIC] -> ABSENT
+    [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, ABSENT], VALIDATED] -> ABSENT
     [[ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT], PUBLIC] -> ABSENT
     [[Namespace:{DescID: 110, Name: sq1, ReferencedDescID: 100}, ABSENT], PUBLIC] -> ABSENT
     [[Owner:{DescID: 110}, ABSENT], PUBLIC] -> ABSENT
@@ -135,11 +137,45 @@ PreCommitPhase stage 1 of 1 with 42 MutationType ops
   ops:
     *scop.MarkDescriptorAsDropped
       DescriptorID: 109
-    *scop.RemoveAllTableComments
+    *scop.RemoveTableComment
       TableID: 109
+    *scop.LogEvent
+      Element:
+        TableComment:
+          comment: shipment is important
+          tableId: 109
+      EventBase:
+        Authorization:
+          UserName: root
+        Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+        StatementTag: DROP TABLE
+        TargetMetadata:
+          SourceElementID: 1
+          SubWorkID: 1
+      TargetStatus: 1
     *scop.RemoveColumnDefaultExpression
       ColumnID: 1
       TableID: 109
+    *scop.RemoveColumnComment
+      ColumnID: 1
+      PgAttributeNum: 1
+      TableID: 109
+    *scop.LogEvent
+      Element:
+        ColumnComment:
+          columnId: 1
+          comment: tracking_number is a must
+          pgAttributeNum: 1
+          tableId: 109
+      EventBase:
+        Authorization:
+          UserName: root
+        Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+        StatementTag: DROP TABLE
+        TargetMetadata:
+          SourceElementID: 1
+          SubWorkID: 1
+      TargetStatus: 1
     *scop.RemoveDroppedColumnType
       ColumnID: 3
       TableID: 109
@@ -156,35 +192,53 @@ PreCommitPhase stage 1 of 1 with 42 MutationType ops
       BackReferencedTableID: 109
       SequenceIDs:
       - 106
+    *scop.RemoveIndexComment
+      IndexID: 1
+      TableID: 109
+    *scop.LogEvent
+      Element:
+        IndexComment:
+          comment: pkey is good
+          indexId: 1
+          tableId: 109
+      EventBase:
+        Authorization:
+          UserName: root
+        Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+        StatementTag: DROP TABLE
+        TargetMetadata:
+          SourceElementID: 1
+          SubWorkID: 1
+      TargetStatus: 1
     *scop.RemoveDroppedIndexPartialPredicate
       IndexID: 2
       TableID: 109
-    *scop.RemoveForeignKeyBackReference
-      OriginConstraintID: 2
-      OriginTableID: 109
-      ReferencedTableID: 104
-    *scop.RemoveForeignKeyConstraint
+    *scop.RemoveConstraintComment
       ConstraintID: 2
       TableID: 109
-    *scop.RemoveForeignKeyBackReference
-      OriginConstraintID: 3
-      OriginTableID: 109
-      ReferencedTableID: 105
-    *scop.RemoveForeignKeyConstraint
-      ConstraintID: 3
-      TableID: 109
+    *scop.LogEvent
+      Element:
+        ConstraintComment:
+          comment: customer is not god
+          constraintId: 2
+          tableId: 109
+      EventBase:
+        Authorization:
+          UserName: root
+        Statement: DROP TABLE ‹defaultdb›.public.‹shipments› CASCADE
+        StatementTag: DROP TABLE
+        TargetMetadata:
+          SourceElementID: 1
+          SubWorkID: 1
+      TargetStatus: 1
     *scop.MarkDescriptorAsDropped
       DescriptorID: 110
-    *scop.RemoveAllTableComments
-      TableID: 110
     *scop.MarkDescriptorAsDropped
       DescriptorID: 111
     *scop.RemoveViewBackReferencesInRelations
       BackReferencedViewID: 111
       RelationIDs:
       - 109
-    *scop.RemoveAllTableComments
-      TableID: 111
     *scop.DrainDescriptorName
       Namespace:
         DatabaseID: 100
@@ -240,6 +294,20 @@ PreCommitPhase stage 1 of 1 with 42 MutationType ops
         TargetMetadata:
           SourceElementID: 1
           SubWorkID: 1
+      TableID: 109
+    *scop.RemoveForeignKeyBackReference
+      OriginConstraintID: 2
+      OriginTableID: 109
+      ReferencedTableID: 104
+    *scop.RemoveForeignKeyConstraint
+      ConstraintID: 2
+      TableID: 109
+    *scop.RemoveForeignKeyBackReference
+      OriginConstraintID: 3
+      OriginTableID: 109
+      ReferencedTableID: 105
+    *scop.RemoveForeignKeyConstraint
+      ConstraintID: 3
       TableID: 109
     *scop.DrainDescriptorName
       Namespace:
@@ -735,6 +803,30 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [Column:{DescID: 111, ColumnID: 4294967295}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ConstraintComment:{DescID: 109, ConstraintID: 2, Comment: customer is not god}, ABSENT]
+  to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT]
+  kind: Precedence
+  rule: dependents removed before constraint
+- from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT]
+  to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT]
+  kind: Precedence
+  rule: dependents removed before constraint
+- from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT]
+  to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, ABSENT]
+  kind: Precedence
+  rule: dependents removed before constraint
+- from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, VALIDATED]
+  to:   [ConstraintComment:{DescID: 109, ConstraintID: 2, Comment: customer is not god}, ABSENT]
+  kind: Precedence
+  rule: constraint no longer public before dependents
+- from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, VALIDATED]
+  to:   [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT]
+  kind: Precedence
+  rule: constraint no longer public before dependents
+- from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, VALIDATED]
+  to:   [ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT]
+  kind: Precedence
+  rule: constraint no longer public before dependents
 - from: [IndexColumn:{DescID: 109, ColumnID: 1, IndexID: 1}, ABSENT]
   to:   [Column:{DescID: 109, ColumnID: 1}, ABSENT]
   kind: Precedence
@@ -1012,14 +1104,6 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: descriptor drop right before dependent element removal
 - from: [Table:{DescID: 109}, DROPPED]
-  to:   [ForeignKeyConstraint:{DescID: 109, ConstraintID: 2, ReferencedDescID: 104}, ABSENT]
-  kind: Precedence
-  rule: descriptor drop right before dependent element removal
-- from: [Table:{DescID: 109}, DROPPED]
-  to:   [ForeignKeyConstraint:{DescID: 109, ConstraintID: 3, ReferencedDescID: 105}, ABSENT]
-  kind: Precedence
-  rule: descriptor drop right before dependent element removal
-- from: [Table:{DescID: 109}, DROPPED]
   to:   [IndexColumn:{DescID: 109, ColumnID: 1, IndexID: 1}, ABSENT]
   kind: Precedence
   rule: descriptor drop right before dependent element removal
@@ -1199,7 +1283,7 @@ StatementPhase stage 1 of 1 with 1 MutationType op
   ops:
     *scop.MarkDescriptorAsSyntheticallyDropped
       DescriptorID: 114
-PreCommitPhase stage 1 of 1 with 21 MutationType ops
+PreCommitPhase stage 1 of 1 with 20 MutationType ops
   transitions:
     [[Namespace:{DescID: 114, Name: greeter, ReferencedDescID: 100}, ABSENT], PUBLIC] -> ABSENT
     [[Owner:{DescID: 114}, ABSENT], PUBLIC] -> ABSENT
@@ -1240,8 +1324,6 @@ PreCommitPhase stage 1 of 1 with 21 MutationType ops
   ops:
     *scop.MarkDescriptorAsDropped
       DescriptorID: 114
-    *scop.RemoveAllTableComments
-      TableID: 114
     *scop.RemoveColumnDefaultExpression
       ColumnID: 1
       TableID: 114

@@ -97,7 +97,8 @@ type Storage struct {
 type instancerow struct {
 	region     []byte
 	instanceID base.SQLInstanceID
-	addr       string
+	sqlAddr    string
+	rpcAddr    string
 	sessionID  sqlliveness.SessionID
 	locality   roachpb.Locality
 	timestamp  hlc.Timestamp
@@ -140,14 +141,15 @@ func (s *Storage) CreateInstance(
 	ctx context.Context,
 	sessionID sqlliveness.SessionID,
 	sessionExpiration hlc.Timestamp,
-	addr string,
+	rpcAddr string,
+	sqlAddr string,
 	locality roachpb.Locality,
 ) (instance sqlinstance.InstanceInfo, _ error) {
-	if len(addr) == 0 {
-		return sqlinstance.InstanceInfo{}, errors.New("no address information for instance")
+	if len(sqlAddr) == 0 || len(rpcAddr) == 0 {
+		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("missing sql or rpc address information for instance")
 	}
 	if len(sessionID) == 0 {
-		return sqlinstance.InstanceInfo{}, errors.New("no session information for instance")
+		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("no session information for instance")
 	}
 
 	region, _, err := slstorage.UnsafeDecodeSessionID(sessionID)
@@ -183,7 +185,7 @@ func (s *Storage) CreateInstance(
 			}
 
 			key := s.rowcodec.encodeKey(region, availableID)
-			value, err := s.rowcodec.encodeValue(addr, sessionID, locality)
+			value, err := s.rowcodec.encodeValue(rpcAddr, sqlAddr, sessionID, locality)
 			if err != nil {
 				log.Warningf(ctx, "failed to encode row for instance id %d: %v", availableID, err)
 				return err
@@ -205,16 +207,17 @@ func (s *Storage) CreateInstance(
 		Multiplier:     2,
 	}
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
-		log.Infof(ctx, "assigning instance id to addr %s", addr)
+		log.Infof(ctx, "assigning instance id to rpc addr %s and sql addr %s", rpcAddr, sqlAddr)
 		instanceID, err := assignInstance()
 		// Instance was successfully assigned an ID.
 		if err == nil {
 			return sqlinstance.InstanceInfo{
-				Region:       region,
-				InstanceID:   instanceID,
-				InstanceAddr: addr,
-				SessionID:    sessionID,
-				Locality:     locality,
+				Region:          region,
+				InstanceID:      instanceID,
+				InstanceRPCAddr: rpcAddr,
+				InstanceSQLAddr: sqlAddr,
+				SessionID:       sessionID,
+				Locality:        locality,
 			}, err
 		}
 		if !errors.Is(err, errNoPreallocatedRows) {
@@ -393,16 +396,18 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	ts timeutil.TimeSource,
-	internalExecutorFactory descs.TxnManager,
+	db descs.DB,
 	sessionExpirationFn func() hlc.Timestamp,
 ) error {
 	loadRegions := func() ([][]byte, error) {
 		// Load regions from the system DB.
 		var regions [][]byte
-		if err := internalExecutorFactory.DescsTxn(ctx, s.db, func(
-			ctx context.Context, txn *kv.Txn, descsCol *descs.Collection,
+		if err := db.DescsTxn(ctx, func(
+			ctx context.Context, txn descs.Txn,
 		) error {
-			enumReps, _, err := sql.GetRegionEnumRepresentations(ctx, txn, keys.SystemDatabaseID, descsCol)
+			enumReps, _, err := sql.GetRegionEnumRepresentations(
+				ctx, txn.KV(), keys.SystemDatabaseID, txn.Descriptors(),
+			)
 			if err != nil {
 				if errors.Is(err, sql.ErrNotMultiRegionDatabase) {
 					return nil

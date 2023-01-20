@@ -36,7 +36,10 @@ import {
   setGlobalTimeScaleAction,
 } from "src/redux/statements";
 import { createStatementDiagnosticsAlertLocalSetting } from "src/redux/alerts";
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import {
+  selectHasAdminRole,
+  selectHasViewActivityRedactedRole,
+} from "src/redux/user";
 import {
   trackCancelDiagnosticsBundleAction,
   trackDownloadDiagnosticsBundleAction,
@@ -48,6 +51,7 @@ import { getMatchParamByName, queryByName } from "src/util/query";
 import { appNamesAttr, statementAttr } from "src/util/constants";
 import { selectTimeScale } from "src/redux/timeScale";
 import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
+import moment from "moment";
 
 const { generateStmtDetailsToID } = util;
 
@@ -67,6 +71,7 @@ export const selectStatementDetails = createSelector(
     statementDetails: StatementDetailsResponseMessage;
     isLoading: boolean;
     lastError: Error;
+    lastUpdated: moment.Moment | null;
   } => {
     // Since the aggregation interval is 1h, we want to round the selected timeScale to include
     // the full hour. If a timeScale is between 14:32 - 15:17 we want to search for values
@@ -85,9 +90,15 @@ export const selectStatementDetails = createSelector(
         statementDetails: statementDetailsStats[key].data,
         isLoading: statementDetailsStats[key].inFlight,
         lastError: statementDetailsStats[key].lastError,
+        lastUpdated: statementDetailsStats[key]?.setAt?.utc(),
       };
     }
-    return { statementDetails: null, isLoading: true, lastError: null };
+    return {
+      statementDetails: null,
+      isLoading: true,
+      lastError: null,
+      lastUpdated: null,
+    };
   },
 );
 
@@ -95,16 +106,15 @@ const mapStateToProps = (
   state: AdminUIState,
   props: RouteComponentProps,
 ): StatementDetailsStateProps => {
-  const { statementDetails, isLoading, lastError } = selectStatementDetails(
-    state,
-    props,
-  );
+  const { statementDetails, isLoading, lastError, lastUpdated } =
+    selectStatementDetails(state, props);
   const statementFingerprint = statementDetails?.statement.metadata.query;
   return {
     statementFingerprintID: getMatchParamByName(props.match, statementAttr),
     statementDetails,
     isLoading: isLoading,
     statementsError: lastError,
+    lastUpdated: lastUpdated,
     timeScale: selectTimeScale(state),
     nodeRegions: nodeRegionsByIDSelector(state),
     diagnosticsReports: selectDiagnosticsReportsByStatementFingerprint(
@@ -112,6 +122,7 @@ const mapStateToProps = (
       statementFingerprint,
     ),
     hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+    hasAdminRole: selectHasAdminRole(state),
   };
 };
 

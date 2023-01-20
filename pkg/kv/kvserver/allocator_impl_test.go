@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
@@ -49,6 +50,48 @@ var singleStore = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 1,
+			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+		},
+		Capacity: roachpb.StoreCapacity{
+			Capacity:     200,
+			Available:    100,
+			LogicalBytes: 100,
+		},
+	},
+}
+
+var threeStores = []*roachpb.StoreDescriptor{
+	{
+		StoreID: 1,
+		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
+		Node: roachpb.NodeDescriptor{
+			NodeID: 1,
+			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+		},
+		Capacity: roachpb.StoreCapacity{
+			Capacity:     200,
+			Available:    100,
+			LogicalBytes: 100,
+		},
+	},
+	{
+		StoreID: 2,
+		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
+		Node: roachpb.NodeDescriptor{
+			NodeID: 2,
+			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+		},
+		Capacity: roachpb.StoreCapacity{
+			Capacity:     200,
+			Available:    100,
+			LogicalBytes: 100,
+		},
+	},
+	{
+		StoreID: 3,
+		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
+		Node: roachpb.NodeDescriptor{
+			NodeID: 3,
 			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
 		},
 		Capacity: roachpb.StoreCapacity{
@@ -161,7 +204,7 @@ func TestAllocatorRebalanceTarget(t *testing.T) {
 	repl.mu.state.Stats = &enginepb.MVCCStats{}
 	repl.mu.Unlock()
 
-	repl.loadStats = NewReplicaLoad(clock, nil)
+	repl.loadStats = load.NewReplicaLoad(clock, nil)
 
 	var rangeUsageInfo allocator.RangeUsageInfo
 

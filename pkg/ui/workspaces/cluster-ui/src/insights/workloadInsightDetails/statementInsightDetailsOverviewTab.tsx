@@ -44,16 +44,17 @@ const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 export interface StatementInsightDetailsOverviewTabProps {
   insightEventDetails: FlattenedStmtInsightEvent;
   setTimeScale: (ts: TimeScale) => void;
+  hasAdminRole: boolean;
 }
 
 export const StatementInsightDetailsOverviewTab: React.FC<
   StatementInsightDetailsOverviewTabProps
-> = ({ insightEventDetails, setTimeScale }) => {
+> = ({ insightEventDetails, setTimeScale, hasAdminRole }) => {
   const isCockroachCloud = useContext(CockroachCloudContext);
 
   const insightsColumns = useMemo(
-    () => makeInsightsColumns(isCockroachCloud),
-    [isCockroachCloud],
+    () => makeInsightsColumns(isCockroachCloud, hasAdminRole),
+    [isCockroachCloud, hasAdminRole],
   );
 
   const insightDetails = insightEventDetails;
@@ -67,7 +68,7 @@ export const StatementInsightDetailsOverviewTab: React.FC<
     columnTitle: "duration",
   });
   let contentionTable: JSX.Element = null;
-  if (insightDetails.contentionEvents != null) {
+  if (insightDetails?.contentionEvents !== null) {
     contentionTable = (
       <Row gutter={24} className={tableCx("margin-bottom")}>
         <Col className="gutter-row">

@@ -3,6 +3,7 @@
 source [file join [file dirname $argv0] common.tcl]
 
 set ::env(COCKROACH_INSECURE) "false"
+set python "python2.7"
 
 spawn $argv demo --empty --no-line-editor --multitenant=true
 eexpect "Welcome"
@@ -49,7 +50,7 @@ eexpect eof
 end_test
 
 start_test "Check that a SQL shell can connect to the system tenant without special arguments as demo"
-spawn $argv sql --no-line-editor -u demo -p 26258
+spawn $argv sql --no-line-editor -u demo -d cluster:system
 eexpect "Welcome"
 eexpect demo@
 eexpect "defaultdb>"
@@ -60,8 +61,8 @@ send "\\q\r"
 eexpect eof
 end_test
 
-start_test "Check that a SQL shell can connect to the app tenant without special arguments as root"
-spawn $argv sql --no-line-editor -u root -p 26258
+start_test "Check that a SQL shell can connect to the system tenant without special arguments as root"
+spawn $argv sql --no-line-editor -u root -d cluster:system
 eexpect "Welcome"
 eexpect root@
 eexpect "defaultdb>"
@@ -72,6 +73,64 @@ send "\\q\r"
 eexpect eof
 end_test
 
+spawn /bin/bash
+set shell_spawn_id $spawn_id
+send "PS1=':''/# '\r"
+eexpect ":/# "
+
+start_test "Check that an auth cookie can be extracted for a demo session"
+# From the system tenant.
+set ssldir $env(HOME)/.cockroach-demo
+set sqlurl "postgresql://root@127.0.0.1:26257/?options=-ccluster%3Dsystem&sslmode=require&sslrootcert=$ssldir/ca.crt&sslcert=$ssldir/client.root.crt&sslkey=$ssldir/client.root.key"
+send "$argv auth-session login root --url \"$sqlurl\" --only-cookie >cookie_system.txt\r"
+eexpect ":/# "
+# From the app tenant.
+send "$argv auth-session login root --certs-dir=\$HOME/.cockroach-demo --only-cookie >cookie_app.txt\r"
+eexpect ":/# "
+
+# Check that the cookies work.
+set pyfile [file join [file dirname $argv0] test_auth_cookie.py]
+
+send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?tenant_name=system'\r"
+eexpect "username"
+eexpect "demo"
+# No tenant name specified -> use default tenant.
+send "$python $pyfile cookie_app.txt 'http://localhost:8080/_admin/v1/users'\r"
+eexpect "username"
+eexpect "demo"
+end_test
+
+
+start_test "Check that login sessions are preserved across demo restarts."
+
 set spawn_id $demo_spawn_id
 send "\\q\r"
 eexpect eof
+
+spawn $argv demo --empty --no-line-editor --multitenant=true
+set demo_spawn_id $spawn_id
+eexpect "Welcome"
+eexpect "defaultdb>"
+
+set spawn_id $shell_spawn_id
+
+send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?tenant_name=system'\r"
+eexpect "username"
+eexpect "demo"
+# No tenant name specified -> use default tenant.
+send "$python $pyfile cookie_app.txt 'http://localhost:8080/_admin/v1/users'\r"
+eexpect "username"
+eexpect "demo"
+end_test
+
+send "exit\r"
+eexpect eof
+
+set spawn_id $demo_spawn_id
+send "\\q\r"
+eexpect eof
+
+# Regression test for #95135.
+start_test "Verify that the demo command did not leave tenant directories around."
+system "if ls tenant-* >logs/tenants 2>&1; then echo Strays; cat logs/tenants; exit 1; fi"
+end_test

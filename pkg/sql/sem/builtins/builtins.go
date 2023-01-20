@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/randgen/randgencfg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -4092,7 +4093,11 @@ value if you rely on the HLC for accuracy.`,
 				if err := protoutil.Unmarshal(data, &msg); err != nil {
 					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid protocol message")
 				}
-				return tree.NewDString(msg.Type().String()), nil
+				typ, err := msg.CheckType()
+				if err != nil {
+					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "invalid type in job payload protocol message")
+				}
+				return tree.NewDString(typ.String()), nil
 			}
 
 			return []tree.Overload{
@@ -4204,7 +4209,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_statement_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4235,7 +4240,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_transaction_stats": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4269,7 +4274,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 	"crdb_internal.merge_stats_metadata": makeBuiltin(arrayProps(),
 		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONArray}},
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				arr := tree.MustBeDArray(args[0])
@@ -4910,20 +4915,30 @@ value if you rely on the HLC for accuracy.`,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
-				{Name: "id", Typ: types.Int},
+				{Name: "parameters", Typ: types.Jsonb},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
+				tid, err := evalCtx.Tenant.CreateTenant(ctx,
+					args[0].(*tree.DJSON).JSON.String(),
+				)
 				if err != nil {
 					return nil, err
 				}
-				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), ""); err != nil {
-					return nil, err
-				}
-				return args[0], nil
+				return tree.NewDInt(tree.DInt(tid.ToUint64())), nil
 			},
-			Info:       "Creates a new tenant with the provided ID. Must be run by the System tenant.",
+			Info: `Creates a new tenant with the provided parameters. ` +
+				`Must be run by the system tenant.`,
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "id", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1))`,
+			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
@@ -4932,18 +4947,9 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.CreateTenantWithID(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Creates a new tenant with the provided ID and name. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'name', $2))`,
+			Info:       `create_tenant(id, name) is an alias for create_tenant('{"id": id, "name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
@@ -4951,43 +4957,9 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				tenantName := tree.MustBeDString(args[0])
-				var tenantID roachpb.TenantID
-				var err error
-				if tenantID, err = evalCtx.Tenant.CreateTenant(ctx, roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return tree.NewDInt(tree.DInt(tenantID.ToUint64())), nil
-			},
-			Info:       "Creates a new tenant with the provided name. Must be run by the System tenant.",
-			Volatility: volatility.Volatile,
-		},
-	),
-
-	"crdb_internal.rename_tenant": makeBuiltin(
-		tree.FunctionProperties{
-			Category:     builtinconstants.CategoryMultiTenancy,
-			Undocumented: true,
-		},
-		tree.Overload{
-			Types: tree.ParamTypes{
-				{Name: "id", Typ: types.Int},
-				{Name: "name", Typ: types.String},
-			},
-			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				tenantName := tree.MustBeDString(args[1])
-				if err := evalCtx.Tenant.RenameTenant(ctx, uint64(sTenID), roachpb.TenantName(tenantName)); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Renames the specified tenant. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
+			Info:       `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5025,6 +4997,8 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	// destroy_tenant is preserved for compatibility with CockroachCloud
+	// intrusion for v22.2 and previous versions.
 	"crdb_internal.destroy_tenant": makeBuiltin(
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,
@@ -5035,19 +5009,9 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				sTenID, err := mustBeDIntInTenantRange(args[0])
-				if err != nil {
-					return nil, err
-				}
-				if err := evalCtx.Tenant.DestroyTenantByID(
-					ctx, uint64(sTenID), false, /* synchronous */
-				); err != nil {
-					return nil, err
-				}
-				return args[0], nil
-			},
-			Info:       "Destroys a tenant with the provided ID. Must be run by the System tenant.",
+			IsUDF:      true,
+			Body:       `SELECT crdb_internal.destroy_tenant($1, false)`,
+			Info:       "DO NOT USE -- USE 'DROP TENANT' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 		tree.Overload{
@@ -5062,15 +5026,14 @@ value if you rely on the HLC for accuracy.`,
 					return nil, err
 				}
 				synchronous := tree.MustBeDBool(args[1])
-				if err := evalCtx.Tenant.DestroyTenantByID(
+				if err := evalCtx.Tenant.DropTenantByID(
 					ctx, uint64(sTenID), bool(synchronous),
 				); err != nil {
 					return nil, err
 				}
 				return args[0], nil
 			},
-			Info: "Destroys a tenant with the provided ID. Must be run by the System tenant. " +
-				"Optionally, synchronously destroy the data",
+			Info:       "DO NOT USE -- USE 'DROP TENANT IMMEDIATE' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5512,11 +5475,11 @@ value if you rely on the HLC for accuracy.`,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				name := tree.MustBeDString(args[0])
 				tenantName := roachpb.TenantName(name)
-				tenantInfo, err := evalCtx.Tenant.GetTenantInfo(ctx, tenantName)
+				tid, err := evalCtx.Tenant.LookupTenantID(ctx, tenantName)
 				if err != nil {
 					return nil, err
 				}
-				start := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantInfo.ID))
+				start := keys.MakeTenantPrefix(tid)
 				end := start.PrefixEnd()
 
 				result := tree.NewDArray(types.Bytes)
@@ -6331,6 +6294,65 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	// Generate some objects.
+	"crdb_internal.generate_test_objects": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "names", Typ: types.String},
+				{Name: "number", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			IsUDF:      true,
+			Body: `SELECT crdb_internal.generate_test_objects(
+json_build_object('names', $1, 'counts', array[$2]))`,
+			Info: `Generates a number of objects whose name follow the provided pattern.
+
+generate_test_objects(pat, num) is an alias for
+generate_test_objects('{"names":pat, "counts":[num]}'::jsonb)
+`,
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "names", Typ: types.String},
+				{Name: "counts", Typ: types.IntArray},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			IsUDF:      true,
+			Body: `SELECT crdb_internal.generate_test_objects(
+json_build_object('names', $1, 'counts', $2))`,
+			Info: `Generates a number of objects whose name follow the provided pattern.
+
+generate_test_objects(pat, counts) is an alias for
+generate_test_objects('{"names":pat, "counts":counts}'::jsonb)
+`,
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "parameters", Typ: types.Jsonb},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				j, err := evalCtx.Planner.GenerateTestObjects(ctx,
+					args[0].(*tree.DJSON).JSON.String(),
+				)
+				if err != nil {
+					return nil, err
+				}
+				return tree.ParseDJSON(j)
+			},
+			Info: `Generates a number of objects whose name follow the provided pattern.
+
+Parameters:` + randgencfg.ConfigDoc,
+			Volatility: volatility.Volatile,
+		},
+	),
+
 	// Returns true iff the given sqlliveness session is not expired.
 	"crdb_internal.sql_liveness_is_alive": makeBuiltin(
 		tree.FunctionProperties{
@@ -6354,7 +6376,7 @@ value if you rely on the HLC for accuracy.`,
 	),
 
 	"crdb_internal.gc_tenant": makeBuiltin(
-		// TODO(jeffswenson): Delete internal_crdb.gc_tenant after the DestroyTenant
+		// TODO(jeffswenson): Delete crdb_internal.gc_tenant after the DestroyTenant
 		// changes are deployed to all Cockroach Cloud serverless hosts.
 		tree.FunctionProperties{
 			Category:     builtinconstants.CategoryMultiTenancy,

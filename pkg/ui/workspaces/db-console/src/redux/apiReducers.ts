@@ -32,6 +32,7 @@ import { VersionList } from "src/interfaces/cockroachlabs";
 import { versionCheck } from "src/util/cockroachlabsAPI";
 import { INodeStatus, RollupStoreMetrics } from "src/util/proto";
 import * as protos from "src/js/protos";
+import Long from "long";
 
 const { generateStmtDetailsToID } = util;
 
@@ -350,7 +351,7 @@ export const statementDetailsReducerObj = new KeyedCachedDataReducer(
   api.getStatementDetails,
   statementDetailsActionNamespace,
   statementDetailsRequestToID,
-  moment.duration(5, "m"),
+  null,
   moment.duration(30, "m"),
 );
 
@@ -419,17 +420,16 @@ const transactionInsightsReducerObj = new CachedDataReducer(
 export const refreshTxnContentionInsights =
   transactionInsightsReducerObj.refresh;
 
-export const refreshTransactionInsights = (): ThunkAction<
-  any,
-  any,
-  any,
-  Action
-> => {
+export const refreshTransactionInsights = (
+  req?: clusterUiApi.ExecutionInsightsRequest,
+): ThunkAction<any, any, any, Action> => {
   return (dispatch: ThunkDispatch<unknown, unknown, Action>) => {
-    dispatch(refreshTxnContentionInsights());
-    dispatch(refreshExecutionInsights());
+    dispatch(refreshTxnContentionInsights(req));
+    dispatch(refreshExecutionInsights(req));
   };
 };
+export const invalidateTransactionInsights =
+  transactionInsightsReducerObj.invalidateData;
 
 const executionInsightsReducerObj = new CachedDataReducer(
   clusterUiApi.getClusterInsightsApi,
@@ -438,6 +438,8 @@ const executionInsightsReducerObj = new CachedDataReducer(
   moment.duration(5, "m"),
 );
 export const refreshExecutionInsights = executionInsightsReducerObj.refresh;
+export const invalidateExecutionInsights =
+  executionInsightsReducerObj.invalidateData;
 
 export const transactionInsightRequestKey = (
   req: clusterUiApi.TxnContentionInsightDetailsRequest,
@@ -459,7 +461,7 @@ export const refreshTransactionInsightDetails = (
 ): ThunkAction<any, any, any, Action> => {
   return (dispatch: ThunkDispatch<unknown, unknown, Action>) => {
     dispatch(refreshTxnContentionInsightDetails(req));
-    dispatch(refreshExecutionInsights());
+    dispatch(refreshExecutionInsights({ start: req.start, end: req.end }));
   };
 };
 
@@ -499,7 +501,6 @@ const snapshotsReducerObj = new KeyedCachedDataReducer(
   clusterUiApi.listTracingSnapshots,
   "snapshots",
   (nodeID: string): string => nodeID,
-  moment.duration(1, "s"),
 );
 export const refreshSnapshots = snapshotsReducerObj.refresh;
 
@@ -512,9 +513,21 @@ const snapshotReducerObj = new KeyedCachedDataReducer(
   clusterUiApi.getTracingSnapshot,
   "snapshot",
   snapshotKey,
-  moment.duration(1, "s"),
 );
 export const refreshSnapshot = snapshotReducerObj.refresh;
+
+export const rawTraceKey = (req: {
+  nodeID: string;
+  snapshotID: number;
+  traceID: Long;
+}): string =>
+  req.nodeID + "/" + req.snapshotID.toString() + "/" + req.traceID?.toString();
+const rawTraceReducerObj = new KeyedCachedDataReducer(
+  clusterUiApi.getRawTrace,
+  "rawTrace",
+  rawTraceKey,
+);
+export const refreshRawTrace = rawTraceReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
@@ -559,6 +572,7 @@ export interface APIReducersState {
   schedule: KeyedCachedDataReducerState<clusterUiApi.Schedule>;
   snapshots: KeyedCachedDataReducerState<clusterUiApi.ListTracingSnapshotsResponse>;
   snapshot: KeyedCachedDataReducerState<clusterUiApi.GetTracingSnapshotResponse>;
+  rawTrace: KeyedCachedDataReducerState<clusterUiApi.GetTraceResponse>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -611,6 +625,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [scheduleReducerObj.actionNamespace]: scheduleReducerObj.reducer,
   [snapshotsReducerObj.actionNamespace]: snapshotsReducerObj.reducer,
   [snapshotReducerObj.actionNamespace]: snapshotReducerObj.reducer,
+  [rawTraceReducerObj.actionNamespace]: rawTraceReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

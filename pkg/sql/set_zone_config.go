@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/zone"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -228,16 +229,17 @@ func (p *planner) getUpdatedZoneConfigOptions(
 }
 
 func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (planNode, error) {
+
+	execCfg := p.ExecCfg()
 	if err := checkSchemaChangeEnabled(
 		ctx,
-		p.ExecCfg(),
+		execCfg,
 		"CONFIGURE ZONE",
 	); err != nil {
 		return nil, err
 	}
 
-	if !p.ExecCfg().Codec.ForSystemTenant() &&
-		!SecondaryTenantZoneConfigsEnabled.Get(&p.ExecCfg().Settings.SV) {
+	if err := execCfg.RequireSystemTenantOrClusterSetting(SecondaryTenantZoneConfigsEnabled); err != nil {
 		// Return an unimplemented error here instead of referencing the cluster
 		// setting here as zone configurations for secondary tenants are intended to
 		// be hidden.
@@ -286,8 +288,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 		if zs.Database == "system" {
 			return p.RequireAdminRole(ctx, "alter the system database")
 		}
-		dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
-			string(zs.Database), tree.DatabaseLookupFlags{Required: true})
+		dbDesc, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, string(zs.Database))
 		if err != nil {
 			return err
 		}
@@ -1199,14 +1200,14 @@ func writeZoneConfigUpdate(
 // reuse an existing client.Txn safely.
 func RemoveIndexZoneConfigs(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	execCfg *ExecutorConfig,
 	kvTrace bool,
 	descriptors *descs.Collection,
 	tableDesc catalog.TableDescriptor,
 	indexIDs []uint32,
 ) error {
-	zoneWithRaw, err := descriptors.GetZoneConfig(ctx, txn, tableDesc.GetID())
+	zoneWithRaw, err := descriptors.GetZoneConfig(ctx, txn.KV(), tableDesc.GetID())
 	if err != nil {
 		return err
 	}
@@ -1235,7 +1236,9 @@ func RemoveIndexZoneConfigs(
 	if zcRewriteNecessary {
 		// Ignore CCL required error to allow schema change to progress.
 		_, err = writeZoneConfig(
-			ctx, txn, tableDesc.GetID(), tableDesc, zone, zoneWithRaw.GetRawBytesInStorage(), execCfg, descriptors, false /* hasNewSubzones */, kvTrace,
+			ctx, txn.KV(), tableDesc.GetID(), tableDesc, zone,
+			zoneWithRaw.GetRawBytesInStorage(), execCfg, descriptors,
+			false /* hasNewSubzones */, kvTrace,
 		)
 		if err != nil && !sqlerrors.IsCCLRequiredError(err) {
 			return err

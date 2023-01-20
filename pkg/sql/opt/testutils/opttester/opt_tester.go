@@ -293,6 +293,7 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().OptSplitScanLimit = tabledesc.MaxBucketAllowed
 	ot.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
 	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
 
 	return ot
 }
@@ -2251,7 +2252,7 @@ func (ot *OptTester) optimizeExpr(
 		return nil, err
 	}
 	if tables != nil {
-		o.Memo().Metadata().UpdateTableMeta(tables)
+		o.Memo().Metadata().UpdateTableMeta(&ot.evalCtx, tables)
 	}
 	root, err := o.Optimize()
 	if err != nil {

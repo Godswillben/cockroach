@@ -15,34 +15,38 @@ import {
   StatementInsightDetailsDispatchProps,
   StatementInsightDetailsStateProps,
 } from "./statementInsightDetails";
-import { AppState } from "src/store";
+import { AppState, uiConfigActions } from "src/store";
 import {
   actions as statementInsights,
   selectStatementInsightDetails,
-  selectStatementInsightsError,
+  selectExecutionInsightsError,
 } from "src/store/insights/statementInsights";
-import { selectIsTenant } from "src/store/uiConfig";
+import { selectHasAdminRole, selectIsTenant } from "src/store/uiConfig";
 import { TimeScale } from "../../timeScaleDropdown";
 import { actions as sqlStatsActions } from "../../store/sqlStats";
+import { selectTimeScale } from "../../store/utils/selectors";
+import { ExecutionInsightsRequest } from "../../api";
 
 const mapStateToProps = (
   state: AppState,
   props: RouteComponentProps,
 ): StatementInsightDetailsStateProps => {
   const insightStatements = selectStatementInsightDetails(state, props);
-  const insightError = selectStatementInsightsError(state);
+  const insightError = selectExecutionInsightsError(state);
   return {
     insightEventDetails: insightStatements,
     insightError: insightError,
     isTenant: selectIsTenant(state),
+    timeScale: selectTimeScale(state),
+    hasAdminRole: selectHasAdminRole(state),
   };
 };
 
 const mapDispatchToProps = (
   dispatch: Dispatch,
 ): StatementInsightDetailsDispatchProps => ({
-  refreshStatementInsights: () => {
-    dispatch(statementInsights.refresh());
+  refreshStatementInsights: (req: ExecutionInsightsRequest) => {
+    dispatch(statementInsights.refresh(req));
   },
   setTimeScale: (ts: TimeScale) => {
     dispatch(
@@ -51,6 +55,7 @@ const mapDispatchToProps = (
       }),
     );
   },
+  refreshUserSQLRoles: () => dispatch(uiConfigActions.refreshUserSQLRoles()),
 });
 
 export const StatementInsightDetailsConnected = withRouter(

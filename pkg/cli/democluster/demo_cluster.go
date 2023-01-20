@@ -80,10 +80,6 @@ type transientCluster struct {
 	tenantServers []serverutils.TestTenantInterface
 	defaultDB     string
 
-	httpFirstPort int
-	sqlFirstPort  int
-	rpcFirstPort  int
-
 	adminPassword string
 	adminUser     username.SQLUsername
 
@@ -115,6 +111,9 @@ const demoOrg = "Cockroach Demo"
 
 // demoUsername is the name of the predefined non-root user.
 const demoUsername = "demo"
+
+// demoTenantName is the name of the demo tenant.
+const demoTenantName = "demo-tenant"
 
 // LoggerFn is the type of a logger function to use by the
 // demo cluster to report special events.
@@ -203,24 +202,6 @@ func NewDemoCluster(
 		if err := c.generateCerts(ctx, c.demoDir); err != nil {
 			return c, err
 		}
-	}
-
-	c.httpFirstPort = c.demoCtx.HTTPPort
-	c.sqlFirstPort = c.demoCtx.SQLPort
-	// +100 is the offset we've chosen to recommend to separate the SQL
-	// port from the RPC port when we deprecated the use of merged
-	// ports.
-	c.rpcFirstPort = c.demoCtx.SQLPort + 100
-	if c.demoCtx.Multitenant {
-		// This allows the first secondary tenant server to get the
-		// desired ports (i.e., those configured by --http-port or
-		// --sql-port, or the default) without conflicting with the system
-		// tenant.
-		// Note: this logic can be removed once we use a single
-		// listener for HTTP and SQL.
-		c.httpFirstPort += c.demoCtx.NumNodes
-		c.sqlFirstPort += c.demoCtx.NumNodes
-		c.rpcFirstPort += c.demoCtx.NumNodes
 	}
 
 	c.stickyEngineRegistry = server.NewStickyInMemEnginesRegistry()
@@ -419,63 +400,66 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 				latencyMap := c.servers[i].Cfg.TestingKnobs.Server.(*server.TestingKnobs).
 					ContextTestingKnobs.InjectedLatencyOracle
 				c.infoLog(ctx, "starting tenant node %d", i)
-				tenantStopper := stop.NewStopper()
-				ts, err := c.servers[i].StartTenant(ctx, base.TestTenantArgs{
-					// We set the tenant ID to i+2, since tenant 0 is not a tenant, and
-					// tenant 1 is the system tenant. We also subtract 2 for the "starting"
-					// SQL/HTTP ports so the first tenant ends up with the desired default
-					// ports.
-					DisableCreateTenant:     !createTenant,
-					TenantName:              roachpb.TenantName(fmt.Sprintf("demo-tenant-%d", secondaryTenantID)),
-					TenantID:                roachpb.MustMakeTenantID(secondaryTenantID),
-					Stopper:                 tenantStopper,
-					ForceInsecure:           c.demoCtx.Insecure,
-					SSLCertsDir:             c.demoDir,
-					DisableTLSForHTTP:       true,
-					EnableDemoLoginEndpoint: true,
-					StartingRPCAndSQLPort:   c.demoCtx.SQLPort - secondaryTenantID + i,
-					StartingHTTPPort:        c.demoCtx.HTTPPort - secondaryTenantID + i,
-					Locality:                c.demoCtx.Localities[i],
-					TestingKnobs: base.TestingKnobs{
-						Server: &server.TestingKnobs{
-							ContextTestingKnobs: rpc.ContextTestingKnobs{
-								InjectedLatencyOracle:  latencyMap,
-								InjectedLatencyEnabled: c.latencyEnabled.Get,
+
+				var ts serverutils.TestTenantInterface
+				if c.demoCtx.DisableServerController {
+					tenantStopper := stop.NewStopper()
+					args := base.TestTenantArgs{
+						DisableCreateTenant:     !createTenant,
+						TenantName:              demoTenantName,
+						TenantID:                roachpb.MustMakeTenantID(secondaryTenantID),
+						Stopper:                 tenantStopper,
+						ForceInsecure:           c.demoCtx.Insecure,
+						SSLCertsDir:             c.demoDir,
+						DisableTLSForHTTP:       true,
+						EnableDemoLoginEndpoint: true,
+						StartingRPCAndSQLPort:   c.demoCtx.sqlPort(i, true) - secondaryTenantID,
+						StartingHTTPPort:        c.demoCtx.httpPort(i, true) - secondaryTenantID,
+						Locality:                c.demoCtx.Localities[i],
+						TestingKnobs: base.TestingKnobs{
+							Server: &server.TestingKnobs{
+								ContextTestingKnobs: rpc.ContextTestingKnobs{
+									InjectedLatencyOracle:  latencyMap,
+									InjectedLatencyEnabled: c.latencyEnabled.Get,
+								},
 							},
 						},
-					},
-				})
-				c.stopper.AddCloser(stop.CloserFn(func() {
-					stopCtx := context.Background()
-					if ts != nil {
-						stopCtx = ts.AnnotateCtx(stopCtx)
 					}
-					tenantStopper.Stop(stopCtx)
-				}))
-				if err != nil {
-					return err
+
+					var err error
+					ts, err = c.servers[i].StartTenant(ctx, args)
+					c.stopper.AddCloser(stop.CloserFn(func() {
+						stopCtx := context.Background()
+						if ts != nil {
+							stopCtx = ts.AnnotateCtx(stopCtx)
+						}
+						tenantStopper.Stop(stopCtx)
+					}))
+					if err != nil {
+						return err
+					}
+				} else {
+					var err error
+					ts, _, err = c.servers[i].StartSharedProcessTenant(ctx,
+						base.TestSharedProcessTenantArgs{
+							TenantID:   roachpb.MustMakeTenantID(secondaryTenantID),
+							TenantName: demoTenantName,
+							Knobs: base.TestingKnobs{
+								Server: &server.TestingKnobs{
+									ContextTestingKnobs: rpc.ContextTestingKnobs{
+										InjectedLatencyOracle:  latencyMap,
+										InjectedLatencyEnabled: c.latencyEnabled.Get,
+									},
+								},
+							},
+						})
+					if err != nil {
+						return err
+					}
 				}
+
 				c.tenantServers[i] = ts
 				c.infoLog(ctx, "started tenant server %d: %s", i, ts.SQLAddr())
-
-				// Propagate the tenant server tags to the initialization
-				// context, so that the initialization messages below are
-				// properly annotated in traces.
-				ctx = ts.AnnotateCtx(ctx)
-
-				if i == 0 && !c.demoCtx.Insecure {
-					// Set up the demo username and password on each tenant.
-					ie := ts.DistSQLServer().(*distsql.ServerImpl).ServerConfig.Executor
-					_, err = ie.Exec(ctx, "tenant-password", nil,
-						fmt.Sprintf("CREATE USER %s WITH PASSWORD '%s'", demoUsername, demoPassword))
-					if err != nil {
-						return err
-					}
-					_, err = ie.Exec(ctx, "tenant-grant", nil, fmt.Sprintf("GRANT admin TO %s", demoUsername))
-					if err != nil {
-						return err
-					}
-				}
 			}
 		}
 		return nil
@@ -491,10 +475,10 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 		// admin user.
 		c.infoLog(ctx, "running initial SQL for demo cluster")
 		// Propagate the server log tags to the operations below, to include node ID etc.
-		server := c.firstServer.Server
-		ctx = server.AnnotateCtx(ctx)
+		srv := c.firstServer.Server
+		ctx = srv.AnnotateCtx(ctx)
 
-		if err := server.RunInitialSQL(ctx, c.demoCtx.NumNodes < 3, demoUsername, demoPassword); err != nil {
+		if err := srv.RunInitialSQL(ctx, c.demoCtx.NumNodes < 3, demoUsername, demoPassword); err != nil {
 			return err
 		}
 		if c.demoCtx.Insecure {
@@ -503,6 +487,34 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 		} else {
 			c.adminUser = username.MakeSQLUsernameFromPreNormalizedString(demoUsername)
 			c.adminPassword = demoPassword
+		}
+
+		if c.demoCtx.Multitenant && !c.demoCtx.Insecure {
+			// Also create the user/password for the secondary tenant.
+			ts := c.tenantServers[0]
+			tctx := ts.AnnotateCtx(ctx)
+			ieTenant := ts.DistSQLServer().(*distsql.ServerImpl).ServerConfig.DB.Executor()
+			_, err = ieTenant.Exec(tctx, "tenant-password", nil,
+				fmt.Sprintf("CREATE USER %s WITH PASSWORD '%s'", demoUsername, demoPassword))
+			if err != nil {
+				return err
+			}
+			_, err = ieTenant.Exec(tctx, "tenant-grant", nil, fmt.Sprintf("GRANT admin TO %s", demoUsername))
+			if err != nil {
+				return err
+			}
+		}
+
+		if c.demoCtx.Multitenant && !c.demoCtx.DisableServerController {
+			// Select the default tenant.
+			ie := c.firstServer.DistSQLServer().(*distsql.ServerImpl).ServerConfig.DB.Executor()
+			// Choose the tenant to use when no tenant is specified on a
+			// connection or web URL.
+			if _, err := ie.Exec(ctx, "default-tenant", nil,
+				`SET CLUSTER SETTING `+server.DefaultTenantSelectSettingName+` = $1`,
+				demoTenantName); err != nil {
+				return err
+			}
 		}
 
 		// Prepare the URL for use by the SQL shell.
@@ -524,6 +536,18 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 	}(phaseCtx); err != nil {
 		return err
 	}
+
+	// Step 10: restore web sessions.
+	phaseCtx = logtags.AddTag(ctx, "phase", 10)
+	if err := func(ctx context.Context) error {
+		if err := c.restoreWebSessions(ctx); err != nil {
+			c.warnLog(ctx, "unable to restore web sessions: %v", err)
+		}
+		return nil
+	}(phaseCtx); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -560,9 +584,6 @@ func (c *transientCluster) createAndAddNode(
 	}
 	args := c.demoCtx.testServerArgsForTransientCluster(
 		c.sockForServer(idx), idx, joinAddr, c.demoDir,
-		c.sqlFirstPort,
-		c.rpcFirstPort,
-		c.httpFirstPort,
 		c.stickyEngineRegistry,
 	)
 	if idx == 0 {
@@ -765,6 +786,68 @@ func (c *transientCluster) waitForSQLReadiness(
 	return nil
 }
 
+func (demoCtx *Context) sqlPort(serverIdx int, forSecondaryTenant bool) int {
+	if demoCtx.SQLPort == 0 || testingForceRandomizeDemoPorts {
+		return 0
+	}
+	if !demoCtx.Multitenant {
+		// No multitenancy: just one port per node.
+		return demoCtx.SQLPort + serverIdx
+	}
+	if forSecondaryTenant {
+		// The port number of the secondary tenant is always
+		// the "base" port number.
+		return demoCtx.SQLPort + serverIdx
+	}
+	// System tenant.
+	if !demoCtx.DisableServerController {
+		// Using server controller: same port for app and system tenant.
+		return demoCtx.SQLPort + serverIdx
+	}
+	// Currently using a separate SQL listener. System tenant uses port number
+	// offset by NumNodes.
+	return demoCtx.SQLPort + serverIdx + demoCtx.NumNodes
+}
+
+func (demoCtx *Context) httpPort(serverIdx int, forSecondaryTenant bool) int {
+	if demoCtx.HTTPPort == 0 || testingForceRandomizeDemoPorts {
+		return 0
+	}
+	if !demoCtx.Multitenant {
+		// No multitenancy: just one port per node.
+		return demoCtx.HTTPPort + serverIdx
+	}
+	if forSecondaryTenant {
+		// The port number of the secondary tenant is always
+		// the "base" port number.
+		return demoCtx.HTTPPort + serverIdx
+	}
+	// System tenant.
+	if !demoCtx.DisableServerController {
+		// Using server controller: same port for app and system tenant.
+		return demoCtx.HTTPPort + serverIdx
+	}
+	// Not using server controller: http port is offset by number of nodes.
+	return demoCtx.HTTPPort + serverIdx + demoCtx.NumNodes
+}
+
+func (demoCtx *Context) rpcPort(serverIdx int, forSecondaryTenant bool) int {
+	if demoCtx.SQLPort == 0 || testingForceRandomizeDemoPorts {
+		return 0
+	}
+	// +100 is the offset we've chosen to recommend to separate the SQL
+	// port from the RPC port when we deprecated the use of merged
+	// ports.
+	if !demoCtx.Multitenant {
+		return demoCtx.SQLPort + serverIdx + 100
+	}
+	if forSecondaryTenant {
+		return demoCtx.SQLPort + serverIdx + 100
+	}
+	// System tenant.
+	return demoCtx.SQLPort + serverIdx + demoCtx.NumNodes + 100
+}
+
 // testServerArgsForTransientCluster creates the test arguments for
 // a necessary server in the demo cluster.
 func (demoCtx *Context) testServerArgsForTransientCluster(
@@ -772,7 +855,6 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 	serverIdx int,
 	joinAddr string,
 	demoDir string,
-	sqlBasePort, rpcBasePort, httpBasePort int,
 	stickyEngineRegistry server.StickyInMemEnginesRegistry,
 ) base.TestServerArgs {
 	// Assign a path to the store spec, to be saved.
@@ -793,6 +875,7 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		// Demo clusters by default will create their own tenants, so we
 		// don't need to create them here.
 		DisableDefaultTestTenant: true,
+
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
 				StickyEngineRegistry: stickyEngineRegistry,
@@ -810,21 +893,20 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 	// `make stress`. This is bound to not work with fixed ports.
 	// So by default we use :0 to auto-allocate ports.
 	args.Addr = "127.0.0.1:0"
-	if !testingForceRandomizeDemoPorts {
-		sqlPort := sqlBasePort + serverIdx
-		if sqlBasePort == 0 {
-			sqlPort = 0
-		}
-		rpcPort := rpcBasePort + serverIdx
-		if rpcBasePort == 0 {
-			rpcPort = 0
-		}
-		httpPort := httpBasePort + serverIdx
-		if httpBasePort == 0 {
-			httpPort = 0
-		}
+	if sqlPort := demoCtx.sqlPort(serverIdx, false /* forSecondaryTenant */); sqlPort != 0 {
+		rpcPort := demoCtx.rpcPort(serverIdx, false)
 		args.Addr = fmt.Sprintf("127.0.0.1:%d", rpcPort)
 		args.SQLAddr = fmt.Sprintf("127.0.0.1:%d", sqlPort)
+		if !demoCtx.DisableServerController {
+			// The code in NewDemoCluster put the KV ports higher
+			// so we need to subtract the number of nodes to get
+			// back to the "good" ports.
+			// We reduce NumNodes by 1 because the server controller
+			// uses 1-based indexing for servers.
+			args.SecondaryTenantPortOffset = -(demoCtx.NumNodes + 1)
+		}
+	}
+	if httpPort := demoCtx.httpPort(serverIdx, false /* forSecondaryTenant */); httpPort != 0 {
 		args.HTTPAddr = fmt.Sprintf("127.0.0.1:%d", httpPort)
 	}
 
@@ -851,6 +933,9 @@ func TestingForceRandomizeDemoPorts() func() {
 }
 
 func (c *transientCluster) Close(ctx context.Context) {
+	if err := c.saveWebSessions(ctx); err != nil {
+		c.warnLog(ctx, "unable to save web sessions: %v", err)
+	}
 	if c.stopper != nil {
 		if r := recover(); r != nil {
 			// A panic here means some of the async tasks may still be
@@ -1031,7 +1116,7 @@ func (c *transientCluster) startServerInternal(
 		c.sockForServer(serverIdx),
 		serverIdx,
 		c.firstServer.ServingRPCAddr(), c.demoDir,
-		c.sqlFirstPort, c.rpcFirstPort, c.httpFirstPort, c.stickyEngineRegistry)
+		c.stickyEngineRegistry)
 	s, err := server.TestServerFactory.New(args)
 	if err != nil {
 		return 0, err
@@ -1378,6 +1463,18 @@ func (c *transientCluster) getNetworkURLForServer(
 	if !forSecondaryTenant && c.demoCtx.Multitenant {
 		database = catalogkeys.DefaultDatabaseName
 	}
+
+	if c.demoCtx.Multitenant && !c.demoCtx.DisableServerController {
+		if forSecondaryTenant {
+			if err := u.SetOption("options", "-ccluster="+demoTenantName); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := u.SetOption("options", "-ccluster="+catconstants.SystemTenantName); err != nil {
+				return nil, err
+			}
+		}
+	}
 	host, port, _ := addr.SplitHostPort(sqlAddr, "")
 	u.
 		WithNet(pgurl.NetTCP(host, port)).
@@ -1515,9 +1612,76 @@ func (c *transientCluster) SetupWorkload(ctx context.Context) error {
 				return errors.Wrapf(err, "starting background workload")
 			}
 		}
+
+		if c.demoCtx.ExpandSchema > 0 {
+			if err := c.expandSchema(ctx, gen); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
+}
+
+func (c *transientCluster) expandSchema(ctx context.Context, gen workload.Generator) error {
+	return c.stopper.RunAsyncTask(ctx, "expand-schema", func(ctx context.Context) {
+		ctx, cancel := c.stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+		ctx = logtags.AddTag(ctx, "expand-schemas", nil)
+
+		db, err := gosql.Open("postgres", c.connURL)
+		if err != nil {
+			c.warnLog(ctx, "unable to connect: %v", err)
+			return
+		}
+		defer db.Close()
+
+		// How to generate names.
+		nameGenOpts := "{}"
+		if c.demoCtx.NameGenOptions != "" {
+			nameGenOpts = c.demoCtx.NameGenOptions
+		}
+
+		// Don't spam too many warnings if the schema expansion cannot
+		// make progress.
+		every := log.Every(10 * time.Second)
+
+		for num := 0; num < c.demoCtx.ExpandSchema; {
+			// Pace the expansion in proportion to the target
+			// number (more desired descriptors = grow faster).
+			var dbPerRound, tbPerDbPerRound int
+			switch {
+			case c.demoCtx.ExpandSchema <= 100:
+				dbPerRound = 1
+				tbPerDbPerRound = 10
+			case c.demoCtx.ExpandSchema <= 50000:
+				dbPerRound = 10
+				tbPerDbPerRound = 100
+			default:
+				dbPerRound = 20
+				tbPerDbPerRound = 450
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			if _, err := db.ExecContext(ctx, `SELECT crdb_internal.generate_test_objects(
+json_build_object(
+  'names', quote_ident($1) || '._',
+  'counts', array[$2,0,$3],
+  'table_templates', array[quote_ident($1) || '.*'],
+  'name_gen', $4::JSONB
+))`, gen.Meta().Name, dbPerRound, tbPerDbPerRound, nameGenOpts); err != nil {
+				if every.ShouldLog() {
+					c.warnLog(ctx, "while expanding the schema: %v", err)
+				}
+				// Try again - it may succeed later.
+				continue
+			}
+			num += dbPerRound*2 + (dbPerRound * tbPerDbPerRound)
+		}
+	})
 }
 
 func (c *transientCluster) runWorkload(
@@ -1597,7 +1761,7 @@ func (c *transientCluster) sockForServer(serverIdx int) unixSocketDetails {
 	if !c.useSockets {
 		return unixSocketDetails{}
 	}
-	port := strconv.Itoa(c.sqlFirstPort + serverIdx)
+	port := strconv.Itoa(c.demoCtx.sqlPort(serverIdx, false))
 	databaseName := c.defaultDB
 	if c.demoCtx.Multitenant {
 		// TODO(knz): for now, we only define the unix socket for the
@@ -1676,7 +1840,15 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 			fmt.Fprintf(w, "node %d:\n", nodeID)
 		}
 		if c.demoCtx.Multitenant {
+			if !c.demoCtx.DisableServerController {
+				// When using the server controller, we have a single web UI
+				// URL for both tenants. The demologin link does an
+				// auto-login for both.
+				uiURL := c.addDemoLoginToURL(s.Cfg.AdminURL(), false /* includeTenantName */)
+				fmt.Fprintln(w, "   (webui)   ", uiURL)
+			}
 			if verbose {
+				fmt.Fprintln(w)
 				fmt.Fprintln(w, "  Application tenant:")
 			}
 
@@ -1691,6 +1863,10 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 				if err != nil {
 					fmt.Fprintln(ew, errors.Wrap(err, "retrieving network URL for tenant server"))
 				} else {
+					// Only include a separate HTTP URL if there's no server
+					// controller.
+					includeHTTP := !c.demoCtx.Multitenant || c.demoCtx.DisableServerController
+
 					// The unix socket is currently not defined for secondary
 					// tenant servers.
 					//
@@ -1698,7 +1874,7 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 					// listener for all tenants; after which this code can be
 					// simplified.
 					tenantSocket := unixSocketDetails{}
-					c.printURLs(w, ew, tenantSqlURL, tenantUiURL, tenantSocket, rpcAddr, verbose)
+					c.printURLs(w, ew, tenantSqlURL, tenantUiURL, tenantSocket, rpcAddr, verbose, includeHTTP)
 				}
 			}
 			fmt.Fprintln(w)
@@ -1708,14 +1884,21 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 		}
 		if !c.demoCtx.Multitenant || verbose {
 			// Connection parameters for the system tenant follow.
-
 			uiURL := s.Cfg.AdminURL()
+			if q := uiURL.Query(); c.demoCtx.Multitenant && !c.demoCtx.DisableServerController && !q.Has(server.TenantNameParamInQueryURL) {
+				q.Add(server.TenantNameParamInQueryURL, catconstants.SystemTenantName)
+				uiURL.RawQuery = q.Encode()
+			}
+
 			sqlURL, err := c.getNetworkURLForServer(context.Background(), i,
 				false /* includeAppName */, false /* forSecondaryTenant */)
 			if err != nil {
 				fmt.Fprintln(ew, errors.Wrap(err, "retrieving network URL"))
 			} else {
-				c.printURLs(w, ew, sqlURL, uiURL, c.sockForServer(i), s.ServingRPCAddr(), verbose)
+				// Only include a separate HTTP URL if there's no server
+				// controller.
+				includeHTTP := !c.demoCtx.Multitenant || c.demoCtx.DisableServerController
+				c.printURLs(w, ew, sqlURL, uiURL, c.sockForServer(i), s.ServingRPCAddr(), verbose, includeHTTP)
 			}
 			fmt.Fprintln(w)
 		}
@@ -1735,20 +1918,12 @@ func (c *transientCluster) printURLs(
 	uiURL *url.URL,
 	socket unixSocketDetails,
 	rpcAddr string,
-	verbose bool,
+	verbose, includeHTTP bool,
 ) {
-	if !c.demoCtx.Insecure {
-		// Print node ID and web UI URL. Embed the autologin feature inside the URL.
-		// We avoid printing those when insecure, as the autologin path is not available
-		// in that case.
-		pwauth := url.Values{
-			"username": []string{c.adminUser.Normalized()},
-			"password": []string{c.adminPassword},
-		}
-		uiURL.Path = server.DemoLoginPath
-		uiURL.RawQuery = pwauth.Encode()
+	if includeHTTP {
+		uiURL = c.addDemoLoginToURL(uiURL, true /* includeTenantName */)
+		fmt.Fprintln(w, "   (webui)   ", uiURL)
 	}
-	fmt.Fprintln(w, "   (webui)   ", uiURL)
 
 	_, _, port := sqlURL.GetNetworking()
 	portArg := ""
@@ -1759,7 +1934,11 @@ func (c *transientCluster) printURLs(
 	if c.demoCtx.Insecure {
 		secArgs = " --insecure"
 	}
-	fmt.Fprintln(w, "   (cli)     ", "cockroach sql"+secArgs+portArg)
+	db := sqlURL.GetDatabase()
+	if opt := sqlURL.GetOption("options"); strings.HasPrefix(opt, "-ccluster=") {
+		db = "cluster:" + opt[10:] + "/" + db
+	}
+	fmt.Fprintln(w, "   (cli)     ", "cockroach sql"+secArgs+portArg+" -d "+db)
 
 	fmt.Fprintln(w, "   (sql)     ", sqlURL.ToPQ())
 	if verbose {
@@ -1769,6 +1948,27 @@ func (c *transientCluster) printURLs(
 		}
 		fmt.Fprintln(w, "   (rpc)     ", rpcAddr)
 	}
+}
+
+// addDemoLoginToURL generates an "autologin" URL from the
+// server-generated URL.
+func (c *transientCluster) addDemoLoginToURL(uiURL *url.URL, includeTenantName bool) *url.URL {
+	q := uiURL.Query()
+	if !c.demoCtx.Insecure {
+		// Print web UI URL. Embed the autologin feature inside the URL.
+		// We avoid printing those when insecure, as the autologin path is not available
+		// in that case.
+		q.Add("username", c.adminUser.Normalized())
+		q.Add("password", c.adminPassword)
+		uiURL.Path = server.DemoLoginPath
+	}
+
+	if !includeTenantName {
+		q.Del(server.TenantNameParamInQueryURL)
+	}
+
+	uiURL.RawQuery = q.Encode()
+	return uiURL
 }
 
 // genDemoPassword generates a password that prevents accidental
@@ -1847,4 +2047,11 @@ func fileExists(path string) (bool, error) {
 		err = nil
 	}
 	return exists, err
+}
+
+func (c *transientCluster) TenantName() string {
+	if c.demoCtx.Multitenant {
+		return demoTenantName
+	}
+	return catconstants.SystemTenantName
 }

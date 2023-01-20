@@ -96,15 +96,66 @@ query T kvtrace
 SELECT fetch_a_of_2_strict(1, NULL::INT)
 ----
 
+
+subtest subqueries
+
+statement ok
+CREATE TABLE sub1 (a INT);
+CREATE TABLE sub2 (a INT);
+CREATE TABLE sub3 (a INT);
+
+statement ok
+CREATE FUNCTION sub_fn() RETURNS INT LANGUAGE SQL AS 'SELECT a FROM sub1 WHERE a = (SELECT max(a) FROM sub2)'
+
+# A query with a subquery and a subquery inside a UDF.
+query T
+EXPLAIN (VERBOSE) SELECT * FROM sub3 WHERE sub_fn() = 3 AND (SELECT max(a) FROM sub2) = a
+----
+distribution: local
+vectorized: true
+·
+• root
+│ columns: (a)
+│
+├── • filter
+│   │ columns: (a)
+│   │ estimated row count: 110 (missing stats)
+│   │ filter: (sub_fn() = 3) AND (a = @S1)
+│   │
+│   └── • scan
+│         columns: (a)
+│         estimated row count: 1,000 (missing stats)
+│         table: sub3@sub3_pkey
+│         spans: FULL SCAN
+│
+└── • subquery
+    │ id: @S1
+    │ original sql: (SELECT max(a) FROM sub2)
+    │ exec mode: one row
+    │
+    └── • group (scalar)
+        │ columns: (max)
+        │ estimated row count: 1 (missing stats)
+        │ aggregate 0: max(a)
+        │
+        └── • scan
+              columns: (a)
+              estimated row count: 1,000 (missing stats)
+              table: sub2@sub2_pkey
+              spans: FULL SCAN
+
+
+subtest regressions
+
 # Regression test for #93210. Do not plan unnecessary assignment casts on the
 # return values of UDFs.
 statement ok
 CREATE TABLE t93210 (
   a INT PRIMARY KEY
 );
-CREATE FUNCTION fn93210() RETURNS INT STABLE LANGUAGE SQL AS 'SELECT a FROM t93210';
+CREATE FUNCTION fn93210() RETURNS INT VOLATILE LANGUAGE SQL AS 'SELECT a FROM t93210';
 
-# The body of the UDF should have no assignment cast expressions.
+# The query plan should have no assignment cast expressions.
 query T
 EXPLAIN (OPT, TYPES)
 SELECT fn93210()
@@ -112,7 +163,7 @@ SELECT fn93210()
 values
  ├── columns: fn93210:4(int)
  ├── cardinality: [1 - 1]
- ├── stable
+ ├── volatile
  ├── stats: [rows=1]
  ├── cost: 0.02
  ├── key: ()
@@ -138,7 +189,7 @@ values
 # Regression test for #88259. Arguments to UDFs should be formatted correctly in
 # EXPLAIN output.
 statement ok
-CREATE FUNCTION f88259(a INT, b INT) RETURNS INT LANGUAGE SQL IMMUTABLE STRICT AS $$
+CREATE FUNCTION f88259(a INT, b INT) RETURNS INT LANGUAGE SQL VOLATILE STRICT AS $$
   SELECT a + b
 $$
 

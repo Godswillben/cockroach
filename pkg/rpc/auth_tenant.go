@@ -130,9 +130,28 @@ func (a tenantAuthorizer) authorize(
 	case "/cockroach.roachpb.Internal/GetRangeDescriptors":
 		return a.authGetRangeDescriptors(tenID, req.(*roachpb.GetRangeDescriptorsRequest))
 
+	case "/cockroach.server.serverpb.Status/HotRangesV2":
+		return a.authHotRangesV2(tenID)
+
+	case "/cockroach.server.serverpb.Status/NodesUI":
+		return a.authCapability(tenID)
+
+	case "/cockroach.server.serverpb.Admin/Liveness":
+		return a.authCapability(tenID)
+
+	case "/cockroach.ts.tspb.TimeSeries/Query":
+		return a.authCapability(tenID)
+
 	default:
 		return authErrorf("unknown method %q", fullMethod)
 	}
+}
+
+func checkSpanBounds(rSpan, tenSpan roachpb.RSpan) error {
+	if !tenSpan.ContainsKeyRange(rSpan.Key, rSpan.EndKey) {
+		return authErrorf("requested key span %s not fully contained in tenant keyspace %s", rSpan, tenSpan)
+	}
+	return nil
 }
 
 // authBatch authorizes the provided tenant to invoke the Batch RPC with the
@@ -141,9 +160,40 @@ func (a tenantAuthorizer) authBatch(tenID roachpb.TenantID, args *roachpb.BatchR
 	// Consult reqAllowed to determine whether each request in the batch
 	// is permitted. If not, reject the entire batch.
 	for _, ru := range args.Requests {
-		if !reqAllowed(ru.GetInner(), tenID) {
-			return authErrorf("request [%s] not permitted", args.Summary())
+		switch ru.GetInner().(type) {
+		case
+			*roachpb.AddSSTableRequest,
+			*roachpb.AdminChangeReplicasRequest,
+			*roachpb.AdminRelocateRangeRequest,
+			*roachpb.AdminScatterRequest,
+			*roachpb.AdminSplitRequest,
+			*roachpb.AdminTransferLeaseRequest,
+			*roachpb.AdminUnsplitRequest,
+			*roachpb.ClearRangeRequest,
+			*roachpb.ConditionalPutRequest,
+			*roachpb.DeleteRangeRequest,
+			*roachpb.DeleteRequest,
+			*roachpb.EndTxnRequest,
+			*roachpb.ExportRequest,
+			*roachpb.GetRequest,
+			*roachpb.HeartbeatTxnRequest,
+			*roachpb.IncrementRequest,
+			*roachpb.InitPutRequest,
+			*roachpb.IsSpanEmptyRequest,
+			*roachpb.LeaseInfoRequest,
+			*roachpb.PutRequest,
+			*roachpb.QueryIntentRequest,
+			*roachpb.QueryLocksRequest,
+			*roachpb.QueryTxnRequest,
+			*roachpb.RangeStatsRequest,
+			*roachpb.RefreshRangeRequest,
+			*roachpb.RefreshRequest,
+			*roachpb.ReverseScanRequest,
+			*roachpb.RevertRangeRequest,
+			*roachpb.ScanRequest:
+			continue
 		}
+		return authErrorf("request [%s] not permitted", args.Summary())
 	}
 
 	// All keys in the request must reside within the tenant's keyspace.
@@ -152,53 +202,13 @@ func (a tenantAuthorizer) authBatch(tenID roachpb.TenantID, args *roachpb.BatchR
 		return authError(err.Error())
 	}
 	tenSpan := tenantPrefix(tenID)
-	if !tenSpan.ContainsKeyRange(rSpan.Key, rSpan.EndKey) {
-		return authErrorf("requested key span %s not fully contained in tenant keyspace %s", rSpan, tenSpan)
-	}
-	return nil
+	return checkSpanBounds(rSpan, tenSpan)
 }
 
 func (a tenantAuthorizer) authGetRangeDescriptors(
 	tenID roachpb.TenantID, args *roachpb.GetRangeDescriptorsRequest,
 ) error {
 	return validateSpan(tenID, args.Span)
-}
-
-func reqAllowed(r roachpb.Request, tenID roachpb.TenantID) bool {
-	switch t := r.(type) {
-	case *roachpb.GetRequest,
-		*roachpb.PutRequest,
-		*roachpb.ConditionalPutRequest,
-		*roachpb.IncrementRequest,
-		*roachpb.DeleteRequest,
-		*roachpb.DeleteRangeRequest,
-		*roachpb.ClearRangeRequest,
-		*roachpb.RevertRangeRequest,
-		*roachpb.ScanRequest,
-		*roachpb.ReverseScanRequest,
-		*roachpb.EndTxnRequest,
-		*roachpb.HeartbeatTxnRequest,
-		*roachpb.QueryTxnRequest,
-		*roachpb.QueryIntentRequest,
-		*roachpb.QueryLocksRequest,
-		*roachpb.InitPutRequest,
-		*roachpb.ExportRequest,
-		*roachpb.AddSSTableRequest,
-		*roachpb.RefreshRequest,
-		*roachpb.RefreshRangeRequest,
-		*roachpb.IsSpanEmptyRequest,
-		*roachpb.LeaseInfoRequest,
-		*roachpb.RangeStatsRequest:
-		return true
-	case *roachpb.AdminScatterRequest:
-		return t.Class != roachpb.AdminScatterRequest_ARBITRARY || tenID.IsSystem()
-	case *roachpb.AdminSplitRequest:
-		return t.Class != roachpb.AdminSplitRequest_ARBITRARY || tenID.IsSystem()
-	case *roachpb.AdminUnsplitRequest:
-		return t.Class != roachpb.AdminUnsplitRequest_ARBITRARY || tenID.IsSystem()
-	}
-
-	return false
 }
 
 // authRangeLookup authorizes the provided tenant to invoke the RangeLookup RPC
@@ -223,10 +233,7 @@ func (a tenantAuthorizer) authRangeFeed(
 		return authError(err.Error())
 	}
 	tenSpan := tenantPrefix(tenID)
-	if !tenSpan.ContainsKeyRange(rSpan.Key, rSpan.EndKey) {
-		return authErrorf("requested key span %s not fully contained in tenant keyspace %s", rSpan, tenSpan)
-	}
-	return nil
+	return checkSpanBounds(rSpan, tenSpan)
 }
 
 // authGossipSubscription authorizes the provided tenant to invoke the
@@ -256,6 +263,12 @@ func (a tenantAuthorizer) authTenant(id roachpb.TenantID) error {
 	if a.tenantID != id {
 		return authErrorf("request from tenant %s not permitted on tenant %s", id, a.tenantID)
 	}
+	return nil
+}
+
+// authCapability checks if the current tenant has the requested capability.
+func (a tenantAuthorizer) authCapability(id roachpb.TenantID) error {
+	// TODO(davidh): add capability-specific checks here that correspond to specific requests.
 	return nil
 }
 
@@ -357,6 +370,16 @@ func (a tenantAuthorizer) authUpdateSpanConfigs(
 	return nil
 }
 
+// authHotRangesV2 authorizes the provided tenant to invoke the
+// HotRangesV2 RPC with the provided args. It requires that an authorized
+// tenantID has been set.
+func (a tenantAuthorizer) authHotRangesV2(tenID roachpb.TenantID) error {
+	if !tenID.IsSet() {
+		return authErrorf("hot ranges request with unspecified tenant not permitted")
+	}
+	return nil
+}
+
 // authSpanConfigConformance authorizes the provided tenant to invoke the
 // SpanConfigConformance RPC with the provided args.
 func (a tenantAuthorizer) authSpanConfigConformance(
@@ -418,15 +441,21 @@ func validateSpan(tenID roachpb.TenantID, sp roachpb.Span) error {
 	if err != nil {
 		return authError(err.Error())
 	}
-	if !tenSpan.ContainsKeyRange(rSpan.Key, rSpan.EndKey) {
-		return authErrorf("requested key span %s not fully contained in tenant keyspace %s", rSpan, tenSpan)
-	}
-	return nil
+	return checkSpanBounds(rSpan, tenSpan)
 }
 
-func contextWithTenant(ctx context.Context, tenID roachpb.TenantID) context.Context {
-	ctx = roachpb.NewContextForTenant(ctx, tenID)
-	ctx = logtags.AddTag(ctx, "tenant", tenID.String())
+// contextWithClientTenant inserts a tenant identifier in the context,
+// identifying the tenant that's the client for an RPC. The identifier can be
+// retrieved later through roachpb.ClientTenantFromContext(ctx). The tenant
+// information is used both as a log tag, and also for purposes like rate
+// limiting tenant calls.
+func contextWithClientTenant(ctx context.Context, tenID roachpb.TenantID) context.Context {
+	ctx = roachpb.ContextWithClientTenant(ctx, tenID)
+	const key = "tenant"
+	if !tenID.IsSet() {
+		return logtags.RemoveTag(ctx, key)
+	}
+	ctx = logtags.AddTag(ctx, key, tenID.String())
 	return ctx
 }
 

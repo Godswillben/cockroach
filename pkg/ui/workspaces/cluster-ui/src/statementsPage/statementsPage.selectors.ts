@@ -121,6 +121,13 @@ export const selectLastReset = createSelector(sqlStatsSelector, state => {
   return formatDate(TimestampToMoment(state.data.last_reset));
 });
 
+export const selectStatementsDataValid = createSelector(
+  sqlStatsSelector,
+  (state: SQLStatsState): boolean => {
+    return state.valid;
+  },
+);
+
 export const selectStatements = createSelector(
   sqlStatsSelector,
   (_: AppState, props: RouteComponentProps) => props,
@@ -220,11 +227,6 @@ export const selectColumns = createSelector(
     localStorage["showColumns/StatementsPage"]
       ? localStorage["showColumns/StatementsPage"].split(",")
       : null,
-);
-
-export const selectTimeScale = createSelector(
-  localStorageSelector,
-  localStorage => localStorage["timeScale/SQLActivity"],
 );
 
 export const selectSortSetting = createSelector(

@@ -29,11 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -79,6 +81,17 @@ var MaxSyncDurationFatalOnExceeded = settings.RegisterBoolSetting(
 	"if true, fatal the process when a disk operation exceeds storage.max_sync_duration",
 	maxSyncDurationFatalOnExceededDefault,
 )
+
+// valueBlocksEnabled controls whether older versions of MVCC keys in the same
+// sstable will have their values written to value blocks. This only affects
+// sstables that will be written in the future, as part of flushes or
+// compactions, and does not eagerly change the encoding of existing sstables.
+// Reads can correctly read both kinds of sstables.
+var valueBlocksEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"storage.value_blocks.enabled",
+	"set to true to enable writing of value blocks in sstables",
+	false).WithPublic()
 
 // EngineKeyCompare compares cockroach keys, including the version (which
 // could be MVCC timestamps).
@@ -568,6 +581,11 @@ func DefaultPebbleOptions() *pebble.Options {
 		}
 		return nil
 	}
+	opts.Experimental.ShortAttributeExtractor = shortAttributeExtractorForValues
+	opts.Experimental.RequiredInPlaceValueBound = pebble.UserKeyPrefixBound{
+		Lower: keys.LocalRangeLockTablePrefix,
+		Upper: keys.LocalRangeLockTablePrefix.PrefixEnd(),
+	}
 
 	for i := 0; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
@@ -582,6 +600,25 @@ func DefaultPebbleOptions() *pebble.Options {
 	}
 
 	return opts
+}
+
+func shortAttributeExtractorForValues(
+	key []byte, keyPrefixLen int, value []byte,
+) (pebble.ShortAttribute, error) {
+	suffixLen := len(key) - keyPrefixLen
+	const lockTableSuffixLen = engineKeyVersionLockTableLen + sentinelLen
+	if suffixLen == engineKeyNoVersion || suffixLen == lockTableSuffixLen {
+		// Not a versioned MVCC value.
+		return 0, nil
+	}
+	isTombstone, err := EncodedMVCCValueIsTombstone(value)
+	if err != nil {
+		return 0, err
+	}
+	if isTombstone {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // wrapFilesystemMiddleware wraps the Option's vfs.FS with disk-health checking
@@ -840,11 +877,26 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		}
 	}()
 
+	// The context dance here is done so that we have a clean context without
+	// timeouts that has a copy of the log tags.
+	logCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
+	// The store id, could not necessarily be determined when this function
+	// is called. Therefore, we use a container for the store id.
+	storeIDContainer := &base.StoreIDContainer{}
+	logCtx = logtags.AddTag(logCtx, "s", storeIDContainer)
+	logCtx = logtags.AddTag(logCtx, "pebble", nil)
+
 	cfg.Opts.EnsureDefaults()
 	cfg.Opts.ErrorIfNotExists = cfg.MustExist
 	if settings := cfg.Settings; settings != nil {
 		cfg.Opts.WALMinSyncInterval = func() time.Duration {
 			return minWALSyncInterval.Get(&settings.SV)
+		}
+		cfg.Opts.Experimental.EnableValueBlocks = func() bool {
+			version := settings.Version.ActiveVersionOrEmpty(logCtx)
+			return !version.Less(clusterversion.ByKey(
+				clusterversion.V23_1EnablePebbleFormatSSTableValueBlocks)) &&
+				valueBlocksEnabled.Get(&settings.SV)
 		}
 	}
 
@@ -865,15 +917,6 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// The context dance here is done so that we have a clean context without
-	// timeouts that has a copy of the log tags.
-	logCtx := logtags.WithTags(context.Background(), logtags.FromContext(ctx))
-	// The store id, could not necessarily be determined when this function
-	// is called. Therefore, we use a container for the store id.
-	storeIDContainer := &base.StoreIDContainer{}
-	logCtx = logtags.AddTag(logCtx, "s", storeIDContainer)
-	logCtx = logtags.AddTag(logCtx, "pebble", nil)
 
 	// If no logger was passed, the previous call to `EnsureDefaults` on
 	// `cfg.Opts` will set the logger to pebble's `DefaultLogger`. In
@@ -1828,6 +1871,10 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	formatVers := pebble.FormatMostCompatible
 	// Cases are ordered from newer to older versions.
 	switch {
+	case !version.Less(clusterversion.ByKey(clusterversion.V23_1EnsurePebbleFormatSSTableValueBlocks)):
+		if formatVers < pebble.FormatSSTableValueBlocks {
+			formatVers = pebble.FormatSSTableValueBlocks
+		}
 	case !version.Less(clusterversion.ByKey(clusterversion.V22_2PebbleFormatPrePebblev1Marked)):
 		if formatVers < pebble.FormatPrePebblev1Marked {
 			formatVers = pebble.FormatPrePebblev1Marked
@@ -1861,6 +1908,11 @@ func (p *Pebble) MinVersionIsAtLeastTargetVersion(target roachpb.Version) (bool,
 	return MinVersionIsAtLeastTargetVersion(p.unencryptedFS, p.path, target)
 }
 
+// BufferedSize implements the Engine interface.
+func (p *Pebble) BufferedSize() int {
+	return 0
+}
+
 type pebbleReadOnly struct {
 	parent *Pebble
 	// The iterator reuse optimization in pebbleReadOnly is for servicing a
@@ -1882,7 +1934,7 @@ type pebbleReadOnly struct {
 	prefixEngineIter pebbleIterator
 	normalEngineIter pebbleIterator
 
-	iter       *pebble.Iterator
+	iter       pebbleiter.Iterator
 	iterUsed   bool // avoids cloning after PinEngineStateForIterators()
 	durability DurabilityRequirement
 	closed     bool
@@ -2056,7 +2108,7 @@ func (p *pebbleReadOnly) PinEngineStateForIterators() error {
 		if p.durability == GuaranteedDurability {
 			o = &pebble.IterOptions{OnlyReadGuaranteedDurable: true}
 		}
-		p.iter = p.parent.db.NewIter(o)
+		p.iter = pebbleiter.MaybeWrap(p.parent.db.NewIter(o))
 		// NB: p.iterUsed == false avoids cloning this in NewMVCCIterator(), since
 		// we've just created it.
 	}
@@ -2166,6 +2218,10 @@ func (p *pebbleReadOnly) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalO
 }
 
 func (p *pebbleReadOnly) ShouldWriteLocalTimestamps(ctx context.Context) bool {
+	panic("not implemented")
+}
+
+func (p *pebbleReadOnly) BufferedSize() int {
 	panic("not implemented")
 }
 

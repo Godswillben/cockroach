@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -28,16 +27,6 @@ import (
 func (p *planner) EvalRoutineExpr(
 	ctx context.Context, expr *tree.RoutineExpr, input tree.Datums,
 ) (result tree.Datum, err error) {
-	// If the routine should not be called on null input, then directly return
-	// NULL if any of the datums in the input are NULL.
-	if !expr.CalledOnNullInput {
-		for i := range input {
-			if input[i] == tree.DNull {
-				return tree.DNull, nil
-			}
-		}
-	}
-
 	retTypes := []*types.T{expr.ResolvedType()}
 
 	// The result of the routine is the result of the last statement. The result
@@ -51,7 +40,7 @@ func (p *planner) EvalRoutineExpr(
 	// Configure stepping for volatile routines so that mutations made by the
 	// invoking statement are visible to the routine.
 	txn := p.Txn()
-	if expr.Volatility == volatility.Volatile {
+	if expr.EnableStepping {
 		prevSteppingMode := txn.ConfigureStepping(ctx, kv.SteppingEnabled)
 		prevSeqNum := txn.GetLeafTxnInputState(ctx).ReadSeqNum
 		defer func() {
@@ -90,7 +79,7 @@ func (p *planner) EvalRoutineExpr(
 
 			// Place a sequence point before each statement in the routine for
 			// volatile functions.
-			if expr.Volatility == volatility.Volatile {
+			if expr.EnableStepping {
 				if err := txn.Step(ctx); err != nil {
 					return err
 				}

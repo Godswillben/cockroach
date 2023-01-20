@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -64,8 +65,8 @@ CREATE SCHEMA test_sc;
 `,
 	)
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		funcDesc, err := col.GetImmutableFunctionByID(ctx, txn, 110, tree.ObjectLookupFlagsWithRequired())
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		funcDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 110)
 		require.NoError(t, err)
 		require.Equal(t, funcDesc.GetName(), "f")
 
@@ -94,7 +95,7 @@ SELECT nextval(105:::REGCLASS);`,
 
 		// Make sure columns and indexes has correct back references.
 		tn := tree.MakeTableNameWithSchema("defaultdb", "public", "t")
-		_, tbl, err := col.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlagsWithRequired())
+		_, tbl, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &tn)
 		require.NoError(t, err)
 		require.Equal(t, "t", tbl.GetName())
 		require.Equal(t,
@@ -108,7 +109,7 @@ SELECT nextval(105:::REGCLASS);`,
 
 		// Make sure sequence has correct back references.
 		sqn := tree.MakeTableNameWithSchema("defaultdb", "public", "sq1")
-		_, seq, err := col.GetImmutableTableByName(ctx, txn, &sqn, tree.ObjectLookupFlagsWithRequired())
+		_, seq, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &sqn)
 		require.NoError(t, err)
 		require.Equal(t, "sq1", seq.GetName())
 		require.Equal(t,
@@ -120,7 +121,7 @@ SELECT nextval(105:::REGCLASS);`,
 
 		// Make sure view has correct back references.
 		vn := tree.MakeTableNameWithSchema("defaultdb", "public", "v")
-		_, view, err := col.GetImmutableTableByName(ctx, txn, &vn, tree.ObjectLookupFlagsWithRequired())
+		_, view, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).Get(), &vn)
 		require.NoError(t, err)
 		require.Equal(t, "v", view.GetName())
 		require.Equal(t,
@@ -132,7 +133,7 @@ SELECT nextval(105:::REGCLASS);`,
 
 		// Make sure type has correct back references.
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
-		_, typ, err := col.GetImmutableTypeByName(ctx, txn, &typn, tree.ObjectLookupFlagsWithRequired())
+		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
 		require.Equal(t, "notmyworkday", typ.GetName())
 		require.Equal(t,
@@ -194,7 +195,7 @@ func TestCreateOrReplaceFunctionUpdateReferences(t *testing.T) {
 	) {
 		// Make sure columns and indexes has correct back references.
 		tn := tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("t"+nonEmptyRelID))
-		_, tbl, err := col.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlagsWithRequired())
+		_, tbl, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tn)
 		require.NoError(t, err)
 		require.Equal(t,
 			[]descpb.TableDescriptor_Reference{{ID: 112, IndexID: 2, ColumnIDs: []catid.ColumnID{2}}},
@@ -202,13 +203,13 @@ func TestCreateOrReplaceFunctionUpdateReferences(t *testing.T) {
 
 		// Make sure sequence has correct back references.
 		sqn := tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("sq"+nonEmptyRelID))
-		_, seq, err := col.GetImmutableTableByName(ctx, txn, &sqn, tree.ObjectLookupFlagsWithRequired())
+		_, seq, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &sqn)
 		require.NoError(t, err)
 		require.Equal(t, []descpb.TableDescriptor_Reference{{ID: 112, ByID: true}}, seq.GetDependedOnBy())
 
 		// Make sure view has empty back references.
 		vn := tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("v"+nonEmptyRelID))
-		_, view, err := col.GetImmutableTableByName(ctx, txn, &vn, tree.ObjectLookupFlagsWithRequired())
+		_, view, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &vn)
 		require.NoError(t, err)
 		require.Equal(t,
 			[]descpb.TableDescriptor_Reference{{ID: 112, ColumnIDs: []catid.ColumnID{1}}},
@@ -216,19 +217,19 @@ func TestCreateOrReplaceFunctionUpdateReferences(t *testing.T) {
 
 		// Make sure columns and indexes has empty back references.
 		tn = tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("t"+emptyRelID))
-		_, tbl, err = col.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlagsWithRequired())
+		_, tbl, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &tn)
 		require.NoError(t, err)
 		require.Nil(t, tbl.GetDependedOnBy())
 
 		// Make sure sequence has empty back references.
 		sqn = tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("sq"+emptyRelID))
-		_, seq, err = col.GetImmutableTableByName(ctx, txn, &sqn, tree.ObjectLookupFlagsWithRequired())
+		_, seq, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &sqn)
 		require.NoError(t, err)
 		require.Nil(t, seq.GetDependedOnBy())
 
 		// Make sure view has emtpy back references.
 		vn = tree.MakeTableNameWithSchema("defaultdb", "public", tree.Name("v"+emptyRelID))
-		_, view, err = col.GetImmutableTableByName(ctx, txn, &vn, tree.ObjectLookupFlagsWithRequired())
+		_, view, err = descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn).Get(), &vn)
 		require.NoError(t, err)
 		require.Nil(t, view.GetDependedOnBy())
 	}
@@ -249,8 +250,8 @@ $$;
 `,
 	)
 
-	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		funcDesc, err := col.GetImmutableFunctionByID(ctx, txn, 112, tree.ObjectLookupFlagsWithRequired())
+	err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		funcDesc, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 112)
 		require.NoError(t, err)
 		require.Equal(t, funcDesc.GetName(), "f")
 
@@ -271,13 +272,13 @@ SELECT nextval(106:::REGCLASS);`,
 
 		// Make sure type has correct back references.
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
-		_, typ, err := col.GetImmutableTypeByName(ctx, txn, &typn, tree.ObjectLookupFlagsWithRequired())
+		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
 		require.Equal(t, []descpb.ID{112}, typ.GetReferencingDescriptorIDs())
 
 		// All objects with "1" suffix should have back references to the function,
 		// "2" should have empty references since it's not used yet.
-		validateReferences(ctx, txn, col, "1", "2")
+		validateReferences(ctx, txn.KV(), col, "1", "2")
 		return nil
 	})
 	require.NoError(t, err)
@@ -292,14 +293,8 @@ CREATE OR REPLACE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL 
 $$;
 `)
 
-	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		flags := tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				Required:    true,
-				AvoidLeased: true,
-			},
-		}
-		funcDesc, err := col.GetImmutableFunctionByID(ctx, txn, 112, flags)
+	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		funcDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Function(ctx, 112)
 		require.NoError(t, err)
 		require.Equal(t, funcDesc.GetName(), "f")
 
@@ -320,13 +315,13 @@ SELECT nextval(107:::REGCLASS);`,
 
 		// Make sure type has correct back references.
 		typn := tree.MakeQualifiedTypeName("defaultdb", "public", "notmyworkday")
-		_, typ, err := col.GetImmutableTypeByName(ctx, txn, &typn, tree.ObjectLookupFlagsWithRequired())
+		_, typ, err := descs.PrefixAndType(ctx, col.ByNameWithLeased(txn.KV()).Get(), &typn)
 		require.NoError(t, err)
 		require.Equal(t, []descpb.ID{112}, typ.GetReferencingDescriptorIDs())
 
 		// Now all objects with "2" suffix in name should have back references "1"
 		// had before, and "1" should have empty references.
-		validateReferences(ctx, txn, col, "2", "1")
+		validateReferences(ctx, txn.KV(), col, "2", "1")
 		return nil
 	})
 	require.NoError(t, err)

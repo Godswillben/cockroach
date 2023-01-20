@@ -367,6 +367,40 @@ const (
 	// based on (statistics->>'indexes') with inverted index on table system.statement_statistics.
 	V23_1_AlterSystemStatementStatisticsAddIndexesUsage
 
+	// V23_1EnsurePebbleFormatSSTableValueBlocks upgrades the Pebble format major
+	// version to FormatSSTableValueBlocks, which supports writing sstables in a
+	// new format containing value blocks (sstable.TableFormatPebblev3). As part
+	// of this upgrade, a preceding Pebble format major version
+	// (FormatPrePebblev1MarkedCompacted) upgrade also occurs.
+	//
+	// Only a Pebble version that has upgraded to FormatSSTableValueBlocks can
+	// read sstables with format sstable.TableFormatPebblev3 -- i.e., it is
+	// insufficient for the Pebble code to be recent enough. Hence, this is the
+	// first step of a two-part migration, and we cannot do this in a single
+	// step. With a single step migration, consider a cluster with nodes N1 and
+	// N2: once both are on V23_1EnsurePebbleFormatSSTableValueBlocks, N1 is notified
+	// of the change and upgrades the format major version in Pebble and starts
+	// constructing sstables (say for range snapshot ingestion) in this new
+	// format. This sstable could be sent to N2 before N2 has been notified
+	// about V23_1EnsurePebbleFormatSSTableValueBlocks, which will cause the sstable
+	// ingestion to fail.
+	V23_1EnsurePebbleFormatSSTableValueBlocks
+
+	// V23_1EnablePebbleFormatSSTableValueBlocks is the second step of the
+	// two-part migration. When this starts we are sure that all Pebble
+	// instances in the cluster have already upgraded to format major version
+	// FormatSSTableValueBlocks.
+	V23_1EnablePebbleFormatSSTableValueBlocks
+
+	// V23_1AlterSystemSQLInstancesAddSqlAddr adds a sql_addr column to the
+	// system.sql_instances table.
+	V23_1AlterSystemSQLInstancesAddSQLAddr
+
+	// V23_1_ChangefeedExpressionProductionReady marks changefeed expressions (transformation)
+	// as production ready.  This gate functions as a signal to attempt to upgrade
+	// chagnefeeds created prior to this version.
+	V23_1_ChangefeedExpressionProductionReady
+
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -636,6 +670,22 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1_AlterSystemStatementStatisticsAddIndexesUsage,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 22},
+	},
+	{
+		Key:     V23_1EnsurePebbleFormatSSTableValueBlocks,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 24},
+	},
+	{
+		Key:     V23_1EnablePebbleFormatSSTableValueBlocks,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 26},
+	},
+	{
+		Key:     V23_1AlterSystemSQLInstancesAddSQLAddr,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 28},
+	},
+	{
+		Key:     V23_1_ChangefeedExpressionProductionReady,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 30},
 	},
 
 	// *************************************************

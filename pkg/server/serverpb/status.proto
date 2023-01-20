@@ -892,10 +892,6 @@ message ActiveQuery {
   enum Phase {
     PREPARING = 0;
     EXECUTING = 1;
-    CANCELED  = 2;
-    TIMED_OUT = 3;
-    COMPLETED = 4;
-    FAILED    = 5;
   }
   // phase stores the current phase of execution for this query.
   Phase phase = 5;
@@ -927,19 +923,6 @@ message ActiveQuery {
 
   // The database the statement was executed on.
   string database = 14;
-
-  // The ID for the session that the statement was executed on
-  // (uint128 represented as raw bytes).
-  bytes session_id = 15 [(gogoproto.customname) = "SessionID"];
-
-  // The application name for the session that the statement was executed on.
-  string app_name = 16;
-
-  // The user name for the session that the statement was executed on.
-  string username = 17;
-
-  // The client address for the session that the statement was executed on.
-  string client_address = 18;
 }
 
 // Request object for ListSessions and ListLocalSessions.
@@ -1263,7 +1246,7 @@ message ProblemRangesResponse {
     ];
     repeated int64 circuit_breaker_error_range_ids = 10 [
       (gogoproto.customname) = "CircuitBreakerErrorRangeIDs",
-      (gogoproto.casttype) =
+      (gogoproto.casttype) = 
           "github.com/cockroachdb/cockroach/pkg/roachpb.RangeID"
     ];
     repeated int64 paused_replica_ids = 11 [
@@ -1301,6 +1284,10 @@ message HotRangesRequest {
   string node_id = 1 [(gogoproto.customname) = "NodeID"];
   int32 page_size = 2 [(gogoproto.nullable) = true];
   string page_token = 3 [(gogoproto.nullable) = true];
+  string tenant_id = 4 [
+    (gogoproto.customname) = "TenantID",
+    (gogoproto.nullable) = true
+  ];
 }
 
 // HotRangesResponse is the payload produced in response
@@ -1819,7 +1806,10 @@ message TableIndexStatsResponse {
     // CreatedAt is an approximate timestamp at which the index was created.
     // Note that it may not always be populated.
     google.protobuf.Timestamp created_at = 5 [(gogoproto.stdtime) = true];
-
+    // index_id is the ID of the index.
+    string index_id = 6 [(gogoproto.customname) = "IndexID"];
+    // table_id is the ID of the table which the index belongs to.
+    string table_id = 7 [(gogoproto.customname) = "TableID"];
   }
 
   repeated ExtendedCollectedIndexUsageStatistics statistics = 1;

@@ -122,9 +122,6 @@ type CatalogChangeBatcher interface {
 	DeleteComment(
 		ctx context.Context, key catalogkeys.CommentKey,
 	) error
-
-	// DeleteTableComments deletes all comments created on the table.
-	DeleteTableComments(ctx context.Context, tblID descpb.ID) error
 }
 
 // TransactionalJobRegistry creates and updates jobs in the current transaction.
@@ -234,10 +231,10 @@ type Validator interface {
 		override sessiondata.InternalExecutorOverride,
 	) error
 
-	ValidateCheckConstraint(
+	ValidateConstraint(
 		ctx context.Context,
 		tbl catalog.TableDescriptor,
-		constraint catalog.CheckConstraint,
+		constraint catalog.Constraint,
 		indexIDForValidation descpb.IndexID,
 		override sessiondata.InternalExecutorOverride,
 	) error

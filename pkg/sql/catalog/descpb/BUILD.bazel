@@ -9,7 +9,6 @@ go_library(
     name = "descpb",
     srcs = [
         "column.go",
-        "constraint.go",
         "descriptor.go",
         "index.go",
         "join_type.go",
@@ -23,7 +22,6 @@ go_library(
     deps = [
         "//pkg/keys",
         "//pkg/sql/catalog/catenumpb",
-        "//pkg/sql/catalog/catpb",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/protoreflect",
@@ -59,10 +57,12 @@ proto_library(
     deps = [
         "//pkg/config/zonepb:zonepb_proto",
         "//pkg/geo/geoindex:geoindex_proto",
+        "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb:tenantcapabilitiespb_proto",
         "//pkg/roachpb:roachpb_proto",
         "//pkg/sql/catalog/catenumpb:catenumpb_proto",
         "//pkg/sql/catalog/catpb:catpb_proto",
         "//pkg/sql/schemachanger/scpb:scpb_proto",
+        "//pkg/sql/sem/semenumpb:semenumpb_proto",
         "//pkg/sql/types:types_proto",
         "//pkg/util/hlc:hlc_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
@@ -78,10 +78,12 @@ go_proto_library(
     deps = [
         "//pkg/config/zonepb",
         "//pkg/geo/geoindex",
+        "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb",
         "//pkg/roachpb",  # keep
         "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/schemachanger/scpb",
+        "//pkg/sql/sem/semenumpb",
         "//pkg/sql/types",
         "//pkg/util/hlc",
         "@com_github_gogo_protobuf//gogoproto",

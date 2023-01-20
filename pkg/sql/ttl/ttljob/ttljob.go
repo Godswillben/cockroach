@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -113,12 +114,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	var relationName string
 	var entirePKSpan roachpb.Span
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		desc, err := descsCol.GetImmutableTableByID(
-			ctx,
-			txn,
-			details.TableID,
-			tree.ObjectLookupFlagsWithRequired(),
-		)
+		desc, err := descsCol.ByIDWithLeased(txn).WithoutNonPublic().Get().Table(ctx, details.TableID)
 		if err != nil {
 			return err
 		}
@@ -259,7 +255,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			jobID,
 			nil,  /* txn */
 			true, /* useReadLock */
-			func(_ *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 				progress := md.Progress
 				rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
 				rowLevelTTL.JobSpanCount = int64(jobSpanCount)
@@ -307,7 +303,6 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			nil, /* txn */
 			nil, /* clockUpdater */
 			evalCtx.Tracing,
-			execCfg.ContentionRegistry,
 		)
 		defer distSQLReceiver.Release()
 
