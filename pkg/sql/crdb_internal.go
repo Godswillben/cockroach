@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -137,6 +138,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalCreateStmtsTableID:                 crdbInternalCreateStmtsTable,
 		catconstants.CrdbInternalCreateTypeStmtsTableID:             crdbInternalCreateTypeStmtsTable,
 		catconstants.CrdbInternalDatabasesTableID:                   crdbInternalDatabasesTable,
+		catconstants.CrdbInternalDroppedRelationsViewID:             crdbInternalDroppedRelationsView,
 		catconstants.CrdbInternalSuperRegions:                       crdbInternalSuperRegions,
 		catconstants.CrdbInternalFeatureUsageID:                     crdbInternalFeatureUsage,
 		catconstants.CrdbInternalForwardDependenciesTableID:         crdbInternalForwardDependenciesTable,
@@ -1111,14 +1113,17 @@ func makeJobsTableRows(
 	}
 	defer cleanup(ctx)
 
-	sessionJobs := make([]*jobs.Record, 0, len(p.extendedEvalCtx.SchemaChangeJobRecords))
+	sessionJobs := make([]*jobs.Record, 0, p.extendedEvalCtx.jobs.numToCreate())
 	uniqueJobs := make(map[*jobs.Record]struct{})
-	for _, job := range p.extendedEvalCtx.SchemaChangeJobRecords {
+	if err := p.extendedEvalCtx.jobs.forEachToCreate(func(job *jobs.Record) error {
 		if _, ok := uniqueJobs[job]; ok {
-			continue
+			return nil
 		}
 		sessionJobs = append(sessionJobs, job)
 		uniqueJobs[job] = struct{}{}
+		return nil
+	}); err != nil {
+		return matched, err
 	}
 
 	// Loop while we need to skip a row.
@@ -1288,7 +1293,7 @@ func makeJobsTableRows(
 
 // execStatAvg is a helper for execution stats shown in virtual tables. Returns
 // NULL when the count is 0, or the mean of the given NumericStat.
-func execStatAvg(count int64, n roachpb.NumericStat) tree.Datum {
+func execStatAvg(count int64, n appstatspb.NumericStat) tree.Datum {
 	if count == 0 {
 		return tree.DNull
 	}
@@ -1297,7 +1302,7 @@ func execStatAvg(count int64, n roachpb.NumericStat) tree.Datum {
 
 // execStatVar is a helper for execution stats shown in virtual tables. Returns
 // NULL when the count is 0, or the variance of the given NumericStat.
-func execStatVar(count int64, n roachpb.NumericStat) tree.Datum {
+func execStatVar(count int64, n appstatspb.NumericStat) tree.Datum {
 	if count == 0 {
 		return tree.DNull
 	}
@@ -1362,6 +1367,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
   contention_time_var FLOAT,
+  cpu_sql_nanos_avg       FLOAT,
+  cpu_sql_nanos_var       FLOAT,
   implicit_txn        BOOL NOT NULL,
   full_scan           BOOL NOT NULL,
   sample_plan         JSONB,
@@ -1387,7 +1394,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		statementVisitor := func(_ context.Context, stats *roachpb.CollectedStatementStatistics) error {
+		statementVisitor := func(_ context.Context, stats *appstatspb.CollectedStatementStatistics) error {
 			anonymized := tree.DNull
 			anonStr, ok := scrubStmtStatKey(p.getVirtualTabler(), stats.Key.Query)
 			if ok {
@@ -1416,7 +1423,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			}
 
 			txnFingerprintID := tree.DNull
-			if stats.Key.TransactionFingerprintID != roachpb.InvalidTransactionFingerprintID {
+			if stats.Key.TransactionFingerprintID != appstatspb.InvalidTransactionFingerprintID {
 				txnFingerprintID = tree.NewDString(strconv.FormatUint(uint64(stats.Key.TransactionFingerprintID), 10))
 
 			}
@@ -1469,6 +1476,8 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),        // max_disk_usage_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_avg
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),      // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),         // cpu_sql_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),         // cpu_sql_nanos_var
 				tree.MakeDBool(tree.DBool(stats.Key.ImplicitTxn)),                                   // implicit_txn
 				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                      // full_scan
 				tree.NewDJSON(samplePlan),           // sample_plan
@@ -1525,7 +1534,9 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
   max_disk_usage_avg  FLOAT,
   max_disk_usage_var  FLOAT,
   contention_time_avg FLOAT,
-  contention_time_var FLOAT
+  contention_time_var FLOAT,
+  cpu_sql_nanos_avg       FLOAT,
+  cpu_sql_nanos_var       FLOAT
 )
 `,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -1545,7 +1556,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		transactionVisitor := func(_ context.Context, stats *roachpb.CollectedTransactionStatistics) error {
+		transactionVisitor := func(_ context.Context, stats *appstatspb.CollectedTransactionStatistics) error {
 			stmtFingerprintIDsDatum := tree.NewDArray(types.String)
 			for _, stmtFingerprintID := range stats.StatementFingerprintIDs {
 				if err := stmtFingerprintIDsDatum.Append(tree.NewDString(strconv.FormatUint(uint64(stmtFingerprintID), 10))); err != nil {
@@ -1580,6 +1591,8 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.MaxDiskUsage),       // max_disk_usage_var
 				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_avg
 				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.ContentionTime),     // contention_time_var
+				execStatAvg(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),        // cpu_sql_nanos_avg
+				execStatVar(stats.Stats.ExecStats.Count, stats.Stats.ExecStats.CPUSQLNanos),        // cpu_sql_nanos_var
 			)
 
 			if err != nil {
@@ -1621,7 +1634,7 @@ CREATE TABLE crdb_internal.node_txn_stats (
 
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
 
-		appTxnStatsVisitor := func(appName string, stats *roachpb.TxnStats) error {
+		appTxnStatsVisitor := func(appName string, stats *appstatspb.TxnStats) error {
 			return addRow(
 				tree.NewDInt(tree.DInt(nodeID)),
 				tree.NewDString(appName),
@@ -2961,12 +2974,12 @@ CREATE TABLE crdb_internal.create_function_statements (
 		fnIDToDBID := make(map[descpb.ID]descpb.ID)
 		for _, curDB := range dbDescs {
 			err := forEachSchema(ctx, p, curDB, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
-				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-					fnIDs = append(fnIDs, overload.ID)
-					fnIDToScName[overload.ID] = sc.GetName()
-					fnIDToScID[overload.ID] = sc.GetID()
-					fnIDToDBName[overload.ID] = curDB.GetName()
-					fnIDToDBID[overload.ID] = curDB.GetID()
+				return sc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+					fnIDs = append(fnIDs, sig.ID)
+					fnIDToScName[sig.ID] = sc.GetName()
+					fnIDToScID[sig.ID] = sc.GetID()
+					fnIDToDBName[sig.ID] = curDB.GetName()
+					fnIDToDBID[sig.ID] = curDB.GetID()
 					return nil
 				})
 			})
@@ -3686,6 +3699,7 @@ CREATE VIEW crdb_internal.ranges AS SELECT ` +
 		colinfo.RangesExtraRenders +
 		`FROM crdb_internal.ranges_no_leases`,
 	resultColumns: colinfo.Ranges,
+	comment:       "ranges is a view which queries ranges_no_leases for system ranges",
 }
 
 // descriptorsByType is a utility function that iterates through a slice of
@@ -5292,10 +5306,10 @@ func collectMarshaledJobMetadataMap(
 	if err := it.Close(); err != nil {
 		return nil, err
 	}
-	for _, record := range p.ExtendedEvalContext().SchemaChangeJobRecords {
+	if err := p.ExtendedEvalContext().jobs.forEachToCreate(func(record *jobs.Record) error {
 		progressBytes, payloadBytes, err := getPayloadAndProgressFromJobsRecord(p, record)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		mj := marshaledJobMetadata{
 			status:        tree.NewDString(string(record.RunningStatus)),
@@ -5303,6 +5317,9 @@ func collectMarshaledJobMetadataMap(
 			progressBytes: progressBytes,
 		}
 		m[record.JobID] = mj
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return m, nil
 }
@@ -6001,7 +6018,7 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 			return memSQLStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
 				SortedAppNames: true,
 				SortedKey:      true,
-			}, func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+			}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 
 				aggregatedTs, err := tree.MakeDTimestampTZ(curAggTs, time.Microsecond)
 				if err != nil {
@@ -6236,7 +6253,7 @@ CREATE TABLE crdb_internal.cluster_transaction_statistics (
 				SortedKey:      true,
 			}, func(
 				ctx context.Context,
-				statistics *roachpb.CollectedTransactionStatistics) error {
+				statistics *appstatspb.CollectedTransactionStatistics) error {
 
 				aggregatedTs, err := tree.MakeDTimestampTZ(curAggTs, time.Microsecond)
 				if err != nil {
@@ -6326,6 +6343,59 @@ GROUP BY
 	},
 }
 
+var crdbInternalDroppedRelationsView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.kv_dropped_relations AS
+WITH
+	dropped_relations
+		AS (
+			SELECT
+				id,
+				(descriptor->'table'->>'name') AS name,
+				(descriptor->'table'->'parentId')::INT8 AS parent_id,
+				(descriptor->'table'->'unexposedParentSchemaId')::INT8
+					AS parent_schema_id,
+				to_timestamp(
+					((descriptor->'table'->>'dropTime')::DECIMAL * 0.000000001)::FLOAT8
+				)
+					AS drop_time
+			FROM
+				crdb_internal.kv_catalog_descriptor
+			WHERE
+				descriptor->'table'->>'state' = 'DROP'
+		),
+	gc_ttl
+		AS (
+			SELECT
+				id, (config->'gc'->'ttlSeconds')::INT8 AS ttl
+			FROM
+				crdb_internal.kv_catalog_zones
+		)
+SELECT
+	dr.parent_id,
+	dr.parent_schema_id,
+	dr.name,
+	dr.id,
+	dr.drop_time,
+	COALESCE(gc.ttl, db_gc.ttl, root_gc.ttl) * '1 second'::INTERVAL AS ttl
+FROM
+	dropped_relations AS dr
+	LEFT JOIN gc_ttl AS gc ON gc.id = dr.id
+	LEFT JOIN gc_ttl AS db_gc ON db_gc.id = dr.parent_id
+	LEFT JOIN gc_ttl AS root_gc ON root_gc.id = 0
+ORDER BY
+	parent_id, parent_schema_id, id`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "parent_id", Typ: types.Int},
+		{Name: "parent_schema_id", Typ: types.Int},
+		{Name: "name", Typ: types.String},
+		{Name: "id", Typ: types.Int},
+		{Name: "drop_time", Typ: types.Timestamp},
+		{Name: "ttl", Typ: types.Interval},
+	},
+	comment: "kv_dropped_relations contains all dropped relations waiting for garbage collection",
+}
+
 // crdbInternalTenantUsageDetailsView, exposes system ranges.
 var crdbInternalTenantUsageDetailsView = virtualSchemaView{
 	schema: `
@@ -6380,7 +6450,10 @@ CREATE TABLE crdb_internal.transaction_contention_events (
     waiting_txn_fingerprint_id   BYTES NOT NULL,
 
     contention_duration          INTERVAL NOT NULL,
-    contending_key               BYTES NOT NULL
+    contending_key               BYTES NOT NULL,
+
+    waiting_stmt_id               string NOT NULL,
+    waiting_stmt_fingerprint_id   BYTES NOT NULL
 );`,
 	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
 		// Check permission first before making RPC fanout.
@@ -6452,15 +6525,22 @@ CREATE TABLE crdb_internal.transaction_contention_events (
 						tree.DBytes(resp.Events[i].BlockingEvent.Key))
 				}
 
+				waitingStmtFingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(resp.Events[i].WaitingStmtFingerprintID))))
+
+				waitingStmtId := tree.NewDString(hex.EncodeToString(resp.Events[i].WaitingStmtID.GetBytes()))
+
 				row = row[:0]
 				row = append(row,
 					collectionTs, // collection_ts
 					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].BlockingEvent.TxnMeta.ID}), // blocking_txn_id
 					blockingFingerprintID, // blocking_fingerprint_id
 					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].WaitingTxnID}), // waiting_txn_id
-					waitingFingerprintID, // waiting_fingerprint_id
-					contentionDuration,   // contention_duration
-					contendingKey,        // contending_key
+					waitingFingerprintID,     // waiting_fingerprint_id
+					contentionDuration,       // contention_duration
+					contendingKey,            // contending_key,
+					waitingStmtId,            // waiting_stmt_id
+					waitingStmtFingerprintID, // waiting_stmt_fingerprint_id
 				)
 
 				if err = pusher.pushRow(row...); err != nil {
@@ -6939,7 +7019,8 @@ CREATE TABLE crdb_internal.%s (
   contention                 INTERVAL,
   problems                   STRING[] NOT NULL,
   causes                     STRING[] NOT NULL,
-  stmt_execution_ids         STRING[] NOT NULL
+  stmt_execution_ids         STRING[] NOT NULL,
+  cpu_sql_nanos              INT8
 )`
 
 var crdbInternalClusterTxnExecutionInsightsTable = virtualSchemaTable{
@@ -7067,6 +7148,7 @@ func populateTxnExecutionInsights(
 			problems,
 			causes,
 			stmtIDs,
+			tree.NewDInt(tree.DInt(insight.Transaction.CPUSQLNanos)),
 		))
 
 		if err != nil {
@@ -7105,7 +7187,8 @@ CREATE TABLE crdb_internal.%s (
 	contention                 INTERVAL,
 	contention_events          JSONB,
 	index_recommendations      STRING[] NOT NULL,
-	implicit_txn               BOOL NOT NULL
+	implicit_txn               BOOL NOT NULL,
+	cpu_sql_nanos              INT8
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
@@ -7235,6 +7318,7 @@ func populateStmtInsights(
 				contentionEvents,
 				indexRecommendations,
 				tree.MakeDBool(tree.DBool(insight.Transaction.ImplicitTxn)),
+				tree.NewDInt(tree.DInt(s.CPUSQLNanos)),
 			))
 		}
 	}

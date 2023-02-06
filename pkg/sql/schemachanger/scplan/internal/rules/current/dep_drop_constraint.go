@@ -31,8 +31,8 @@ func init() {
 		scpb.Status_VALIDATED, scpb.Status_ABSENT,
 		func(from, to NodeVars) rel.Clauses {
 			return rel.Clauses{
-				from.TypeFilter(IsSupportedNonIndexBackedConstraint),
-				to.TypeFilter(IsConstraintDependent),
+				from.TypeFilter(rulesVersionKey, isNonIndexBackedConstraint),
+				to.TypeFilter(rulesVersionKey, isConstraintDependent),
 				JoinOnConstraintID(from, to, "table-id", "constraint-id"),
 			}
 		},
@@ -45,8 +45,8 @@ func init() {
 		scpb.Status_ABSENT, scpb.Status_ABSENT,
 		func(from, to NodeVars) rel.Clauses {
 			return rel.Clauses{
-				from.TypeFilter(IsConstraintDependent),
-				to.TypeFilter(IsSupportedNonIndexBackedConstraint),
+				from.TypeFilter(rulesVersionKey, isConstraintDependent),
+				to.TypeFilter(rulesVersionKey, isNonIndexBackedConstraint),
 				JoinOnConstraintID(from, to, "table-id", "constraint-id"),
 			}
 		},

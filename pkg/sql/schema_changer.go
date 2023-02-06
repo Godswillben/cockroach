@@ -47,14 +47,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -111,6 +109,7 @@ type SchemaChanger struct {
 	mutationID        descpb.MutationID
 	droppedDatabaseID descpb.ID
 	droppedSchemaIDs  catalog.DescriptorIDSet
+	droppedFnIDs      catalog.DescriptorIDSet
 	sqlInstanceID     base.SQLInstanceID
 	leaseMgr          *lease.Manager
 	db                isql.DB
@@ -635,6 +634,17 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 	// Pull out the requested descriptor.
 	desc, err := sc.getTargetDescriptor(ctx)
 	if err != nil {
+		// We had a bug where function descriptors are not deleted after DROP
+		// FUNCTION in legacy schema changer (see #95364). We then add logic to
+		// handle the deletion in jobs and added upgrades to delete all dropped
+		// functions. It's possible that such job is resumed after the cluster is
+		// upgraded (all dropped descriptors are deleted), and we would fail to find
+		// the descriptor here. In this case, we can simply assume the job is done
+		// since we only handle descriptor deletes for functions and `droppedFnIDs`
+		// is not empty only when dropping functions.
+		if sc.droppedFnIDs.Len() > 0 && errors.Is(err, catalog.ErrDescriptorNotFound) {
+			return nil
+		}
 		return err
 	}
 
@@ -690,6 +700,10 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 			}
 		case catalog.DatabaseDescriptor:
 			if sc.droppedDatabaseID != desc.GetID() {
+				return nil
+			}
+		case catalog.FunctionDescriptor:
+			if !sc.droppedFnIDs.Contains(desc.GetID()) {
 				return nil
 			}
 		default:
@@ -2570,11 +2584,12 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			return err
 		}
 	}
-	execSchemaChange := func(descID descpb.ID, mutationID descpb.MutationID, droppedDatabaseID descpb.ID, droppedSchemaIDs descpb.IDs) error {
+	execSchemaChange := func(descID descpb.ID, mutationID descpb.MutationID, droppedDatabaseID descpb.ID, droppedSchemaIDs descpb.IDs, droppedFnIDs descpb.IDs) error {
 		sc := SchemaChanger{
 			descID:               descID,
 			mutationID:           mutationID,
 			droppedSchemaIDs:     catalog.MakeDescriptorIDSet(droppedSchemaIDs...),
+			droppedFnIDs:         catalog.MakeDescriptorIDSet(droppedFnIDs...),
 			droppedDatabaseID:    droppedDatabaseID,
 			sqlInstanceID:        p.ExecCfg().NodeInfo.NodeID.SQLInstanceID(),
 			db:                   p.ExecCfg().InternalDB,
@@ -2671,14 +2686,38 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 	// Drop the child tables.
 	for i := range details.DroppedTables {
 		droppedTable := &details.DroppedTables[i]
-		if err := execSchemaChange(droppedTable.ID, descpb.InvalidMutationID, details.DroppedDatabaseID, details.DroppedSchemas); err != nil {
+		if err := execSchemaChange(
+			droppedTable.ID,
+			descpb.InvalidMutationID,
+			details.DroppedDatabaseID,
+			details.DroppedSchemas,
+			nil, /* droppedFnIDs */
+		); err != nil {
 			return err
 		}
 	}
 
 	// Drop all schemas.
 	for _, id := range details.DroppedSchemas {
-		if err := execSchemaChange(id, descpb.InvalidMutationID, descpb.InvalidID, details.DroppedSchemas); err != nil {
+		if err := execSchemaChange(
+			id,
+			descpb.InvalidMutationID,
+			descpb.InvalidID,
+			details.DroppedSchemas,
+			nil, /* droppedFnIDs */
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range details.DroppedFunctions {
+		if err := execSchemaChange(
+			id,
+			descpb.InvalidMutationID,
+			descpb.InvalidID,
+			nil, /* droppedSchemaIDs */
+			details.DroppedFunctions,
+		); err != nil {
 			return err
 		}
 	}
@@ -2686,7 +2725,13 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 	// Drop the database, if applicable.
 	if details.FormatVersion >= jobspb.DatabaseJobFormatVersion {
 		if dbID := details.DroppedDatabaseID; dbID != descpb.InvalidID {
-			if err := execSchemaChange(dbID, descpb.InvalidMutationID, details.DroppedDatabaseID, details.DroppedSchemas); err != nil {
+			if err := execSchemaChange(
+				dbID,
+				descpb.InvalidMutationID,
+				details.DroppedDatabaseID,
+				details.DroppedSchemas,
+				nil, /* droppedFnIDs */
+			); err != nil {
 				return err
 			}
 			// If there are no tables to GC, the zone config needs to be deleted now.
@@ -2739,7 +2784,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 	// schema changer. This can be any single-table schema change or any change to
 	// a database or schema other than a drop.
 	if details.DescID != descpb.InvalidID {
-		return execSchemaChange(details.DescID, details.TableMutationID, details.DroppedDatabaseID, details.DroppedSchemas)
+		return execSchemaChange(details.DescID, details.TableMutationID, details.DroppedDatabaseID, details.DroppedSchemas, nil /* droppedFnIDs */)
 	}
 	return nil
 }
@@ -3038,25 +3083,10 @@ func (sc *SchemaChanger) getDependentMutationsJobs(
 	return dependentJobs, nil
 }
 
-func (sc *SchemaChanger) shouldSplitAndScatter(
-	tableDesc *tabledesc.Mutable, m catalog.Mutation, idx catalog.Index,
-) bool {
-	if idx == nil {
-		return false
-	}
-
-	if m.Adding() && idx.IsSharded() {
-		return m.Backfilling() || (idx.IsTemporaryIndexForBackfill() && m.DeleteOnly())
-	}
-	return false
-
-}
-
 func (sc *SchemaChanger) preSplitHashShardedIndexRanges(ctx context.Context) error {
 	if err := sc.txn(ctx, func(
 		ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
 	) error {
-		hour := hlc.Timestamp{WallTime: timeutil.Now().Add(time.Hour).UnixNano()}
 		tableDesc, err := descsCol.MutableByID(txn.KV()).Table(ctx, sc.descID)
 		if err != nil {
 			return err
@@ -3075,60 +3105,10 @@ func (sc *SchemaChanger) preSplitHashShardedIndexRanges(ctx context.Context) err
 				break
 			}
 
-			if idx := m.AsIndex(); sc.shouldSplitAndScatter(tableDesc, m, idx) {
-				// Iterate through all partitioning lists to get all possible list
-				// partitioning key prefix. Hash sharded index only allows implicit
-				// partitioning, and implicit partitioning does not support
-				// subpartition. So it's safe not to consider subpartitions. Range
-				// partition is not considered here as well, because it's hard to
-				// predict the sampling points within each range to make the pre-split
-				// on shard boundaries helpful.
-				var partitionKeyPrefixes []roachpb.Key
-				partitioning := idx.GetPartitioning()
-				if err := partitioning.ForEachList(
-					func(name string, values [][]byte, subPartitioning catalog.Partitioning) error {
-						for _, tupleBytes := range values {
-							_, key, err := rowenc.DecodePartitionTuple(
-								&tree.DatumAlloc{},
-								sc.execCfg.Codec,
-								tableDesc,
-								idx,
-								partitioning,
-								tupleBytes,
-								tree.Datums{},
-							)
-							if err != nil {
-								return err
-							}
-							partitionKeyPrefixes = append(partitionKeyPrefixes, key)
-						}
-						return nil
-					},
-				); err != nil {
+			if idx := m.AsIndex(); idx != nil {
+				err := sc.execCfg.IndexSpanSplitter.MaybeSplitIndexSpansForPartitioning(ctx, tableDesc, idx)
+				if err != nil {
 					return err
-				}
-
-				splitAtShards := calculateSplitAtShards(maxHashShardedIndexRangePreSplit.Get(&sc.settings.SV), idx.GetSharded().ShardBuckets)
-				if len(partitionKeyPrefixes) == 0 {
-					// If there is no partitioning on the index, only pre-split on
-					// selected shard boundaries.
-					for _, shard := range splitAtShards {
-						keyPrefix := sc.execCfg.Codec.IndexPrefix(uint32(tableDesc.GetID()), uint32(idx.GetID()))
-						splitKey := encoding.EncodeVarintAscending(keyPrefix, shard)
-						if err := splitAndScatter(ctx, sc.db.KV(), splitKey, hour); err != nil {
-							return err
-						}
-					}
-				} else {
-					// If there are partitioning prefixes, pre-split each of them.
-					for _, partPrefix := range partitionKeyPrefixes {
-						for _, shard := range splitAtShards {
-							splitKey := encoding.EncodeVarintAscending(partPrefix, shard)
-							if err := splitAndScatter(ctx, sc.db.KV(), splitKey, hour); err != nil {
-								return err
-							}
-						}
-					}
 				}
 			}
 		}

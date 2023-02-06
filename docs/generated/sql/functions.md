@@ -323,11 +323,11 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="cardinality"></a><code>cardinality(input: anyelement[]) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of elements contained in <code>input</code></p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="crdb_internal.merge_statement_stats"></a><code>crdb_internal.merge_statement_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of roachpb.StatementStatistics into a single JSONB object</p>
+<tr><td><a name="crdb_internal.merge_statement_stats"></a><code>crdb_internal.merge_statement_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of appstatspb.StatementStatistics into a single JSONB object</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.merge_stats_metadata"></a><code>crdb_internal.merge_stats_metadata(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of StmtStatsMetadata into a single JSONB object</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="crdb_internal.merge_transaction_stats"></a><code>crdb_internal.merge_transaction_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of roachpb.TransactionStatistics into a single JSONB object</p>
+<tr><td><a name="crdb_internal.merge_transaction_stats"></a><code>crdb_internal.merge_transaction_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of appstatspb.TransactionStatistics into a single JSONB object</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="string_to_array"></a><code>string_to_array(str: <a href="string.html">string</a>, delimiter: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Split a string into components on a delimiter.</p>
 </span></td><td>Immutable</td></tr>
@@ -3196,6 +3196,8 @@ active for the current transaction.</p>
 <tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: jsonb) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: jsonb, version: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.num_inverted_index_entries"></a><code>crdb_internal.num_inverted_index_entries(val: tsvector, version: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.payloads_for_span"></a><code>crdb_internal.payloads_for_span(span_id: <a href="int.html">int</a>) &rarr; tuple{string AS payload_type, jsonb AS payload_jsonb}</code></td><td><span class="funcdesc"><p>Returns the payload(s) of the requested span and all its children.</p>
 </span></td><td>Volatile</td></tr>

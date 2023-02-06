@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
@@ -270,6 +271,7 @@ func newRaftConfig(
 	return &raft.Config{
 		ID:                        id,
 		Applied:                   appliedIndex,
+		AsyncStorageWrites:        true,
 		ElectionTick:              storeCfg.RaftElectionTimeoutTicks,
 		HeartbeatTick:             storeCfg.RaftHeartbeatIntervalTicks,
 		MaxUncommittedEntriesSize: storeCfg.RaftMaxUncommittedEntriesSize,
@@ -538,7 +540,7 @@ Store.HandleRaftRequest (which is part of the RaftMessageHandler interface),
 ultimately resulting in a call to Replica.handleRaftReadyRaftMuLocked, which
 houses the integration with the etcd/raft library (raft.RawNode). This may
 generate Raft messages to be sent to other Stores; these are handed to
-Replica.sendRaftMessagesRaftMuLocked which ultimately hands them to the Store's
+Replica.sendRaftMessages which ultimately hands them to the Store's
 RaftTransport.SendAsync method. Raft uses message passing (not
 request-response), and outgoing messages will use a gRPC stream that differs
 from that used for incoming messages (which makes asymmetric partitions more
@@ -745,6 +747,7 @@ type Store struct {
 	metrics            *StoreMetrics
 	intentResolver     *intentresolver.IntentResolver
 	recoveryMgr        txnrecovery.Manager
+	syncWaiter         *logstore.SyncWaiterLoop
 	raftEntryCache     *raftentry.Cache
 	limiters           batcheval.Limiters
 	txnWaitMetrics     *txnwait.Metrics
@@ -1209,7 +1212,7 @@ func NewStore(
 		s.allocator = allocatorimpl.MakeAllocator(
 			cfg.Settings,
 			storePoolIsDeterministic,
-			func(string) (time.Duration, bool) {
+			func(id roachpb.NodeID) (time.Duration, bool) {
 				return 0, false
 			}, cfg.TestingKnobs.AllocatorKnobs,
 		)
@@ -1247,6 +1250,8 @@ func NewStore(
 	// unnecessary elections when ticks are temporarily delayed and piled up.
 	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s, storeSchedulerConcurrency,
 		cfg.RaftElectionTimeoutTicks)
+
+	s.syncWaiter = logstore.NewSyncWaiterLoop()
 
 	s.raftEntryCache = raftentry.NewCache(cfg.RaftEntryCacheSize)
 	s.metrics.registry.AddMetricStruct(s.raftEntryCache.Metrics())
@@ -1845,14 +1850,18 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
-	// concurrently, all of the initialization must be performed before we start
+	// concurrently, all initialization must be performed before we start
 	// listening for Raft messages and starting the process Raft loop.
-	engRepls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
+	repls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.engine)
 	if err != nil {
 		return err
 	}
-	for fullID, desc := range engRepls.Initialized {
-		rep, err := newReplica(ctx, desc, s, fullID.ReplicaID)
+	for _, repl := range repls {
+		if repl.Desc == nil {
+			// Uninitialized Replicas are not currently instantiated at store start.
+			continue
+		}
+		rep, err := newReplica(ctx, repl.Desc, s, repl.ReplicaID)
 		if err != nil {
 			return err
 		}
@@ -2791,7 +2800,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		averageReadsPerSecond += loadStats.ReadKeysPerSecond
 		averageReadBytesPerSecond += loadStats.ReadBytesPerSecond
 		averageWriteBytesPerSecond += loadStats.WriteBytesPerSecond
-		averageCPUNanosPerSecond += loadStats.CPUNanosPerSecond
+		averageCPUNanosPerSecond += loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond
 
 		locks += metrics.LockTableMetrics.Locks
 		totalLockHoldDurationNanos += metrics.LockTableMetrics.TotalLockHoldDurationNanos
@@ -3032,7 +3041,7 @@ type HotReplicaInfo struct {
 	WriteKeysPerSecond  float64
 	WriteBytesPerSecond float64
 	ReadBytesPerSecond  float64
-	CPUNanosPerSecond   float64
+	CPUTimePerSecond    float64
 }
 
 // HottestReplicas returns the hottest replicas on a store, sorted by their
@@ -3064,6 +3073,7 @@ func mapToHotReplicasInfo(repls []CandidateReplica) []HotReplicaInfo {
 		hotRepls[i].ReadKeysPerSecond = loadStats.ReadKeysPerSecond
 		hotRepls[i].WriteBytesPerSecond = loadStats.WriteBytesPerSecond
 		hotRepls[i].ReadBytesPerSecond = loadStats.ReadBytesPerSecond
+		hotRepls[i].CPUTimePerSecond = loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond
 	}
 	return hotRepls
 }
@@ -3136,12 +3146,14 @@ func (s *Store) ReplicateQueueDryRun(
 func (s *Store) AllocatorCheckRange(
 	ctx context.Context,
 	desc *roachpb.RangeDescriptor,
+	collectTraces bool,
 	overrideStorePool storepool.AllocatorStorePool,
 ) (allocatorimpl.AllocatorAction, roachpb.ReplicationTarget, tracingpb.Recording, error) {
-	ctx, collectAndFinish := tracing.ContextWithRecordingSpan(ctx,
-		s.cfg.AmbientCtx.Tracer, "allocator check range",
-	)
-	defer collectAndFinish()
+	var spanOptions []tracing.SpanOption
+	if collectTraces {
+		spanOptions = append(spanOptions, tracing.WithRecording(tracingpb.RecordingVerbose))
+	}
+	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator check range", spanOptions...)
 
 	confReader, err := s.GetConfReader(ctx)
 	if err == nil {
@@ -3149,13 +3161,13 @@ func (s *Store) AllocatorCheckRange(
 	}
 	if err != nil {
 		log.Eventf(ctx, "span configs unavailable: %s", err)
-		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
 	if err != nil {
 		log.Eventf(ctx, "error retrieving span config for range %s: %s", desc, err)
-		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	// If a store pool was provided, use that, otherwise use the store's
@@ -3171,14 +3183,14 @@ func (s *Store) AllocatorCheckRange(
 
 	// In the case that the action does not require a target, return immediately.
 	if !(action.Add() || action.Replace()) {
-		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return action, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	liveVoters, liveNonVoters, isReplacement, nothingToDo, err :=
 		allocatorimpl.FilterReplicasForAction(storePool, desc, action)
 
 	if nothingToDo || err != nil {
-		return action, roachpb.ReplicationTarget{}, collectAndFinish(), err
+		return action, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
 	target, _, err := s.allocator.AllocateTarget(ctx, storePool, conf,
@@ -3206,7 +3218,7 @@ func (s *Store) AllocatorCheckRange(
 		}
 	}
 
-	return action, target, collectAndFinish(), err
+	return action, target, sp.FinishAndGetConfiguredRecording(), err
 }
 
 // Enqueue runs the given replica through the requested queue. If `async` is
@@ -3435,57 +3447,6 @@ func (s *storeForTruncatorImpl) releaseReplicaForTruncator(r replicaForTruncator
 
 func (s *storeForTruncatorImpl) getEngine() storage.Engine {
 	return (*Store)(s).engine
-}
-
-// WriteClusterVersion writes the given cluster version to the store-local
-// cluster version key. We only accept a raw engine to ensure we're persisting
-// the write durably.
-func WriteClusterVersion(
-	ctx context.Context, eng storage.Engine, cv clusterversion.ClusterVersion,
-) error {
-	err := storage.MVCCPutProto(
-		ctx,
-		eng,
-		nil,
-		keys.StoreClusterVersionKey(),
-		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
-		&cv,
-	)
-	if err != nil {
-		return err
-	}
-
-	// The storage engine sometimes must make backwards incompatible
-	// changes. However, the store cluster version key is a key stored
-	// within the storage engine, so it's unavailable when the store is
-	// opened.
-	//
-	// The storage engine maintains its own minimum version on disk that
-	// it may consult it before opening the Engine. This version is
-	// stored in a separate file on the filesystem. For now, write to
-	// this file in combination with the store cluster version key.
-	//
-	// This parallel version state is a bit of a wart and an eventual
-	// goal is to replace the store cluster version key with the storage
-	// engine's flat file. This requires that there are no writes to the
-	// engine until either bootstrapping or joining an existing cluster.
-	// Writing the version to this file would happen before opening the
-	// engine for completing the rest of bootstrapping/joining the
-	// cluster.
-	return eng.SetMinVersion(cv.Version)
-}
-
-// ReadClusterVersion reads the cluster version from the store-local version
-// key. Returns an empty version if the key is not found.
-func ReadClusterVersion(
-	ctx context.Context, reader storage.Reader,
-) (clusterversion.ClusterVersion, error) {
-	var cv clusterversion.ClusterVersion
-	_, err := storage.MVCCGetProto(ctx, reader, keys.StoreClusterVersionKey(), hlc.Timestamp{},
-		&cv, storage.MVCCGetOptions{})
-	return cv, err
 }
 
 func init() {

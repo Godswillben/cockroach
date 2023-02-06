@@ -34,8 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
@@ -55,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -1286,6 +1287,9 @@ type ExecutorConfig struct {
 	// IndexMerger is also used to backfill indexes and is also rather circular.
 	IndexMerger *IndexBackfillerMergePlanner
 
+	// IndexSpanSplitter is used to split and scatter indexes before backfill.
+	IndexSpanSplitter scexec.IndexSpanSplitter
+
 	// Validator is used to validate indexes and check constraints.
 	Validator scexec.Validator
 
@@ -1299,7 +1303,7 @@ type ExecutorConfig struct {
 
 	// RootMemoryMonitor is the root memory monitor of the entire server. Do not
 	// use this for normal purposes. It is to be used to establish any new
-	// root-level memory accounts that are not related to a user sessions.
+	// root-level memory accounts that are not related to a user session.
 	RootMemoryMonitor *mon.BytesMonitor
 
 	// CompactEngineSpanFunc is used to inform a storage engine of the need to
@@ -1350,6 +1354,9 @@ type ExecutorConfig struct {
 	// InternalDB is used to create an isql.Executor bound with SessionData and
 	// other ExtraTxnState.
 	InternalDB *InternalDB
+
+	// SpanStatsConsumer is used by the key visualizer job.
+	SpanStatsConsumer keyvisualizer.SpanStatsConsumer
 
 	// ConsistencyChecker is to generate the results in calls to
 	// crdb_internal.check_consistency.
@@ -1527,7 +1534,7 @@ type ExecutorTestingKnobs struct {
 	BeforeTxnStatsRecorded func(
 		sessionData *sessiondata.SessionData,
 		txnID uuid.UUID,
-		txnFingerprintID roachpb.TransactionFingerprintID,
+		txnFingerprintID appstatspb.TransactionFingerprintID,
 	)
 
 	// AfterBackupCheckpoint if set will be called after a BACKUP-CHECKPOINT
@@ -1674,6 +1681,9 @@ type StreamingTestingKnobs struct {
 	// OverrideRevertRangeBatchSize allows overriding the `MaxSpanRequestKeys`
 	// used when sending a RevertRange request.
 	OverrideRevertRangeBatchSize int64
+
+	// AfterCutoverStarted allows blocking after the cutover has started.
+	AfterCutoverStarted func()
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -2028,12 +2038,6 @@ type queryMeta struct {
 	database string
 }
 
-// cancel cancels the query associated with this queryMeta, by closing the
-// associated stmt context.
-func (q *queryMeta) cancel() {
-	q.cancelQuery()
-}
-
 // SessionDefaults mirrors fields in Session, for restoring default
 // configuration values in SET ... TO DEFAULT (or RESET ...) statements.
 type SessionDefaults map[string]string
@@ -2062,141 +2066,104 @@ type SessionArgs struct {
 // SessionRegistry stores a set of all sessions on this node.
 // Use register() and deregister() to modify this registry.
 type SessionRegistry struct {
-	syncutil.Mutex
-	sessions            map[clusterunique.ID]registrySession
-	sessionsByCancelKey map[pgwirecancel.BackendKeyData]registrySession
+	mu struct {
+		syncutil.RWMutex
+		sessionsByID        map[clusterunique.ID]RegistrySession
+		sessionsByCancelKey map[pgwirecancel.BackendKeyData]RegistrySession
+	}
 }
 
 // NewSessionRegistry creates a new SessionRegistry with an empty set
 // of sessions.
 func NewSessionRegistry() *SessionRegistry {
-	return &SessionRegistry{
-		sessions:            make(map[clusterunique.ID]registrySession),
-		sessionsByCancelKey: make(map[pgwirecancel.BackendKeyData]registrySession),
+	r := SessionRegistry{}
+	r.mu.sessionsByID = make(map[clusterunique.ID]RegistrySession)
+	r.mu.sessionsByCancelKey = make(map[pgwirecancel.BackendKeyData]RegistrySession)
+	return &r
+}
+
+func (r *SessionRegistry) GetSessionByID(sessionID clusterunique.ID) (RegistrySession, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session, ok := r.mu.sessionsByID[sessionID]
+	return session, ok
+}
+
+func (r *SessionRegistry) GetSessionByQueryID(queryID clusterunique.ID) (RegistrySession, bool) {
+	for _, session := range r.getSessions() {
+		if session.hasQuery(queryID) {
+			return session, true
+		}
 	}
+	return nil, false
+}
+
+func (r *SessionRegistry) GetSessionByCancelKey(
+	cancelKey pgwirecancel.BackendKeyData,
+) (RegistrySession, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session, ok := r.mu.sessionsByCancelKey[cancelKey]
+	return session, ok
+}
+
+func (r *SessionRegistry) getSessions() []RegistrySession {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	sessions := make([]RegistrySession, 0, len(r.mu.sessionsByID))
+	for _, session := range r.mu.sessionsByID {
+		sessions = append(sessions, session)
+	}
+	return sessions
 }
 
 func (r *SessionRegistry) register(
-	id clusterunique.ID, queryCancelKey pgwirecancel.BackendKeyData, s registrySession,
+	id clusterunique.ID, queryCancelKey pgwirecancel.BackendKeyData, s RegistrySession,
 ) {
-	r.Lock()
-	defer r.Unlock()
-	r.sessions[id] = s
-	r.sessionsByCancelKey[queryCancelKey] = s
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.sessionsByID[id] = s
+	r.mu.sessionsByCancelKey[queryCancelKey] = s
 }
 
 func (r *SessionRegistry) deregister(
 	id clusterunique.ID, queryCancelKey pgwirecancel.BackendKeyData,
 ) {
-	r.Lock()
-	defer r.Unlock()
-	delete(r.sessions, id)
-	delete(r.sessionsByCancelKey, queryCancelKey)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.mu.sessionsByID, id)
+	delete(r.mu.sessionsByCancelKey, queryCancelKey)
 }
 
-type registrySession interface {
-	user() username.SQLUsername
-	cancelQuery(queryID clusterunique.ID) bool
-	cancelCurrentQueries() bool
-	cancelSession()
+type RegistrySession interface {
+	// SessionUser returns the session user's username.
+	SessionUser() username.SQLUsername
+	hasQuery(queryID clusterunique.ID) bool
+	// CancelQuery cancels the query specified by queryID if it exists.
+	CancelQuery(queryID clusterunique.ID) bool
+	// CancelActiveQueries cancels all currently active queries.
+	CancelActiveQueries() bool
+	// CancelSession cancels the session.
+	CancelSession()
 	// serialize serializes a Session into a serverpb.Session
 	// that can be served over RPC.
 	serialize() serverpb.Session
 }
 
-// CancelQuery looks up the associated query in the session registry and cancels
-// it. The caller is responsible for all permission checks.
-func (r *SessionRegistry) CancelQuery(queryIDStr string) (bool, error) {
-	queryID, err := clusterunique.IDFromString(queryIDStr)
-	if err != nil {
-		return false, errors.Wrapf(err, "query ID %s malformed", queryID)
-	}
-
-	r.Lock()
-	defer r.Unlock()
-
-	for _, session := range r.sessions {
-		if session.cancelQuery(queryID) {
-			return true, nil
-		}
-	}
-
-	return false, fmt.Errorf("query ID %s not found", queryID)
-}
-
-// CancelQueryByKey looks up the associated query in the session registry and
-// cancels it.
-func (r *SessionRegistry) CancelQueryByKey(
-	queryCancelKey pgwirecancel.BackendKeyData,
-) (canceled bool, err error) {
-	r.Lock()
-	defer r.Unlock()
-	if session, ok := r.sessionsByCancelKey[queryCancelKey]; ok {
-		if session.cancelCurrentQueries() {
-			return true, nil
-		}
-		return false, nil
-	}
-	return false, fmt.Errorf("session for cancel key %d not found", queryCancelKey)
-}
-
-// CancelSession looks up the specified session in the session registry and
-// cancels it. The caller is responsible for all permission checks.
-func (r *SessionRegistry) CancelSession(
-	sessionIDBytes []byte,
-) (*serverpb.CancelSessionResponse, error) {
-	if len(sessionIDBytes) != 16 {
-		return nil, errors.Errorf("invalid non-16-byte UUID %v", sessionIDBytes)
-	}
-	sessionID := clusterunique.IDFromBytes(sessionIDBytes)
-
-	r.Lock()
-	defer r.Unlock()
-
-	for id, session := range r.sessions {
-		if id == sessionID {
-			session.cancelSession()
-			return &serverpb.CancelSessionResponse{Canceled: true}, nil
-		}
-	}
-
-	return &serverpb.CancelSessionResponse{
-		Error: fmt.Sprintf("session ID %s not found", sessionID),
-	}, nil
-}
-
-// SerializeAll returns a slice of all sessions in the registry, converted to serverpb.Sessions.
+// SerializeAll returns a slice of all sessions in the registry converted to
+// serverpb.Sessions.
 func (r *SessionRegistry) SerializeAll() []serverpb.Session {
-	r.Lock()
-	defer r.Unlock()
-
-	return r.SerializeAllLocked()
-}
-
-// SerializeAllLocked is like SerializeAll but assumes SessionRegistry's mutex is locked.
-func (r *SessionRegistry) SerializeAllLocked() []serverpb.Session {
-	response := make([]serverpb.Session, 0, len(r.sessions))
-
-	for _, s := range r.sessions {
+	sessions := r.getSessions()
+	response := make([]serverpb.Session, 0, len(sessions))
+	for _, s := range sessions {
 		response = append(response, s.serialize())
 	}
-
 	return response
 }
 
 // MaxSQLBytes is the maximum length in bytes of SQL statements serialized
 // into a serverpb.Session. Exported for testing.
 const MaxSQLBytes = 1000
-
-type jobsCollection []jobspb.JobID
-
-func (jc *jobsCollection) add(ids ...jobspb.JobID) {
-	*jc = append(*jc, ids...)
-}
-
-func (jc *jobsCollection) reset() {
-	*jc = nil
-}
 
 // truncateStatementStringForTelemetry truncates the string
 // representation of a statement to a maximum length, so as to not
@@ -3032,6 +2999,10 @@ func (m *sessionDataMutator) SetSynchronousCommit(val bool) {
 	m.data.SynchronousCommit = val
 }
 
+func (m *sessionDataMutator) SetDirectColumnarScansEnabled(b bool) {
+	m.data.DirectColumnarScansEnabled = b
+}
+
 func (m *sessionDataMutator) SetDisablePlanGists(val bool) {
 	m.data.DisablePlanGists = val
 }
@@ -3432,9 +3403,9 @@ func (m *sessionDataMutator) SetOptimizerUseLimitOrderingForStreamingGroupBy(val
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
-// roachpb.StatementStatistics is bucketed to the order of magnitude base 10s
+// appstatspb.StatementStatistics is bucketed to the order of magnitude base 10s
 // and recomputes the squared differences using the new Count value.
-func quantizeCounts(d *roachpb.StatementStatistics) {
+func quantizeCounts(d *appstatspb.StatementStatistics) {
 	oldCount := d.Count
 	newCount := telemetry.Bucket10(oldCount)
 	d.Count = newCount

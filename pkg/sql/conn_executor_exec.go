@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
@@ -149,7 +150,7 @@ func (ex *connExecutor) execStmt(
 		// Cancel the session if the idle time exceeds the idle in session timeout.
 		ex.mu.IdleInSessionTimeout = timeout{time.AfterFunc(
 			ex.sessionData().IdleInSessionTimeout,
-			ex.cancelSession,
+			ex.CancelSession,
 		)}
 	}
 
@@ -162,7 +163,7 @@ func (ex *connExecutor) execStmt(
 			default:
 				ex.mu.IdleInTransactionSessionTimeout = timeout{time.AfterFunc(
 					ex.sessionData().IdleInTransactionSessionTimeout,
-					ex.cancelSession,
+					ex.CancelSession,
 				)}
 			}
 		}
@@ -1059,12 +1060,15 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) error 
 // createJobs creates jobs for the records cached in schemaChangeJobRecords
 // during this transaction.
 func (ex *connExecutor) createJobs(ctx context.Context) error {
-	if len(ex.extraTxnState.schemaChangeJobRecords) == 0 {
+	if !ex.extraTxnState.jobs.hasAnyToCreate() {
 		return nil
 	}
 	var records []*jobs.Record
-	for _, record := range ex.extraTxnState.schemaChangeJobRecords {
-		records = append(records, record)
+	if err := ex.extraTxnState.jobs.forEachToCreate(func(jobRecord *jobs.Record) error {
+		records = append(records, jobRecord)
+		return nil
+	}); err != nil {
+		return err
 	}
 	jobIDs, err := ex.server.cfg.JobRegistry.CreateJobsWithTxn(
 		ctx, ex.planner.InternalSQLTxn(), records,
@@ -1072,7 +1076,7 @@ func (ex *connExecutor) createJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ex.planner.extendedEvalCtx.Jobs.add(jobIDs...)
+	ex.planner.extendedEvalCtx.jobs.addCreatedJobID(jobIDs...)
 	return nil
 }
 
@@ -1153,7 +1157,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		res.DisableBuffering()
 	}
 
-	var stmtFingerprintID roachpb.StmtFingerprintID
+	var stmtFingerprintID appstatspb.StmtFingerprintID
 	var stats topLevelQueryStats
 	defer func() {
 		planner.maybeLogStatement(
@@ -2293,7 +2297,7 @@ func (ex *connExecutor) onTxnFinish(ctx context.Context, ev txnEvent) {
 		implicit := ex.extraTxnState.txnFinishClosure.implicit
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndExecTransaction, timeutil.Now())
 		transactionFingerprintID :=
-			roachpb.TransactionFingerprintID(ex.extraTxnState.transactionStatementsHash.Sum())
+			appstatspb.TransactionFingerprintID(ex.extraTxnState.transactionStatementsHash.Sum())
 
 		err := ex.txnFingerprintIDCache.Add(transactionFingerprintID)
 		if err != nil {
@@ -2352,7 +2356,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 	// execution.
 	ex.txnIDCacheWriter.Record(contentionpb.ResolvedTxnID{
 		TxnID:            txnID,
-		TxnFingerprintID: roachpb.InvalidTransactionFingerprintID,
+		TxnFingerprintID: appstatspb.InvalidTransactionFingerprintID,
 	})
 
 	ex.state.mu.RLock()
@@ -2394,7 +2398,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 
 func (ex *connExecutor) recordTransactionFinish(
 	ctx context.Context,
-	transactionFingerprintID roachpb.TransactionFingerprintID,
+	transactionFingerprintID appstatspb.TransactionFingerprintID,
 	ev txnEvent,
 	implicit bool,
 	txnStart time.Time,
@@ -2418,7 +2422,6 @@ func (ex *connExecutor) recordTransactionFinish(
 
 	if contentionDuration := ex.extraTxnState.accumulatedStats.ContentionTime.Nanoseconds(); contentionDuration > 0 {
 		ex.metrics.EngineMetrics.SQLContendedTxns.Inc(1)
-		ex.planner.DistSQLPlanner().distSQLSrv.Metrics.ContendedQueriesCount.Inc(1)
 	}
 
 	ex.txnIDCacheWriter.Record(contentionpb.ResolvedTxnID{

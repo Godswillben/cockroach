@@ -21,7 +21,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
@@ -30,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -453,21 +453,36 @@ func makeMetrics(internal bool) Metrics {
 			SQLOptPlanCacheHits:   metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheHits, internal)),
 			SQLOptPlanCacheMisses: metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheMisses, internal)),
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
-			DistSQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLExecLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLExecLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			DistSQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaDistSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLServiceLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLServiceLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
-			SQLTxnLatency: metric.NewHistogram(
-				getMetricMeta(MetaSQLTxnLatency, internal), 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			DistSQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLExecLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLExecLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			DistSQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaDistSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLServiceLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLServiceLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
+			SQLTxnLatency: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: getMetricMeta(MetaSQLTxnLatency, internal),
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLTxnsOpen:         metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
 			SQLActiveStatements: metric.NewGauge(getMetricMeta(MetaSQLActiveQueries, internal)),
 			SQLContendedTxns:    metric.NewCounter(getMetricMeta(MetaSQLTxnContended, internal)),
@@ -491,28 +506,38 @@ func makeMetrics(internal bool) Metrics {
 func makeServerMetrics(cfg *ExecutorConfig) ServerMetrics {
 	return ServerMetrics{
 		StatsMetrics: StatsMetrics{
-			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			SQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			SQLStatsMemoryCurBytesCount: metric.NewGauge(MetaSQLStatsMemCurBytes),
-			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(
-				MetaReportedSQLStatsMemMaxBytes,
-				cfg.HistogramWindowInterval,
-				metric.MemoryUsage64MBBuckets,
-			),
+			ReportedSQLStatsMemoryMaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+				Metadata: MetaReportedSQLStatsMemMaxBytes,
+				Duration: cfg.HistogramWindowInterval,
+				MaxVal:   log10int64times1000,
+				SigFigs:  3,
+				Buckets:  metric.MemoryUsage64MBBuckets,
+			}),
 			ReportedSQLStatsMemoryCurBytesCount: metric.NewGauge(MetaReportedSQLStatsMemCurBytes),
 			DiscardedStatsCount:                 metric.NewCounter(MetaDiscardedSQLStats),
 			SQLStatsFlushStarted:                metric.NewCounter(MetaSQLStatsFlushStarted),
 			SQLStatsFlushFailure:                metric.NewCounter(MetaSQLStatsFlushFailure),
-			SQLStatsFlushDuration: metric.NewHistogram(
-				MetaSQLStatsFlushDuration, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLStatsFlushDuration: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLStatsFlushDuration,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 			SQLStatsRemovedRows: metric.NewCounter(MetaSQLStatsRemovedRows),
-			SQLTxnStatsCollectionOverhead: metric.NewHistogram(
-				MetaSQLTxnStatsCollectionOverhead, 6*metricsSampleInterval, metric.IOLatencyBuckets,
-			),
+			SQLTxnStatsCollectionOverhead: metric.NewHistogram(metric.HistogramOptions{
+				Mode:     metric.HistogramModePreferHdrLatency,
+				Metadata: MetaSQLTxnStatsCollectionOverhead,
+				Duration: 6 * metricsSampleInterval,
+				Buckets:  metric.IOLatencyBuckets,
+			}),
 		},
 		ContentionSubsystemMetrics: txnidcache.NewMetrics(),
 		InsightsMetrics:            insights.NewMetrics(),
@@ -586,7 +611,7 @@ func (s *Server) GetTxnIDCache() *txnidcache.Cache {
 // scrubbed will be omitted from the returned map.
 func (s *Server) GetScrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.sqlStats.GetLocalMemProvider())
 }
 
@@ -597,9 +622,9 @@ var _ = (*Server).GetScrubbedStmtStats
 // identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedStmtStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
-	var stmtStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+) ([]appstatspb.CollectedStatementStatistics, error) {
+	var stmtStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		stmtStats = append(stmtStats, *stat)
 		return nil
 	}
@@ -617,9 +642,9 @@ func (s *Server) GetUnscrubbedStmtStats(
 // Identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedTxnStats(
 	ctx context.Context,
-) ([]roachpb.CollectedTransactionStatistics, error) {
-	var txnStats []roachpb.CollectedTransactionStatistics
-	txnStatsVisitor := func(_ context.Context, stat *roachpb.CollectedTransactionStatistics) error {
+) ([]appstatspb.CollectedTransactionStatistics, error) {
+	var txnStats []appstatspb.CollectedTransactionStatistics
+	txnStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedTransactionStatistics) error {
 		txnStats = append(txnStats, *stat)
 		return nil
 	}
@@ -637,17 +662,17 @@ func (s *Server) GetUnscrubbedTxnStats(
 // returns statistics from the reported stats pool.
 func (s *Server) GetScrubbedReportingStats(
 	ctx context.Context,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	return s.getScrubbedStmtStats(ctx, s.reportedStats)
 }
 
 func (s *Server) getScrubbedStmtStats(
 	ctx context.Context, statsProvider sqlstats.Provider,
-) ([]roachpb.CollectedStatementStatistics, error) {
+) ([]appstatspb.CollectedStatementStatistics, error) {
 	salt := ClusterSecret.Get(&s.cfg.Settings.SV)
 
-	var scrubbedStats []roachpb.CollectedStatementStatistics
-	stmtStatsVisitor := func(_ context.Context, stat *roachpb.CollectedStatementStatistics) error {
+	var scrubbedStats []appstatspb.CollectedStatementStatistics
+	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		// Scrub the statement itself.
 		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query)
 
@@ -1018,9 +1043,8 @@ func (s *Server) newConnExecutor(
 	ex.extraTxnState.descCollection = s.cfg.CollectionFactory.NewCollection(
 		ctx, descs.WithDescriptorSessionDataProvider(dsdp), descs.WithMonitor(ex.sessionMon),
 	)
-	ex.extraTxnState.jobs = new(jobsCollection)
+	ex.extraTxnState.jobs = newTxnJobsCollection()
 	ex.extraTxnState.txnRewindPos = -1
-	ex.extraTxnState.schemaChangeJobRecords = make(map[descpb.ID]*jobs.Record)
 	ex.extraTxnState.schemaChangerState = &SchemaChangerState{
 		mode: ex.sessionData().NewSchemaChangerMode,
 	}
@@ -1275,18 +1299,7 @@ type connExecutor struct {
 		// descCollection collects descriptors used by the current transaction.
 		descCollection *descs.Collection
 
-		// jobs accumulates jobs staged for execution inside the transaction.
-		// Staging happens when executing statements that are implemented with a
-		// job. The jobs are staged via the function QueueJob in
-		// pkg/sql/planner.go. The staged jobs are executed once the transaction
-		// that staged them commits.
-		jobs *jobsCollection
-
-		// schemaChangeJobRecords is a map of descriptor IDs to job Records.
-		// Used in createOrUpdateSchemaChangeJob so we can check if a job has been
-		// queued up for the given ID. The cache remains valid only for the current
-		// transaction and it is cleared after the transaction is committed.
-		schemaChangeJobRecords map[descpb.ID]*jobs.Record
+		jobs *txnJobsCollection
 
 		// firstStmtExecuted indicates that the first statement inside this
 		// transaction has been executed.
@@ -1385,7 +1398,7 @@ type connExecutor struct {
 		// transactionStatementFingerprintIDs tracks all statement IDs that make up the current
 		// transaction. It's length is bound by the TxnStatsNumStmtFingerprintIDsToRecord
 		// cluster setting.
-		transactionStatementFingerprintIDs []roachpb.StmtFingerprintID
+		transactionStatementFingerprintIDs []appstatspb.StmtFingerprintID
 
 		// transactionStatementsHash is the hashed accumulation of all statementFingerprintIDs
 		// that comprise the transaction. It is used to construct the key when
@@ -1714,9 +1727,6 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 		}
 	} else {
 		ex.extraTxnState.descCollection.ReleaseAll(ctx)
-		for k := range ex.extraTxnState.schemaChangeJobRecords {
-			delete(ex.extraTxnState.schemaChangeJobRecords, k)
-		}
 		ex.extraTxnState.jobs.reset()
 		ex.extraTxnState.schemaChangerState = &SchemaChangerState{
 			mode: ex.sessionData().NewSchemaChangerMode,
@@ -2505,7 +2515,7 @@ func (ex *connExecutor) execCopyIn(
 		// These fields are not available in COPY, so use the empty value.
 		f := tree.NewFmtCtx(tree.FmtHideConstants)
 		f.FormatNode(cmd.Stmt)
-		stmtFingerprintID := roachpb.ConstructStatementFingerprintID(
+		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
 			copyErr != nil,
 			ex.implicitTxn(),
@@ -2824,15 +2834,14 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			DescIDGenerator:                ex.getDescIDGenerator(),
 			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
 		},
-		Tracing:                &ex.sessionTracing,
-		MemMetrics:             &ex.memMetrics,
-		Descs:                  ex.extraTxnState.descCollection,
-		TxnModesSetter:         ex,
-		Jobs:                   ex.extraTxnState.jobs,
-		SchemaChangeJobRecords: ex.extraTxnState.schemaChangeJobRecords,
-		statsProvider:          ex.server.sqlStats,
-		indexUsageStats:        ex.indexUsageStats,
-		statementPreparer:      ex,
+		Tracing:           &ex.sessionTracing,
+		MemMetrics:        &ex.memMetrics,
+		Descs:             ex.extraTxnState.descCollection,
+		TxnModesSetter:    ex,
+		jobs:              ex.extraTxnState.jobs,
+		statsProvider:     ex.server.sqlStats,
+		indexUsageStats:   ex.indexUsageStats,
+		statementPreparer: ex,
 	}
 	evalCtx.copyFromExecCfg(ex.server.cfg)
 }
@@ -3077,13 +3086,27 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		}
 		ex.notifyStatsRefresherOfNewTables(ex.Ctx())
 
+		// If there is any descriptor has new version. We want to make sure there is
+		// only one version of the descriptor in all nodes. In schema changer jobs,
+		// `WaitForOneVersion` has been called for the descriptors included in jobs.
+		// So we just need to do this for descriptors not in jobs.
+		// We need to get descriptor IDs in jobs before jobs are run because we have
+		// operations in declarative schema changer removing descriptor IDs from job
+		// payload as it's done with the descriptors.
+		descIDsInJobs, err := ex.descIDsInSchemaChangeJobs()
+		if err != nil {
+			return advanceInfo{}, err
+		}
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionStartPostCommitJob, timeutil.Now())
 		if err := ex.server.cfg.JobRegistry.Run(
-			ex.ctxHolder.connCtx, *ex.extraTxnState.jobs,
+			ex.ctxHolder.connCtx, ex.extraTxnState.jobs.created,
 		); err != nil {
 			handleErr(err)
 		}
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionEndPostCommitJob, timeutil.Now())
+		if err := ex.waitOneVersionForNewVersionDescriptorsWithoutJobs(descIDsInJobs); err != nil {
+			return advanceInfo{}, err
+		}
 
 		fallthrough
 	case txnRestart, txnRollback:
@@ -3137,31 +3160,43 @@ func (ex *connExecutor) initStatementResult(
 	return nil
 }
 
-// cancelQuery is part of the registrySession interface.
-func (ex *connExecutor) cancelQuery(queryID clusterunique.ID) bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+// hasQuery is part of the RegistrySession interface.
+func (ex *connExecutor) hasQuery(queryID clusterunique.ID) bool {
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
+	_, exists := ex.mu.ActiveQueries[queryID]
+	return exists
+}
+
+// CancelQuery is part of the RegistrySession interface.
+func (ex *connExecutor) CancelQuery(queryID clusterunique.ID) bool {
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	if queryMeta, exists := ex.mu.ActiveQueries[queryID]; exists {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		return true
 	}
 	return false
 }
 
-// cancelCurrentQueries is part of the registrySession interface.
-func (ex *connExecutor) cancelCurrentQueries() bool {
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
+// CancelActiveQueries is part of the RegistrySession interface.
+func (ex *connExecutor) CancelActiveQueries() bool {
+	// RLock can be used because map deletion happens in
+	// connExecutor.removeActiveQuery.
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	canceled := false
 	for _, queryMeta := range ex.mu.ActiveQueries {
-		queryMeta.cancel()
+		queryMeta.cancelQuery()
 		canceled = true
 	}
 	return canceled
 }
 
-// cancelSession is part of the registrySession interface.
-func (ex *connExecutor) cancelSession() {
+// CancelSession is part of the RegistrySession interface.
+func (ex *connExecutor) CancelSession() {
 	if ex.onCancelSession == nil {
 		return
 	}
@@ -3169,12 +3204,14 @@ func (ex *connExecutor) cancelSession() {
 	ex.onCancelSession()
 }
 
-// user is part of the registrySession interface.
-func (ex *connExecutor) user() username.SQLUsername {
-	return ex.sessionData().User()
+// SessionUser is part of the RegistrySession interface.
+func (ex *connExecutor) SessionUser() username.SQLUsername {
+	// SessionUser is the same for all elements in the stack so use Base()
+	// to avoid needing a lock and race conditions.
+	return ex.sessionDataStack.Base().SessionUser()
 }
 
-// serialize is part of the registrySession interface.
+// serialize is part of the RegistrySession interface.
 func (ex *connExecutor) serialize() serverpb.Session {
 	ex.mu.RLock()
 	defer ex.mu.RUnlock()
@@ -3395,7 +3432,7 @@ func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
 	scs.state = after
 	scs.jobID = jobID
 	if jobID != jobspb.InvalidJobID {
-		ex.extraTxnState.jobs.add(jobID)
+		ex.extraTxnState.jobs.addCreatedJobID(jobID)
 		log.Infof(ctx, "queued new schema change job %d using the new schema changer", jobID)
 	}
 	return nil

@@ -958,10 +958,6 @@ type Engine interface {
 	// version that it must maintain compatibility with.
 	SetMinVersion(version roachpb.Version) error
 
-	// MinVersionIsAtLeastTargetVersion returns whether the engine's recorded
-	// storage min version is at least the target version.
-	MinVersionIsAtLeastTargetVersion(target roachpb.Version) (bool, error)
-
 	// SetCompactionConcurrency is used to set the engine's compaction
 	// concurrency. It returns the previous compaction concurrency.
 	SetCompactionConcurrency(n uint64) uint64
@@ -978,6 +974,14 @@ type Batch interface {
 	// engine. This is a noop unless the batch was created via NewBatch(). If
 	// sync is true, the batch is synchronously committed to disk.
 	Commit(sync bool) error
+	// CommitNoSyncWait atomically applies any batched updates to the underlying
+	// engine and initiates a disk write, but does not wait for that write to
+	// complete. The caller must call SyncWait to wait for the fsync to complete.
+	// The caller must not Close the Batch without first calling SyncWait.
+	CommitNoSyncWait() error
+	// SyncWait waits for the disk write initiated by a call to CommitNoSyncWait
+	// to complete.
+	SyncWait() error
 	// Empty returns whether the batch has been written to or not.
 	Empty() bool
 	// Count returns the number of memtable-modifying operations in the batch.

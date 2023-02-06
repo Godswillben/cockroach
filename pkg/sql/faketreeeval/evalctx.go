@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
@@ -216,6 +217,13 @@ func (ep *DummyEvalPlanner) UnsafeUpsertNamespaceEntry(
 // UnsafeDeleteNamespaceEntry is part of the Planner interface.
 func (ep *DummyEvalPlanner) UnsafeDeleteNamespaceEntry(
 	ctx context.Context, parentID, parentSchemaID int64, name string, descID int64, force bool,
+) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// UpsertDroppedRelationGCTTL is part of the Planner interface.
+func (ep *DummyEvalPlanner) UpsertDroppedRelationGCTTL(
+	ctx context.Context, id int64, ttl duration.Duration,
 ) error {
 	return errors.WithStack(errEvalPlanner)
 }
@@ -547,7 +555,7 @@ func (c *DummyTenantOperator) LookupTenantID(
 
 // DropTenantByID is part of the tree.TenantOperator interface.
 func (c *DummyTenantOperator) DropTenantByID(
-	ctx context.Context, tenantID uint64, synchronous bool,
+	ctx context.Context, tenantID uint64, synchronous, ignoreServiceMode bool,
 ) error {
 	return errors.WithStack(errEvalTenant)
 }

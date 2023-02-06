@@ -26,10 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -208,7 +208,7 @@ func setupC2C(
 	srcNode := srcCluster.RandNode()
 	destNode := dstCluster.RandNode()
 
-	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode)
+	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode, "")
 	require.NoError(t, err)
 
 	srcDB := c.Conn(ctx, t.L(), srcNode[0])
@@ -219,10 +219,14 @@ func setupC2C(
 	srcClusterSettings(t, srcSQL)
 	destClusterSettings(t, destSQL)
 
+	createTenantAdminRole(t, "src-system", srcSQL)
+	createTenantAdminRole(t, "dst-system", destSQL)
+
 	srcTenantID, destTenantID := 2, 2
 	srcTenantName := "src-tenant"
 	destTenantName := "destination-tenant"
-	srcSQL.Exec(t, fmt.Sprintf(`CREATE TENANT %q`, srcTenantName))
+
+	createInMemoryTenant(ctx, t, c, srcTenantName, srcCluster, true)
 
 	pgURL, err := copyPGCertsAndMakeURL(ctx, t, c, srcNode, srcClusterSetting.PGUrlCertsDir, addr[0])
 	require.NoError(t, err)
@@ -241,30 +245,11 @@ func setupC2C(
 		db:    destDB,
 		nodes: dstCluster}
 
-	// Currently, a tenant has by default a 10m RU burst limit, which can be
-	// reached during these tests. To prevent RU limit throttling, add 10B RUs to
-	// the tenant.
-	srcTenantInfo.sql.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1, 10000000000, 0,
-10000000000, now(), 0);`, srcTenantInfo.ID)
-
-	createSystemRole(t, srcTenantInfo.name+" system tenant", srcTenantInfo.sql)
-	createSystemRole(t, destTenantInfo.name+" system tenant", destTenantInfo.sql)
-
 	return &c2cSetup{
 		src:          srcTenantInfo,
 		dst:          destTenantInfo,
 		workloadNode: workloadNode,
 		metrics:      c2cMetrics{}}
-}
-
-// createSystemRole creates a role that can be used to log into the cluster's db console
-func createSystemRole(t test.Test, name string, sql *sqlutils.SQLRunner) {
-	username := "secure"
-	password := "roach"
-	sql.Exec(t, fmt.Sprintf(`CREATE ROLE %s WITH LOGIN PASSWORD '%s'`, username, password))
-	sql.Exec(t, fmt.Sprintf(`GRANT ADMIN TO %s`, username))
-	t.L().Printf(`Log into the %s db console with username "%s" and password "%s"`,
-		name, username, password)
 }
 
 type streamingWorkload interface {
@@ -484,7 +469,7 @@ func registerClusterToCluster(r registry.Registry) {
 }
 func getIngestionJobID(t test.Test, dstSQL *sqlutils.SQLRunner, dstTenantName string) int {
 	var tenantInfoBytes []byte
-	var tenantInfo descpb.TenantInfo
+	var tenantInfo mtinfopb.ProtoInfo
 	dstSQL.QueryRow(t, "SELECT info FROM system.tenants WHERE name=$1",
 		dstTenantName).Scan(&tenantInfoBytes)
 	require.NoError(t, protoutil.Unmarshal(tenantInfoBytes, &tenantInfo))

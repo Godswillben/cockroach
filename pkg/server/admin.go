@@ -361,7 +361,7 @@ func (s *adminServer) Databases(
 ) (_ *serverpb.DatabasesResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	sessionUser, err := userFromContext(ctx)
+	sessionUser, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -431,7 +431,7 @@ func (s *adminServer) DatabaseDetails(
 	ctx context.Context, req *serverpb.DatabaseDetailsRequest,
 ) (_ *serverpb.DatabaseDetailsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -799,7 +799,7 @@ func (s *adminServer) TableDetails(
 	ctx context.Context, req *serverpb.TableDetailsRequest,
 ) (_ *serverpb.TableDetailsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1202,7 +1202,7 @@ func (s *adminServer) TableStats(
 ) (*serverpb.TableStatsResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1443,7 +1443,7 @@ func (s *adminServer) Users(
 	ctx context.Context, req *serverpb.UsersRequest,
 ) (_ *serverpb.UsersResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1647,7 +1647,7 @@ func (s *adminServer) RangeLog(
 	ctx = s.AnnotateCtx(ctx)
 
 	// Range keys, even when pretty-printed, contain PII.
-	user, _, err := s.getUserAndRole(ctx)
+	user, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1881,7 +1881,7 @@ func (s *adminServer) SetUIData(
 ) (*serverpb.SetUIDataResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1920,7 +1920,7 @@ func (s *adminServer) GetUIData(
 ) (*serverpb.GetUIDataResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2188,7 +2188,7 @@ func getLivenessResponse(
 func (s *adminServer) Liveness(
 	ctx context.Context, req *serverpb.LivenessRequest,
 ) (*serverpb.LivenessResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	return s.sqlServer.tenantConnect.Liveness(ctx, req)
@@ -2210,7 +2210,7 @@ func (s *adminServer) Jobs(
 ) (_ *serverpb.JobsResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2405,7 +2405,7 @@ func (s *adminServer) Job(
 ) (_ *serverpb.JobResponse, retErr error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2466,7 +2466,7 @@ func (s *adminServer) Locations(
 	ctx = s.AnnotateCtx(ctx)
 
 	// Require authentication.
-	_, err := userFromContext(ctx)
+	_, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2536,7 +2536,7 @@ func (s *adminServer) QueryPlan(
 ) (*serverpb.QueryPlanResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -2579,7 +2579,7 @@ func (s *adminServer) QueryPlan(
 // getStatementBundle retrieves the statement bundle with the given id and
 // writes it out as an attachment.
 func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.ResponseWriter) {
-	sessionUser, err := userFromContext(ctx)
+	sessionUser, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2627,6 +2627,99 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 	)
 
 	_, _ = io.Copy(w, &bundle)
+}
+
+// DecommissionPreCheck runs checks and returns the DecommissionPreCheckResponse
+// for the given nodes.
+func (s *systemAdminServer) DecommissionPreCheck(
+	ctx context.Context, req *serverpb.DecommissionPreCheckRequest,
+) (*serverpb.DecommissionPreCheckResponse, error) {
+	var collectTraces bool
+	if s := tracing.SpanFromContext(ctx); (s != nil && s.RecordingType() != tracingpb.RecordingOff) || req.CollectTraces {
+		collectTraces = true
+	}
+
+	// Initially evaluate node liveness status, so we filter the nodes to check.
+	var nodesToCheck []roachpb.NodeID
+	livenessStatusByNodeID, err := getLivenessStatusMap(ctx, s.nodeLiveness, s.clock.Now().GoTime(), s.st)
+	if err != nil {
+		return nil, serverError(ctx, err)
+	}
+
+	resp := &serverpb.DecommissionPreCheckResponse{}
+	resultsByNodeID := make(map[roachpb.NodeID]serverpb.DecommissionPreCheckResponse_NodeCheckResult)
+
+	// Any nodes that are already decommissioned or have unknown liveness should
+	// not be checked, and are added to response without replica counts or errors.
+	for _, nID := range req.NodeIDs {
+		livenessStatus := livenessStatusByNodeID[nID]
+		if livenessStatus == livenesspb.NodeLivenessStatus_UNKNOWN {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_UNKNOWN,
+				LivenessStatus:        livenessStatus,
+			}
+		} else if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+			resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+				NodeID:                nID,
+				DecommissionReadiness: serverpb.DecommissionPreCheckResponse_ALREADY_DECOMMISSIONED,
+				LivenessStatus:        livenessStatus,
+			}
+		} else {
+			nodesToCheck = append(nodesToCheck, nID)
+		}
+	}
+
+	results, err := s.server.DecommissionPreCheck(ctx, nodesToCheck, req.StrictReadiness, collectTraces, int(req.NumReplicaReport))
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect ranges that encountered errors by the nodes on which their replicas
+	// exist. Ranges with replicas on multiple checked nodes will result in the
+	// error being reported for each nodeID.
+	rangeCheckErrsByNode := make(map[roachpb.NodeID][]serverpb.DecommissionPreCheckResponse_RangeCheckResult)
+	for _, rangeWithErr := range results.rangesNotReady {
+		rangeCheckResult := serverpb.DecommissionPreCheckResponse_RangeCheckResult{
+			RangeID: rangeWithErr.desc.RangeID,
+			Action:  rangeWithErr.action,
+			Events:  recordedSpansToTraceEvents(rangeWithErr.tracingSpans),
+			Error:   rangeWithErr.err.Error(),
+		}
+
+		for _, nID := range nodesToCheck {
+			if rangeWithErr.desc.Replicas().HasReplicaOnNode(nID) {
+				rangeCheckErrsByNode[nID] = append(rangeCheckErrsByNode[nID], rangeCheckResult)
+			}
+		}
+	}
+
+	// Evaluate readiness for each node to check based on how many ranges have
+	// replicas on the node that did not pass checks.
+	for _, nID := range nodesToCheck {
+		numReplicas := len(results.replicasByNode[nID])
+		var readiness serverpb.DecommissionPreCheckResponse_NodeReadiness
+		if len(rangeCheckErrsByNode[nID]) > 0 {
+			readiness = serverpb.DecommissionPreCheckResponse_ALLOCATION_ERRORS
+		} else {
+			readiness = serverpb.DecommissionPreCheckResponse_READY
+		}
+
+		resultsByNodeID[nID] = serverpb.DecommissionPreCheckResponse_NodeCheckResult{
+			NodeID:                nID,
+			DecommissionReadiness: readiness,
+			LivenessStatus:        livenessStatusByNodeID[nID],
+			ReplicaCount:          int64(numReplicas),
+			CheckedRanges:         rangeCheckErrsByNode[nID],
+		}
+	}
+
+	// Reorder checked nodes to match request order.
+	for _, nID := range req.NodeIDs {
+		resp.CheckedNodes = append(resp.CheckedNodes, resultsByNodeID[nID])
+	}
+
+	return resp, nil
 }
 
 // DecommissionStatus returns the DecommissionStatus for all or the given nodes.
@@ -2811,7 +2904,7 @@ func (s *adminServer) DataDistribution(
 		return nil, err
 	}
 
-	userName, err := userFromContext(ctx)
+	userName, err := userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -3016,7 +3109,7 @@ func (s *adminServer) dataDistributionHelper(
 func (s *systemAdminServer) EnqueueRange(
 	ctx context.Context, req *serverpb.EnqueueRangeRequest,
 ) (*serverpb.EnqueueRangeResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
 	if _, err := s.requireAdminUser(ctx); err != nil {
@@ -3251,19 +3344,38 @@ func (s *systemAdminServer) RecoveryCollectLocalReplicaInfo(
 func (s *systemAdminServer) RecoveryStagePlan(
 	ctx context.Context, request *serverpb.RecoveryStagePlanRequest,
 ) (*serverpb.RecoveryStagePlanResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93044")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Ops.Info(ctx, "staging recovery plan")
+	return s.server.recoveryServer.StagePlan(ctx, request)
 }
 
 func (s *systemAdminServer) RecoveryNodeStatus(
 	ctx context.Context, request *serverpb.RecoveryNodeStatusRequest,
 ) (*serverpb.RecoveryNodeStatusResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.NodeStatus(ctx, request)
 }
 
 func (s *systemAdminServer) RecoveryVerify(
 	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
 ) (*serverpb.RecoveryVerifyResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
+	ctx = s.server.AnnotateCtx(ctx)
+	_, err := s.requireAdminUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.server.recoveryServer.Verify(ctx, request)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
@@ -3869,7 +3981,7 @@ func (c *adminPrivilegeChecker) requireViewDebugPermission(ctx context.Context) 
 func (c *adminPrivilegeChecker) getUserAndRole(
 	ctx context.Context,
 ) (userName username.SQLUsername, isAdmin bool, err error) {
-	userName, err = userFromContext(ctx)
+	userName, err = userFromIncomingRPCContext(ctx)
 	if err != nil {
 		return userName, false, err
 	}
@@ -4192,33 +4304,27 @@ func (s *adminServer) RecoveryVerify(
 	return nil, errors.AssertionFailedf("To be implemented by #93043")
 }
 
-// ListTenants returns a list of active tenants in the cluster. Calling this
-// function will start in-process tenants if they are not already running.
+// ListTenants returns a list of tenants that are served
+// by shared-process services in this server.
 func (s *systemAdminServer) ListTenants(
 	ctx context.Context, _ *serverpb.ListTenantsRequest,
 ) (*serverpb.ListTenantsResponse, error) {
-	ie := s.internalExecutor
-	rowIter, err := ie.QueryIterator(ctx, "list-tenants", nil, /* txn */
-		`SELECT name FROM system.tenants WHERE active = true AND name IS NOT NULL`)
+	tenantNames, err := s.server.serverController.getExpectedRunningTenants(ctx, s.internalExecutor)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rowIter.Close() }()
 
-	var tenantNames []roachpb.TenantName
-	var hasNext bool
-	for hasNext, err = rowIter.Next(ctx); hasNext && err == nil; hasNext, err = rowIter.Next(ctx) {
-		row := rowIter.Cur()
-		tenantName := tree.MustBeDString(row[0])
-		tenantNames = append(tenantNames, roachpb.TenantName(tenantName))
-	}
-
-	var tenantList []*serverpb.Tenant
+	tenantList := make([]*serverpb.Tenant, 0, len(tenantNames))
 	for _, tenantName := range tenantNames {
-		server, err := s.server.serverController.getOrCreateServer(ctx, tenantName)
+		server, err := s.server.serverController.getServer(ctx, tenantName)
 		if err != nil {
-			log.Errorf(ctx, "unable to get or create a tenant server: %v", err)
-			continue
+			if errors.Is(err, errNoTenantServerRunning) {
+				// The service for this tenant is not started yet. This is not
+				// an error - the services are started asynchronously. The
+				// client can try again later.
+				continue
+			}
+			return nil, err
 		}
 		tenantID := server.getTenantID()
 		tenantList = append(tenantList, &serverpb.Tenant{

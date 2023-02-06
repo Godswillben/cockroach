@@ -441,7 +441,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 				colDefault := tree.DNull
 				if column.HasDefault() {
 					colExpr, err := schemaexpr.FormatExprForDisplay(
-						ctx, table, column.GetDefaultExpr(), &p.semaCtx, p.SessionData(), tree.FmtParsable,
+						ctx, table, column.GetDefaultExpr(), &p.semaCtx, p.SessionData(), tree.FmtPgwireText,
 					)
 					if err != nil {
 						return err
@@ -1676,8 +1676,8 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 				if err != nil {
 					return err
 				}
-				return sc.ForEachFunctionOverload(func(overload descpb.SchemaDescriptor_FunctionOverload) error {
-					fn, err := p.Descriptors().MutableByID(p.txn).Function(ctx, overload.ID)
+				return sc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+					fn, err := p.Descriptors().MutableByID(p.txn).Function(ctx, sig.ID)
 					if err != nil {
 						return err
 					}

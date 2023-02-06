@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
@@ -42,7 +42,7 @@ func TestRegistry(t *testing.T) {
 		statement := &Statement{
 			Status:           Statement_Completed,
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 		}
 		expectedStatement :=
@@ -77,7 +77,7 @@ func TestRegistry(t *testing.T) {
 		// We'll be coming back to build a better failure story for 23.1.
 		statement := &Statement{
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 			Status:           Statement_Failed,
 		}
@@ -112,7 +112,7 @@ func TestRegistry(t *testing.T) {
 		statement := &Statement{
 			Status:           Statement_Completed,
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 		}
 		st := cluster.MakeTestingClusterSettings()
@@ -137,7 +137,7 @@ func TestRegistry(t *testing.T) {
 		LatencyThreshold.Override(ctx, &st.SV, 1*time.Second)
 		statement2 := &Statement{
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 0.5,
 		}
 		store := newStore(st)
@@ -159,14 +159,14 @@ func TestRegistry(t *testing.T) {
 		statement := &Statement{
 			Status:           Statement_Completed,
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 		}
 		otherSession := Session{ID: clusterunique.IDFromBytes([]byte("cccccccccccccccccccccccccccccccc"))}
 		otherTransaction := &Transaction{ID: uuid.FastMakeV4()}
 		otherStatement := &Statement{
 			ID:               clusterunique.IDFromBytes([]byte("dddddddddddddddddddddddddddddddd")),
-			FingerprintID:    roachpb.StmtFingerprintID(101),
+			FingerprintID:    appstatspb.StmtFingerprintID(101),
 			LatencyInSeconds: 3,
 		}
 
@@ -212,12 +212,12 @@ func TestRegistry(t *testing.T) {
 		statement := &Statement{
 			Status:           Statement_Completed,
 			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-			FingerprintID:    roachpb.StmtFingerprintID(100),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
 			LatencyInSeconds: 2,
 		}
 		siblingStatment := &Statement{
 			ID:            clusterunique.IDFromBytes([]byte("dddddddddddddddddddddddddddddddd")),
-			FingerprintID: roachpb.StmtFingerprintID(101),
+			FingerprintID: appstatspb.StmtFingerprintID(101),
 		}
 
 		st := cluster.MakeTestingClusterSettings()
@@ -253,5 +253,47 @@ func TestRegistry(t *testing.T) {
 		st := cluster.MakeTestingClusterSettings()
 		registry := newRegistry(st, &latencyThresholdDetector{st: st}, newStore(st))
 		require.NotPanics(t, func() { registry.ObserveTransaction(session.ID, transaction) })
+	})
+
+	t.Run("txn with high accumulated contention without high single stmt contention", func(t *testing.T) {
+		st := cluster.MakeTestingClusterSettings()
+		store := newStore(st)
+		registry := newRegistry(st, &latencyThresholdDetector{st: st}, store)
+		contentionDuration := 10 * time.Second
+		statement := &Statement{
+			Status:           Statement_Completed,
+			ID:               clusterunique.IDFromBytes([]byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+			FingerprintID:    appstatspb.StmtFingerprintID(100),
+			LatencyInSeconds: 0.00001,
+		}
+		txnHighContention := &Transaction{ID: uuid.FastMakeV4(), Contention: &contentionDuration}
+
+		registry.ObserveStatement(session.ID, statement)
+		registry.ObserveTransaction(session.ID, txnHighContention)
+
+		expected := []*Insight{
+			{
+				Session: session,
+				Transaction: &Transaction{
+					ID:               txnHighContention.ID,
+					Contention:       &contentionDuration,
+					StmtExecutionIDs: txnHighContention.StmtExecutionIDs,
+					Problems:         []Problem{Problem_SlowExecution},
+					Causes:           []Cause{Cause_HighContention}},
+				Statements: []*Statement{
+					newStmtWithProblemAndCauses(statement, Problem_None, nil),
+				},
+			},
+		}
+
+		var actual []*Insight
+		store.IterateInsights(
+			context.Background(),
+			func(ctx context.Context, o *Insight) {
+				actual = append(actual, o)
+			},
+		)
+
+		require.Equal(t, expected, actual)
 	})
 }

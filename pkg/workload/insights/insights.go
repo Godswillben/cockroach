@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -51,11 +52,12 @@ const (
 	maxTransfer             = 999
 )
 
+var RandomSeed = workload.NewUint64RandomSeed()
+
 type insights struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed                     uint64
 	rowCount, batchSize      int
 	payloadBytes, ranges     int
 	dbCount, totalTableCount int
@@ -70,13 +72,13 @@ var insightsMeta = workload.Meta{
 	Name:        `insights`,
 	Description: `This workload executes queries that will be detected by the database insights in the web UI.`,
 	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &insights{}
 		g.flags.FlagSet = pflag.NewFlagSet(`insights`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
 			`batch-size`: {RuntimeOnly: true},
 		}
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.rowCount, `rows`, defaultRows, `Initial number of accounts in insights table.`)
 		g.flags.IntVar(&g.batchSize, `batch-size`, defaultBatchSize, `Number of rows in each batch of initial data.`)
 		g.flags.IntVar(&g.payloadBytes, `payload-bytes`, defaultPayloadBytes, `Size of the payload field in each initial row.`)
@@ -94,6 +96,7 @@ var insightsMeta = workload.Meta{
 			defaultMaxRndTableCount,
 			`Random number of tables are created for all additional dbs created from db-count. This defines the max random number.`)
 
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -140,7 +143,7 @@ func (b *insights) Hooks() workload.Hooks {
 				return err
 			}
 
-			rng := rand.New(rand.NewSource(b.seed))
+			rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 			numDbsToCreate := b.dbCount - currDbCount
 
 			if numDbsToCreate == 0 {
@@ -182,12 +185,12 @@ var insightsTypes = []*types.T{
 }
 
 func (b *insights) CreateDbAndTables(db *gosql.DB, dbName string, tableCount int) (err error) {
-	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;", dbName))
+	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;", tree.NameString(dbName)))
 	if err != nil {
 		return err
 	}
 
-	rowTableCount := db.QueryRow(fmt.Sprintf("SELECT count(*) from [show tables from %s]", dbName))
+	rowTableCount := db.QueryRow(fmt.Sprintf("SELECT count(*) FROM [SHOW TABLES FROM %s]", tree.NameString(dbName)))
 	var currTableCount int
 	err = rowTableCount.Scan(&currTableCount)
 	if err != nil {
@@ -201,7 +204,8 @@ func (b *insights) CreateDbAndTables(db *gosql.DB, dbName string, tableCount int
 
 	for j := 0; j < tableCount; j++ {
 		tableName := generateTableName(j)
-		query := fmt.Sprintf("CREATE TABLE %s.%s %s;", dbName, tableName, insightsTableSchema)
+		query := fmt.Sprintf("CREATE TABLE %s.%s %s;",
+			tree.NameString(dbName), tree.NameString(tableName), insightsTableSchema)
 		_, errTableCreate := db.Exec(query)
 		if errTableCreate != nil {
 			err = errors.CombineErrors(err, errTableCreate)
@@ -228,7 +232,7 @@ func (b *insights) Tables() []workload.Table {
 			InitialRows: workload.BatchedTuples{
 				NumBatches: numBatches,
 				FillBatch: func(batchIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator) {
-					rng := rand.NewSource(b.seed + uint64(batchIdx))
+					rng := rand.NewSource(RandomSeed.Seed() + uint64(batchIdx))
 
 					rowBegin, rowEnd := batchIdx*b.batchSize, (batchIdx+1)*b.batchSize
 					if rowEnd > b.rowCount {
@@ -285,7 +289,7 @@ func (b *insights) Ops(
 	db.SetMaxIdleConns(b.connFlags.Concurrency + 1)
 
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
-	rng := rand.New(rand.NewSource(b.seed))
+	rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 	for i := 0; i < b.connFlags.Concurrency; i++ {
 		useRandomTable := i < 4
 		hists := reg.GetHandle()
@@ -360,7 +364,7 @@ func joinOnNonIndexColumn(
 	query := fmt.Sprintf(`
 				SELECT a.balance, b.balance FROM %s a
 				LEFT JOIN %s b ON a.shared_key = b.shared_key
-				WHERE a.balance < 0;`, tableName1, tableName2)
+				WHERE a.balance < 0;`, tree.NameString(tableName1), tree.NameString(tableName2))
 	_, err := db.ExecContext(ctx, query)
 	return err
 }
@@ -369,8 +373,8 @@ func orderByOnNonIndexColumn(
 	ctx context.Context, db *gosql.DB, rowCount int, tableName string,
 ) error {
 	rowLimit := (rand.Uint32() % uint32(rowCount)) + 1
-	query := fmt.Sprintf(`SELECT balance 
-			FROM %s ORDER BY balance DESC limit $1;`, tableName)
+	query := fmt.Sprintf(`SELECT balance
+			FROM %s ORDER BY balance DESC limit $1;`, tree.NameString(tableName))
 	_, err := db.ExecContext(ctx, query, rowLimit)
 	return err
 }
@@ -393,7 +397,7 @@ func useTxnToMoveBalance(
 
 	query := fmt.Sprintf(`
 			UPDATE %s
-			SET balance = balance - $1 WHERE id = $2`, tableName)
+			SET balance = balance - $1 WHERE id = $2`, tree.NameString(tableName))
 	_, err = txn.ExecContext(ctx, query, amount, from)
 	if err != nil {
 		return err
@@ -406,7 +410,7 @@ func useTxnToMoveBalance(
 
 	query = fmt.Sprintf(`
 			UPDATE %s
-					SET balance = balance + $1 WHERE id = $2`, tableName)
+					SET balance = balance + $1 WHERE id = $2`, tree.NameString(tableName))
 	_, err = txn.ExecContext(ctx, query, amount, to)
 	if err != nil {
 		return err
@@ -447,7 +451,7 @@ func updateWithContention(
 			return
 		}
 
-		backgroundQuery := fmt.Sprintf("UPDATE %s SET balance = $1 WHERE id = $2;", tableName)
+		backgroundQuery := fmt.Sprintf("UPDATE %s SET balance = $1 WHERE id = $2;", tree.NameString(tableName))
 		_, errTxn = tx.ExecContext(ctx, backgroundQuery, 42, rowToBlock)
 		wgTxnStarted.Done()
 		if errTxn != nil {
@@ -470,7 +474,7 @@ func updateWithContention(
 
 	// This will be blocked until the background go func commits the txn.
 	amount := rng.Intn(maxTransfer)
-	query := fmt.Sprintf("UPDATE %s SET balance = $1 WHERE id = $2;", tableName)
+	query := fmt.Sprintf("UPDATE %s SET balance = $1 WHERE id = $2;", tree.NameString(tableName))
 	_, err := db.ExecContext(ctx, query, amount, rowToBlock)
 
 	// wait for the background go func to complete

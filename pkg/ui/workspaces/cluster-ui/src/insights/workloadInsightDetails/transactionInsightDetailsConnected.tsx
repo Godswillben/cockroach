@@ -23,9 +23,10 @@ import {
 import { TimeScale } from "../../timeScaleDropdown";
 import { actions as sqlStatsActions } from "../../store/sqlStats";
 import { Dispatch } from "redux";
-import { TxnContentionInsightDetailsRequest } from "src/api";
 import { selectTimeScale } from "../../store/utils/selectors";
 import { selectHasAdminRole } from "../../store/uiConfig";
+import { TxnInsightDetailsRequest } from "src/api";
+import { actions as analyticsActions } from "../../store/analytics";
 
 const mapStateToProps = (
   state: AppState,
@@ -44,15 +45,20 @@ const mapStateToProps = (
 const mapDispatchToProps = (
   dispatch: Dispatch,
 ): TransactionInsightDetailsDispatchProps => ({
-  refreshTransactionInsightDetails: (
-    req: TxnContentionInsightDetailsRequest,
-  ) => {
+  refreshTransactionInsightDetails: (req: TxnInsightDetailsRequest) => {
     dispatch(actions.refresh(req));
   },
   setTimeScale: (ts: TimeScale) => {
     dispatch(
       sqlStatsActions.updateTimeScale({
         ts: ts,
+      }),
+    );
+    dispatch(
+      analyticsActions.track({
+        name: "TimeScale changed",
+        page: "Transaction Insight Details",
+        value: ts.key,
       }),
     );
   },

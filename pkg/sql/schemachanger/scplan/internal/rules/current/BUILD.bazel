@@ -9,6 +9,8 @@ go_library(
         "dep_add_index.go",
         "dep_add_index_and_column.go",
         "dep_add_index_and_constraint.go",
+        "dep_create.go",
+        "dep_create_function.go",
         "dep_drop_column.go",
         "dep_drop_constraint.go",
         "dep_drop_index.go",
@@ -17,6 +19,7 @@ go_library(
         "dep_garbage_collection.go",
         "dep_swap_index.go",
         "dep_two_version.go",
+        "helpers.go",
         "op_drop.go",
         "op_index_and_column.go",
         "registry.go",
@@ -24,6 +27,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules/current",
     visibility = ["//pkg/sql/schemachanger/scplan:__subpackages__"],
     deps = [
+        "//pkg/clusterversion",
         "//pkg/sql/schemachanger/rel",
         "//pkg/sql/schemachanger/scpb",
         "//pkg/sql/schemachanger/scplan/internal/opgen",
@@ -31,6 +35,7 @@ go_library(
         "//pkg/sql/schemachanger/scplan/internal/scgraph",
         "//pkg/sql/schemachanger/screl",
         "//pkg/sql/sem/catid",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 

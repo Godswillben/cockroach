@@ -1430,6 +1430,13 @@ func TestLogic_reset(
 	runLogicTest(t, "reset")
 }
 
+func TestLogic_retry(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "retry")
+}
+
 func TestLogic_returning(
 	t *testing.T,
 ) {
@@ -1981,6 +1988,13 @@ func TestLogic_udf(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf")
+}
+
+func TestLogic_udf_star(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_star")
 }
 
 func TestLogic_union(

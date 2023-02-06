@@ -186,14 +186,15 @@ func createTestStoreWithoutStart(
 			Settings:  cfg.Settings,
 		})
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
-	server := rpc.NewServer(rpcContext) // never started
+	server, err := rpc.NewServer(rpcContext) // never started
+	require.NoError(t, err)
 
 	// Some tests inject their own Gossip and StorePool, via
 	// createTestAllocatorWithKnobs, at the time of writing
 	// TestChooseLeaseToTransfer and TestNoLeaseTransferToBehindReplicas. This is
 	// generally considered bad and should eventually be refactored away.
 	if cfg.Gossip == nil {
-		cfg.Gossip = gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+		cfg.Gossip = gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 	}
 	if cfg.StorePool == nil {
 		cfg.StorePool = NewTestStorePool(*cfg)
@@ -263,7 +264,7 @@ func createTestStoreWithoutStart(
 	if opts.bootstrapVersion != (roachpb.Version{}) {
 		cv = clusterversion.ClusterVersion{Version: opts.bootstrapVersion}
 	}
-	require.NoError(t, WriteClusterVersion(ctx, eng, cv))
+	require.NoError(t, kvstorage.WriteClusterVersion(ctx, eng, cv))
 	if err := kvstorage.InitEngine(
 		ctx, eng, storeIdent,
 	); err != nil {
@@ -493,7 +494,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	err := kvstorage.InitEngine(ctx, eng, testIdent)
 	require.ErrorContains(t, err, "no cluster version")
 
-	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
+	require.NoError(t, kvstorage.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 
 	// Put some random garbage into the engine.
 	require.NoError(t, eng.PutUnversioned(roachpb.Key("foo"), []byte("bar")))
@@ -2994,7 +2995,7 @@ func (sp *fakeStorePool) Throttle(
 }
 
 // TestSendSnapshotThrottling tests the store pool throttling behavior of
-// store.sendSnapshot, ensuring that it properly updates the StorePool on
+// store.sendSnapshotUsingDelegate, ensuring that it properly updates the StorePool on
 // various exceptional conditions and new capacity estimates.
 func TestSendSnapshotThrottling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -3065,60 +3066,82 @@ func TestSendSnapshotConcurrency(t *testing.T) {
 	s := tc.store
 
 	// Checking this now makes sure that if the defaults change this test will also.
-	require.Equal(t, 2, s.snapshotSendQueue.Len())
-	cleanup1, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+	require.Equal(t, 2, s.snapshotSendQueue.AvailableLen())
+	require.Equal(t, 0, s.snapshotSendQueue.QueueLen())
+	cleanup1, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSendSnapshotRequest{
 		SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
 		SenderQueuePriority: 1,
 	}, 1)
-	require.Nil(t, err)
-	require.Equal(t, 1, s.snapshotSendQueue.Len())
-	cleanup2, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+	require.NoError(t, err)
+	cleanup2, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSendSnapshotRequest{
 		SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
 		SenderQueuePriority: 1,
 	}, 1)
-	require.Nil(t, err)
-	require.Equal(t, 0, s.snapshotSendQueue.Len())
+	require.NoError(t, err)
+	require.Equal(t, 0, s.snapshotSendQueue.AvailableLen())
+	require.Equal(t, 1, s.snapshotSendQueue.QueueLen())
+
 	// At this point both the first two tasks will be holding reservations and
-	// waiting for cleanup, a third task will block.
+	// waiting for cleanup, a third task will block or fail First send one with
+	// the queue length set to 0 - this will fail since the first tasks are still
+	// running.
+	_, err = s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSendSnapshotRequest{
+		SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+		SenderQueuePriority: 1,
+		QueueOnDelegateLen:  0,
+	}, 1)
+	require.Error(t, err)
+	require.Equal(t, 0, s.snapshotSendQueue.AvailableLen())
+	require.Equal(t, 1, s.snapshotSendQueue.QueueLen())
+
+	// Now add a task that will wait indefinitely for another task to finish.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		before := timeutil.Now()
-		cleanup3, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+		cleanup3, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSendSnapshotRequest{
 			SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
 			SenderQueuePriority: 1,
+			QueueOnDelegateLen:  -1,
 		}, 1)
 		after := timeutil.Now()
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, after.Sub(before), 10*time.Millisecond)
 		cleanup3()
 		wg.Done()
-		require.Nil(t, err)
-		require.GreaterOrEqual(t, after.Sub(before), 10*time.Millisecond)
 	}()
 
-	// This task will not block for more than a few MS, but we want to wait for
-	// it to complete to make sure it frees the permit.
+	// Now add one that will queue up and wait for another task to finish. This
+	// task will not block for more than 8ms, but we want to wait for it to
+	// complete to make sure it frees the permit.
 	go func() {
-		deadlineCtx, cancel := context.WithTimeout(ctx, 1*time.Millisecond)
+		deadlineCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 		defer cancel()
 
 		// This will time out since the deadline is set artificially low. Make sure
 		// the permit is released.
-		_, err := s.reserveSendSnapshot(deadlineCtx, &kvserverpb.DelegateSnapshotRequest{
+		_, err := s.reserveSendSnapshot(deadlineCtx, &kvserverpb.DelegateSendSnapshotRequest{
 			SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
 			SenderQueuePriority: 1,
+			QueueOnDelegateLen:  -1,
 		}, 1)
+		require.Error(t, err)
 		wg.Done()
-		require.NotNil(t, err)
 	}()
 
 	// Wait a little time before calling signaling the first two as complete.
 	time.Sleep(100 * time.Millisecond)
+	require.Equal(t, 0, s.snapshotSendQueue.AvailableLen())
+	// One remaining task are queued at this point.
+	require.Equal(t, 2, s.snapshotSendQueue.QueueLen())
+
 	cleanup1()
 	cleanup2()
 
 	// Wait until all cleanup run before checking the number of permits.
 	wg.Wait()
-	require.Equal(t, 2, s.snapshotSendQueue.Len())
+	require.Equal(t, 2, s.snapshotSendQueue.AvailableLen())
+	require.Equal(t, 0, s.snapshotSendQueue.QueueLen())
 }
 
 func TestReserveSnapshotThrottling(t *testing.T) {
@@ -3404,7 +3427,9 @@ func TestAllocatorCheckRangeUnconfigured(t *testing.T) {
 		tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 		s := tc.store
 
-		action, _, _, err := s.AllocatorCheckRange(ctx, tc.repl.Desc(), nil /* overrideStorePool */)
+		action, _, _, err := s.AllocatorCheckRange(ctx, tc.repl.Desc(),
+			false /* collectTraces */, nil, /* overrideStorePool */
+		)
 		require.Error(t, err)
 
 		if confAvailable {
@@ -3436,7 +3461,9 @@ func TestAllocatorCheckRange(t *testing.T) {
 		name               string
 		stores             []*roachpb.StoreDescriptor
 		existingReplicas   []roachpb.ReplicaDescriptor
+		zoneConfig         *zonepb.ZoneConfig
 		livenessOverrides  map[roachpb.NodeID]livenesspb.NodeLivenessStatus
+		baselineExpNoop    bool
 		expectedAction     allocatorimpl.AllocatorAction
 		expectValidTarget  bool
 		expectedLogMessage string
@@ -3517,6 +3544,25 @@ func TestAllocatorCheckRange(t *testing.T) {
 			expectAllocatorErr: true,
 			expectedErrStr:     "likely not enough nodes in cluster",
 		},
+		{
+			name:   "five to four nodes at RF five",
+			stores: noLocalityStores,
+			existingReplicas: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				{NodeID: 3, StoreID: 3, ReplicaID: 3},
+				{NodeID: 4, StoreID: 4, ReplicaID: 4},
+				{NodeID: 5, StoreID: 5, ReplicaID: 5},
+			},
+			zoneConfig: zonepb.DefaultSystemZoneConfigRef(),
+			livenessOverrides: map[roachpb.NodeID]livenesspb.NodeLivenessStatus{
+				3: livenesspb.NodeLivenessStatus_DECOMMISSIONING,
+			},
+			baselineExpNoop:   true,
+			expectedAction:    allocatorimpl.AllocatorRemoveDecommissioningVoter,
+			expectErr:         false,
+			expectValidTarget: false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup store pool based on store descriptors and configure test store.
@@ -3537,6 +3583,12 @@ func TestAllocatorCheckRange(t *testing.T) {
 			cfg := TestStoreConfig(clock)
 			cfg.Gossip = g
 			cfg.StorePool = sp
+			if tc.zoneConfig != nil {
+				// TODO(sarkesian): This override is not great. It would be much
+				// preferable to provide a SpanConfig if possible. See comment in
+				// createTestStoreWithoutStart.
+				cfg.SystemConfigProvider.GetSystemConfig().DefaultZoneConfig = tc.zoneConfig
+			}
 
 			s := createTestStoreWithoutStart(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
@@ -3550,11 +3602,37 @@ func TestAllocatorCheckRange(t *testing.T) {
 			var storePoolOverride storepool.AllocatorStorePool
 			if len(tc.livenessOverrides) > 0 {
 				livenessOverride := storepool.OverrideNodeLivenessFunc(tc.livenessOverrides, sp.NodeLivenessFn)
-				storePoolOverride = storepool.NewOverrideStorePool(sp, livenessOverride)
+				nodeCountOverride := func() int {
+					numDecomOverrides := 0
+					for _, livenessStatus := range tc.livenessOverrides {
+						if livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONING ||
+							livenessStatus == livenesspb.NodeLivenessStatus_DECOMMISSIONED {
+							numDecomOverrides++
+						}
+					}
+					return numNodes - numDecomOverrides
+				}
+				storePoolOverride = storepool.NewOverrideStorePool(sp, livenessOverride, nodeCountOverride)
+			}
+
+			// Check if our baseline action without overrides is a noop; i.e., the
+			// range is fully replicated as configured and needs no actions.
+			if tc.baselineExpNoop {
+				action, _, _, err := s.AllocatorCheckRange(ctx, desc,
+					false /* collectTraces */, nil, /* overrideStorePool */
+				)
+				require.NoError(t, err, "expected baseline check without error")
+				require.Containsf(t, []allocatorimpl.AllocatorAction{
+					allocatorimpl.AllocatorNoop,
+					allocatorimpl.AllocatorConsiderRebalance,
+				}, action, "expected baseline noop, got %s", action)
+				//require.Equalf(t, allocatorimpl.AllocatorNoop, action, "expected baseline noop, got %s", action)
 			}
 
 			// Execute actual allocator range repair check.
-			action, target, recording, err := s.AllocatorCheckRange(ctx, desc, storePoolOverride)
+			action, target, recording, err := s.AllocatorCheckRange(ctx, desc,
+				true /* collectTraces */, storePoolOverride,
+			)
 
 			// Validate expectations from test case.
 			if tc.expectErr || tc.expectAllocatorErr {

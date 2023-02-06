@@ -118,7 +118,6 @@ func TestMetricsRecorderTenants(t *testing.T) {
 		hlc.NewClock(manual, time.Nanosecond),
 		nil,
 		rpcCtx,
-		nil,
 		st,
 		roachpb.NewTenantNameContainer(catconstants.SystemTenantName),
 	)
@@ -142,7 +141,6 @@ func TestMetricsRecorderTenants(t *testing.T) {
 		hlc.NewClock(manual, time.Nanosecond),
 		nil,
 		rpcCtxTenant,
-		nil,
 		stTenant,
 		appNameContainer,
 	)
@@ -244,7 +242,7 @@ func TestMetricsRecorder(t *testing.T) {
 		},
 	}
 
-	recorder := NewMetricsRecorder(hlc.NewClock(manual, time.Nanosecond), nil, rpcCtx, nil, st, roachpb.NewTenantNameContainer(""))
+	recorder := NewMetricsRecorder(hlc.NewClock(manual, time.Nanosecond), nil, rpcCtx, st, roachpb.NewTenantNameContainer(""))
 	recorder.AddStore(store1)
 	recorder.AddStore(store2)
 	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258", "foo:5432")
@@ -387,7 +385,12 @@ func TestMetricsRecorder(t *testing.T) {
 				c.Inc((data.val))
 				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
 			case "histogram":
-				h := metric.NewHistogram(metric.Metadata{Name: reg.prefix + data.name}, time.Second, []float64{1.0, 10.0, 100.0, 1000.0})
+				h := metric.NewHistogram(metric.HistogramOptions{
+					Metadata: metric.Metadata{Name: reg.prefix + data.name},
+					Duration: time.Second,
+					Buckets:  []float64{1.0, 10.0, 100.0, 1000.0},
+					Mode:     metric.HistogramModePrometheus,
+				})
 				reg.reg.AddMetric(h)
 				h.RecordValue(data.val)
 				for _, q := range recordHistogramQuantiles {

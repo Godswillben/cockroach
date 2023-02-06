@@ -20,13 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -40,6 +40,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
+)
+
+const (
+	tenantCreationMinSupportedVersionKey = clusterversion.V22_2
 )
 
 // CreateTenant implements the tree.TenantOperator interface.
@@ -58,8 +62,9 @@ func (p *planner) CreateTenant(
 }
 
 type createTenantConfig struct {
-	ID   *uint64 `json:"id,omitempty"`
-	Name *string `json:"name,omitempty"`
+	ID          *uint64 `json:"id,omitempty"`
+	Name        *string `json:"name,omitempty"`
+	ServiceMode *string `json:"service_mode,omitempty"`
 }
 
 func (p *planner) createTenantInternal(
@@ -72,6 +77,14 @@ func (p *planner) createTenantInternal(
 	var name roachpb.TenantName
 	if ctcfg.Name != nil {
 		name = roachpb.TenantName(*ctcfg.Name)
+	}
+	serviceMode := mtinfopb.ServiceModeNone
+	if ctcfg.ServiceMode != nil {
+		v, ok := mtinfopb.TenantServiceModeValues[strings.ToLower(*ctcfg.ServiceMode)]
+		if !ok {
+			return tid, pgerror.Newf(pgcode.Syntax, "unknown service mode: %q", *ctcfg.ServiceMode)
+		}
+		serviceMode = v
 	}
 
 	// tenantID uint64, name roachpb.TenantName,
@@ -86,13 +99,14 @@ func (p *planner) createTenantInternal(
 		return tid, err
 	}
 
-	info := &descpb.TenantInfoWithUsage{
-		TenantInfo: descpb.TenantInfo{
+	info := &mtinfopb.TenantInfoWithUsage{
+		SQLInfo: mtinfopb.SQLInfo{
 			ID: tenantID,
 			// We synchronously initialize the tenant's keyspace below, so
-			// we can skip the ADD state and go straight to an ACTIVE state.
-			State: descpb.TenantInfo_ACTIVE,
-			Name:  name,
+			// we can skip the ADD state and go straight to the READY state.
+			DataState:   mtinfopb.DataStateReady,
+			Name:        name,
+			ServiceMode: serviceMode,
 		},
 	}
 
@@ -119,13 +133,48 @@ func (p *planner) createTenantInternal(
 	tid = roachpb.MustMakeTenantID(tenantID)
 
 	// Initialize the tenant's keyspace.
+	var tenantVersion clusterversion.ClusterVersion
 	codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(tenantID))
-	schema := bootstrap.MakeMetadataSchema(
-		codec,
-		initialTenantZoneConfig, /* defaultZoneConfig */
-		initialTenantZoneConfig, /* defaultSystemZoneConfig */
-	)
-	kvs, splits := schema.GetInitialValues()
+	var kvs []roachpb.KeyValue
+	var splits []roachpb.RKey
+
+	processNonActiveVersionInitialValues := func(versionKey clusterversion.Key) error {
+		tenantVersion.Version = clusterversion.ByKey(versionKey)
+		kvs, splits, err = bootstrap.GetInitialValuesFn(versionKey)(
+			codec,
+			initialTenantZoneConfig, /* defaultZoneConfig */
+			initialTenantZoneConfig, /* defaultSystemZoneConfig */
+		)
+		return err
+	}
+
+	TenantLogicalVersionKeyOverride := p.EvalContext().TestingKnobs.TenantLogicalVersionKeyOverride
+	if TenantLogicalVersionKeyOverride != 0 {
+		// An override was passed using testing knobs. Use this override to get
+		// the initial values and bootstrap the tenant using them.
+		if err = processNonActiveVersionInitialValues(TenantLogicalVersionKeyOverride); err != nil {
+			return tid, err
+		}
+	} else if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.BinaryVersionKey) {
+		// The cluster is not running the latest version.
+		// Use the previous major version to create the tenant and bootstrap it
+		// just like the previous major version binary would, using hardcoded
+		// initial values.
+		if err = processNonActiveVersionInitialValues(tenantCreationMinSupportedVersionKey); err != nil {
+			return tid, err
+		}
+	} else {
+		// The cluster is running the latest version.
+		// Use this version to create the tenant and bootstrap it using the host
+		// cluster's bootstrapping logic.
+		tenantVersion.Version = clusterversion.ByKey(clusterversion.BinaryVersionKey)
+		schema := bootstrap.MakeMetadataSchema(
+			codec,
+			initialTenantZoneConfig, /* defaultZoneConfig */
+			initialTenantZoneConfig, /* defaultSystemZoneConfig */
+		)
+		kvs, splits = schema.GetInitialValues()
+	}
 
 	{
 		// Populate the version setting for the tenant. This will allow the tenant
@@ -135,8 +184,7 @@ func (p *planner) createTenantInternal(
 		// using code which may be too new. The expectation is that the tenant
 		// clusters will be updated to a version only after the system tenant has
 		// been upgraded.
-		v := p.EvalContext().Settings.Version.ActiveVersion(ctx)
-		tenantSettingKV, err := generateTenantClusterSettingKV(codec, v)
+		tenantSettingKV, err := generateTenantClusterSettingKV(codec, tenantVersion)
 		if err != nil {
 			return tid, err
 		}
@@ -194,7 +242,7 @@ func CreateTenantRecord(
 	settings *cluster.Settings,
 	txn isql.Txn,
 	spanConfigs spanconfig.KVAccessor,
-	info *descpb.TenantInfoWithUsage,
+	info *mtinfopb.TenantInfoWithUsage,
 	initialTenantZoneConfig *zonepb.ZoneConfig,
 ) (roachpb.TenantID, error) {
 	const op = "create"
@@ -205,7 +253,7 @@ func CreateTenantRecord(
 		return roachpb.TenantID{}, err
 	}
 	if info.Name != "" {
-		if !settings.Version.IsActive(ctx, clusterversion.V23_1TenantNames) {
+		if !settings.Version.IsActive(ctx, clusterversion.V23_1TenantNamesStateAndServiceMode) {
 			return roachpb.TenantID{}, pgerror.Newf(pgcode.FeatureNotSupported, "cannot use tenant names")
 		}
 		if err := info.Name.IsValid(); err != nil {
@@ -225,27 +273,57 @@ func CreateTenantRecord(
 
 	if info.Name == "" {
 		// No name: generate one if we are at the appropriate version.
-		if settings.Version.IsActive(ctx, clusterversion.V23_1TenantNames) {
+		if settings.Version.IsActive(ctx, clusterversion.V23_1TenantNamesStateAndServiceMode) {
 			info.Name = roachpb.TenantName(fmt.Sprintf("tenant-%d", info.ID))
 		}
 	}
 
-	active := info.State == descpb.TenantInfo_ACTIVE
-	infoBytes, err := protoutil.Marshal(&info.TenantInfo)
+	// Populate the deprecated DataState field for compatibility
+	// with pre-v23.1 servers.
+	switch info.DataState {
+	case mtinfopb.DataStateReady:
+		info.DeprecatedDataState = mtinfopb.ProtoInfo_READY
+	case mtinfopb.DataStateAdd:
+		info.DeprecatedDataState = mtinfopb.ProtoInfo_ADD
+	case mtinfopb.DataStateDrop:
+		info.DeprecatedDataState = mtinfopb.ProtoInfo_DROP
+	default:
+		return roachpb.TenantID{}, errors.AssertionFailedf("unhandled: %d", info.DataState)
+	}
+	// DeprecatedID is populated for the benefit of pre-v23.1 servers.
+	info.DeprecatedID = info.ID
+
+	// active is an obsolete column preserved for compatibility with
+	// pre-v23.1 servers.
+	active := info.DataState == mtinfopb.DataStateReady
+
+	infoBytes, err := protoutil.Marshal(&info.ProtoInfo)
 	if err != nil {
 		return roachpb.TenantID{}, err
 	}
 
 	// Insert into the tenant table and detect collisions.
+	var name tree.Datum
 	if info.Name != "" {
-		if !settings.Version.IsActive(ctx, clusterversion.V23_1TenantNames) {
+		if !settings.Version.IsActive(ctx, clusterversion.V23_1TenantNamesStateAndServiceMode) {
 			return roachpb.TenantID{}, pgerror.Newf(pgcode.FeatureNotSupported, "cannot use tenant names")
 		}
+		name = tree.NewDString(string(info.Name))
+	} else {
+		name = tree.DNull
 	}
+
+	query := `INSERT INTO system.tenants (id, active, info, name, data_state, service_mode) VALUES ($1, $2, $3, $4, $5, $6)`
+	args := []interface{}{tenID, active, infoBytes, name, info.DataState, info.ServiceMode}
+	if !settings.Version.IsActive(ctx, clusterversion.V23_1TenantNamesStateAndServiceMode) {
+		// Ensure the insert can succeed if the upgrade is not finalized yet.
+		query = `INSERT INTO system.tenants (id, active, info) VALUES ($1, $2, $3)`
+		args = args[:3]
+	}
+
 	if num, err := txn.ExecEx(
 		ctx, "create-tenant", txn.KV(), sessiondata.NodeUserSessionDataOverride,
-		`INSERT INTO system.tenants (id, active, info) VALUES ($1, $2, $3)`,
-		tenID, active, infoBytes,
+		query, args...,
 	); err != nil {
 		if pgerror.GetPGCode(err) == pgcode.UniqueViolation {
 			extra := redact.RedactableString("")

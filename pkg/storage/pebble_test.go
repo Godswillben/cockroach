@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -256,7 +255,7 @@ func TestPebbleMetricEventListener(t *testing.T) {
 
 	settings := cluster.MakeTestingClusterSettings()
 	MaxSyncDurationFatalOnExceeded.Override(ctx, &settings.SV, false)
-	p, err := Open(ctx, InMemory(), CacheSize(1<<20 /* 1 MiB */), Settings(settings))
+	p, err := Open(ctx, InMemory(), settings, CacheSize(1<<20 /* 1 MiB */))
 	require.NoError(t, err)
 	defer p.Close()
 
@@ -547,7 +546,7 @@ func TestPebbleBackgroundError(t *testing.T) {
 			errorCount: 3,
 		},
 	}
-	eng, err := Open(context.Background(), loc)
+	eng, err := Open(context.Background(), loc, cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer eng.Close()
 
@@ -1197,35 +1196,6 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 	}
 }
 
-// TestFSOpenFd ensures that an engine opened using the real filesystem
-// correctly implements the Fd() method. The Fd() method is an optional part of
-// the vfs.File interface, that when implemented can be used to perform
-// readahead using prefetch calls.
-func TestFSOpenFd(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	dir := t.TempDir()
-
-	eng, err := Open(context.Background(), Filesystem(dir), ForTesting, MaxSize(1<<20))
-	require.NoError(t, err)
-	defer eng.Close()
-
-	filename := filepath.Join(dir, "foo")
-	require.NoError(t, fs.WriteFile(eng, filename, []byte("hello world")))
-	f, err := eng.Open(filename)
-	require.NoError(t, err)
-	defer f.Close()
-
-	type Fder interface {
-		Fd() uintptr
-	}
-	fder, ok := f.(Fder)
-	require.True(t, ok)
-	if fd := fder.Fd(); fd == 0 {
-		t.Fatalf("Fd() returned %d", fd)
-	}
-}
-
 func TestShortAttributeExtractor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -1306,4 +1276,24 @@ func TestShortAttributeExtractor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIncompatibleVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+	oldVer := roachpb.Version{Major: 21, Minor: 1}
+	stOld := cluster.MakeTestingClusterSettingsWithVersions(oldVer, oldVer, true /* initializeVersion */)
+	p, err := Open(ctx, loc, stOld)
+	require.NoError(t, err)
+	p.Close()
+
+	stNew := cluster.MakeTestingClusterSettings()
+	_, err = Open(ctx, loc, stNew)
+	require.ErrorContains(t, err, "is too old for running version")
 }

@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvissettings"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/spanstatscollector"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
@@ -165,7 +167,7 @@ var (
 )
 
 type nodeMetrics struct {
-	Latency    *metric.Histogram
+	Latency    metric.IHistogram
 	Success    *metric.Counter
 	Err        *metric.Counter
 	DiskStalls *metric.Counter
@@ -176,9 +178,12 @@ type nodeMetrics struct {
 
 func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMetrics {
 	nm := nodeMetrics{
-		Latency: metric.NewHistogram(
-			metaExecLatency, histogramWindow, metric.IOLatencyBuckets,
-		),
+		Latency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePreferHdrLatency,
+			Metadata: metaExecLatency,
+			Duration: histogramWindow,
+			Buckets:  metric.IOLatencyBuckets,
+		}),
 		Success:    metric.NewCounter(metaExecSuccess),
 		Err:        metric.NewCounter(metaExecError),
 		DiskStalls: metric.NewCounter(metaDiskStalls),
@@ -252,6 +257,9 @@ type Node struct {
 	diskStatsMap diskStatsMap
 
 	testingErrorEvent func(context.Context, *roachpb.BatchRequest, error)
+
+	// Used to collect samples for the key visualizer.
+	spanStatsCollector *spanstatscollector.SpanStatsCollector
 }
 
 var _ roachpb.InternalServer = &Node{}
@@ -303,7 +311,7 @@ func bootstrapCluster(
 	// other than the first one, and let regular node startup code deal with them.
 	var bootstrapVersion clusterversion.ClusterVersion
 	for i, eng := range engines {
-		cv, err := kvserver.ReadClusterVersion(ctx, eng)
+		cv, err := kvstorage.ReadClusterVersion(ctx, eng)
 		if err != nil {
 			return nil, errors.Wrapf(err, "reading cluster version of %s", eng)
 		} else if cv.Major == 0 {
@@ -390,6 +398,7 @@ func NewNode(
 		spanConfigAccessor:    spanConfigAccessor,
 		spanConfigReporter:    spanConfigReporter,
 		testingErrorEvent:     cfg.TestingKnobs.TestingResponseErrorEvent,
+		spanStatsCollector:    spanstatscollector.New(cfg.Settings),
 	}
 	n.storeCfg.KVAdmissionController = kvadmission.MakeController(
 		kvAdmissionQ, elasticCPUGrantCoord, storeGrantCoords, cfg.Settings,
@@ -547,6 +556,21 @@ func (n *Node) start(
 	// started earlier).
 	n.startGossiping(workersCtx, n.stopper)
 
+	var terminateCollector func() = nil
+
+	if keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
+		terminateCollector = n.enableSpanStatsCollector(ctx)
+	}
+
+	keyvissettings.Enabled.SetOnChange(&n.storeCfg.Settings.SV, func(ctx context.Context) {
+		enabled := keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV)
+		if enabled {
+			terminateCollector = n.enableSpanStatsCollector(ctx)
+		} else if terminateCollector != nil {
+			terminateCollector()
+		}
+	})
+
 	allEngines := append([]storage.Engine(nil), state.initializedEngines...)
 	allEngines = append(allEngines, state.uninitializedEngines...)
 	for _, e := range allEngines {
@@ -555,6 +579,12 @@ func (n *Node) start(
 	}
 	log.Infof(ctx, "started with attributes %v", attrs.Attrs)
 	return nil
+}
+
+func (n *Node) enableSpanStatsCollector(ctx context.Context) func() {
+	collectorCtx, terminate := context.WithCancel(ctx)
+	n.spanStatsCollector.Start(collectorCtx, n.stopper)
+	return terminate
 }
 
 // waitForAdditionalStoreInit blocks until all additional empty stores,
@@ -599,7 +629,7 @@ func (n *Node) SetHLCUpperBound(ctx context.Context, hlcUpperBound int64) error 
 }
 
 func (n *Node) addStore(ctx context.Context, store *kvserver.Store) {
-	cv, err := kvserver.ReadClusterVersion(context.TODO(), store.Engine())
+	cv, err := kvstorage.ReadClusterVersion(context.TODO(), store.Engine())
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
@@ -1048,6 +1078,10 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 	nodeDetails.StartedAt = n.startedAt
 	nodeDetails.NodeID = int32(n.Descriptor.NodeID)
 
+	n.logStructuredEvent(ctx, event)
+}
+
+func (n *Node) logStructuredEvent(ctx context.Context, event logpb.EventPayload) {
 	// Ensure that the event goes to log files even if LogRangeAndNodeEvents is
 	// disabled (which means skip the system.eventlog _table_).
 	log.StructuredEvent(ctx, event)
@@ -1120,7 +1154,27 @@ func (n *Node) batchInternal(
 	br, writeBytes, pErr = n.stores.SendWithWriteBytes(ctx, args)
 	if pErr != nil {
 		br = &roachpb.BatchResponse{}
+		if pErr.Index != nil && keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
+			// Tell the SpanStatsCollector about the requests in this BatchRequest,
+			// but stop when we reach the requests that were not attempted
+			// due to an error.
+			for i, union := range args.Requests {
+				if int32(i) == pErr.Index.Index {
+					break
+				}
+				arg := union.GetInner()
+				n.spanStatsCollector.Increment(arg.Header().Span())
+			}
+		}
 		log.VErrEventf(ctx, 3, "error from stores.Send: %s", pErr)
+	} else {
+		if keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
+			// Tell the SpanStatsCollector about the requests in this BatchRequest.
+			for _, union := range args.Requests {
+				arg := union.GetInner()
+				n.spanStatsCollector.Increment(arg.Header().Span())
+			}
+		}
 	}
 	if br.Error != nil {
 		panic(roachpb.ErrorUnexpectedlySet(n.stores, br))

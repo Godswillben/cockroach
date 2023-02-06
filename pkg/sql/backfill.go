@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
@@ -848,7 +849,7 @@ func NumRangesInSpans(
 	ctx context.Context, db *kv.DB, distSQLPlanner *DistSQLPlanner, spans []roachpb.Span,
 ) (int, error) {
 	txn := db.NewTxn(ctx, "num-ranges-in-spans")
-	spanResolver := distSQLPlanner.spanResolver.NewSpanResolverIterator(txn)
+	spanResolver := distSQLPlanner.spanResolver.NewSpanResolverIterator(txn, physicalplan.DefaultReplicaChooser)
 	rangeIds := make(map[int64]struct{})
 	for _, span := range spans {
 		// For each span, iterate the spanResolver until it's exhausted, storing
@@ -882,7 +883,7 @@ func NumRangesInSpanContainedBy(
 	containedBy []roachpb.Span,
 ) (total, inContainedBy int, _ error) {
 	txn := db.NewTxn(ctx, "num-ranges-in-spans")
-	spanResolver := distSQLPlanner.spanResolver.NewSpanResolverIterator(txn)
+	spanResolver := distSQLPlanner.spanResolver.NewSpanResolverIterator(txn, physicalplan.DefaultReplicaChooser)
 	// For each span, iterate the spanResolver until it's exhausted, storing
 	// the found range ids in the map to de-duplicate them.
 	spanResolver.Seek(ctx, outerSpan, kvcoord.Ascending)
@@ -1544,8 +1545,22 @@ func ValidateConstraint(
 			return txn.WithSyntheticDescriptors(
 				[]catalog.Descriptor{tableDesc},
 				func() error {
-					return validateCheckExpr(ctx, &semaCtx, txn, sessionData, ck.GetExpr(),
+					violatingRow, formattedCkExpr, err := validateCheckExpr(ctx, &semaCtx, txn, sessionData, ck.GetExpr(),
 						tableDesc.(*tabledesc.Mutable), indexIDForValidation)
+					if err != nil {
+						return err
+					}
+					if len(violatingRow) > 0 {
+						if ck.IsNotNullColumnConstraint() {
+							notNullCol, err := catalog.MustFindColumnByID(tableDesc, ck.GetReferencedColumnID(0))
+							if err != nil {
+								return err
+							}
+							return newNotNullViolationErr(notNullCol.GetName(), tableDesc.AccessibleColumns(), violatingRow)
+						}
+						return newCheckViolationErr(formattedCkExpr, tableDesc.AccessibleColumns(), violatingRow)
+					}
+					return nil
 				},
 			)
 		case catconstants.ConstraintTypeFK:
@@ -2635,7 +2650,15 @@ func validateCheckInTxn(
 	return txn.WithSyntheticDescriptors(
 		syntheticDescs,
 		func() error {
-			return validateCheckExpr(ctx, semaCtx, txn, sessionData, checkExpr, tableDesc, 0 /* indexIDForValidation */)
+			violatingRow, formattedCkExpr, err := validateCheckExpr(ctx, semaCtx, txn, sessionData,
+				checkExpr, tableDesc, 0 /* indexIDForValidation */)
+			if err != nil {
+				return err
+			}
+			if len(violatingRow) > 0 {
+				return newCheckViolationErr(formattedCkExpr, tableDesc.AccessibleColumns(), violatingRow)
+			}
+			return nil
 		})
 }
 

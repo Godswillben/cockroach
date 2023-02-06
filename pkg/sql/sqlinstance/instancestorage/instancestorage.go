@@ -27,8 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -115,13 +116,13 @@ func (r *instancerow) isAvailable() bool {
 func NewTestingStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
-	sqlInstancesTableID descpb.ID,
+	table catalog.TableDescriptor,
 	slReader sqlliveness.Reader,
 	settings *cluster.Settings,
 ) *Storage {
 	s := &Storage{
 		db:       db,
-		rowcodec: makeRowCodec(codec, sqlInstancesTableID),
+		rowcodec: makeRowCodec(codec, table),
 		slReader: slReader,
 		settings: settings,
 	}
@@ -132,8 +133,24 @@ func NewTestingStorage(
 func NewStorage(
 	db *kv.DB, codec keys.SQLCodec, slReader sqlliveness.Reader, settings *cluster.Settings,
 ) *Storage {
-	return NewTestingStorage(db, codec, keys.SQLInstancesTableID, slReader, settings)
+	return NewTestingStorage(db, codec, systemschema.SQLInstancesTable(), slReader, settings)
 }
+
+// CreateNodeInstance claims a unique instance identifier for the SQL pod, and
+// associates it with its SQL address and session information.
+func (s *Storage) CreateNodeInstance(
+	ctx context.Context,
+	sessionID sqlliveness.SessionID,
+	sessionExpiration hlc.Timestamp,
+	rpcAddr string,
+	sqlAddr string,
+	locality roachpb.Locality,
+	nodeID roachpb.NodeID,
+) (instance sqlinstance.InstanceInfo, _ error) {
+	return s.createInstanceRow(ctx, sessionID, sessionExpiration, rpcAddr, sqlAddr, locality, nodeID)
+}
+
+const noNodeID = 0
 
 // CreateInstance claims a unique instance identifier for the SQL pod, and
 // associates it with its SQL address and session information.
@@ -144,6 +161,18 @@ func (s *Storage) CreateInstance(
 	rpcAddr string,
 	sqlAddr string,
 	locality roachpb.Locality,
+) (instance sqlinstance.InstanceInfo, _ error) {
+	return s.createInstanceRow(ctx, sessionID, sessionExpiration, rpcAddr, sqlAddr, locality, noNodeID)
+}
+
+func (s *Storage) createInstanceRow(
+	ctx context.Context,
+	sessionID sqlliveness.SessionID,
+	sessionExpiration hlc.Timestamp,
+	rpcAddr string,
+	sqlAddr string,
+	locality roachpb.Locality,
+	nodeID roachpb.NodeID,
 ) (instance sqlinstance.InstanceInfo, _ error) {
 	if len(sqlAddr) == 0 || len(rpcAddr) == 0 {
 		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("missing sql or rpc address information for instance")
@@ -177,11 +206,21 @@ func (s *Storage) CreateInstance(
 				return err
 			}
 
-			// Try to retrieve an available instance ID. This blocks until one
-			// is available.
-			availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
-			if err != nil {
-				return err
+			// TODO(dt): do we need this at all? this keeps nodeID == instanceID when
+			// running mixed KV and SQL nodes, but bakes in the assumption that any
+			// clusters where this happens will contain _only_ mixed KV and SQL nodes
+			// and thus do not need to worry about finding an _actually_ available ID
+			// and avoiding conflicts. This is true today but may not be in more
+			// complex deployments.
+			if nodeID != noNodeID {
+				availableID = base.SQLInstanceID(nodeID)
+			} else {
+				// Try to retrieve an available instance ID. This blocks until one
+				// is available.
+				availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
+				if err != nil {
+					return err
+				}
 			}
 
 			key := s.rowcodec.encodeKey(region, availableID)

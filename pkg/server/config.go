@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -146,15 +145,26 @@ type BaseConfig struct {
 	// ReadWithinUncertaintyIntervalError.
 	MaxOffset MaxOffsetType
 
+	// DisableRuntimeStatsMonitor prevents this server from starting the
+	// async task that collects runtime stats and triggers
+	// heap/goroutine dumps under high load.
+	DisableRuntimeStatsMonitor bool
+
+	// RuntimeStatSampler, if non-nil, will be used as source for
+	// run-time metrics instead of constructing a fresh one.
+	RuntimeStatSampler *status.RuntimeStatSampler
+
 	// GoroutineDumpDirName is the directory name for goroutine dumps using
-	// goroutinedumper.
+	// goroutinedumper. Only used if DisableRuntimeStatsMonitor is false.
 	GoroutineDumpDirName string
 
 	// HeapProfileDirName is the directory name for heap profiles using
-	// heapprofiler. If empty, no heap profiles will be collected.
+	// heapprofiler. If empty, no heap profiles will be collected. Only
+	// used if DisableRuntimeStatsMonitor is false.
 	HeapProfileDirName string
 
 	// CPUProfileDirName is the directory name for CPU profile dumps.
+	// Only used if DisableRuntimeStatsMonitor is false.
 	CPUProfileDirName string
 
 	// InflightTraceDirName is the directory name for job traces.
@@ -342,10 +352,6 @@ type KVConfig struct {
 	// CacheSize is the amount of memory in bytes to use for caching data.
 	// The value is split evenly between the stores if there are more than one.
 	CacheSize int64
-
-	// SoftSlotGranter can be optionally passed into a store to allow the store
-	// to perform additional CPU bound work.
-	SoftSlotGranter *admission.SoftSlotGranter
 
 	// TimeSeriesServerConfig contains configuration specific to the time series
 	// server.
@@ -632,19 +638,6 @@ func (e *Engines) Close() {
 	*e = nil
 }
 
-// cpuWorkPermissionGranter implements the pebble.CPUWorkPermissionGranter
-// interface.
-//type cpuWorkPermissionGranter struct {
-//*admission.SoftSlotGranter
-//}
-
-//func (c *cpuWorkPermissionGranter) TryGetProcs(count int) int {
-//return c.TryGetSlots(count)
-//}
-//func (c *cpuWorkPermissionGranter) ReturnProcs(count int) {
-//c.ReturnSlots(count)
-//}
-
 // CreateEngines creates Engines based on the specs in cfg.Stores.
 func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	engines := Engines(nil)
@@ -724,7 +717,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 					storage.CacheSize(cfg.CacheSize),
 					storage.MaxSize(sizeInBytes),
 					storage.EncryptionAtRest(spec.EncryptionOptions),
-					storage.Settings(cfg.Settings),
 					storage.If(storeKnobs.SmallEngineBlocks, storage.BlockSize(1)),
 				}
 				if len(storeKnobs.EngineKnobs) > 0 {
@@ -732,6 +724,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				}
 				e, err := storage.Open(ctx,
 					storage.InMemory(),
+					cfg.Settings,
 					storageConfigs...,
 				)
 				if err != nil {
@@ -775,11 +768,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			pebbleConfig.Opts.TableCache = tableCache
 			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
 			pebbleConfig.Opts.Experimental.MaxWriterConcurrency = 2
-			// TODO(jackson): Implement the new pebble.CPUWorkPermissionGranter
-			// interface.
-			//pebbleConfig.Opts.Experimental.CPUWorkPermissionGranter = &cpuWorkPermissionGranter{
-			//cfg.SoftSlotGranter,
-			//}
 			if storeKnobs.SmallEngineBlocks {
 				for i := range pebbleConfig.Opts.Levels {
 					pebbleConfig.Opts.Levels[i].BlockSize = 1

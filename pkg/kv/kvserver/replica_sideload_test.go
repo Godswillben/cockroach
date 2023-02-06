@@ -179,7 +179,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 
 	rsl := logstore.NewStateLoader(tc.repl.RangeID)
 	lo := tc.repl.mu.state.TruncatedState.Index + 1
-	hi := tc.repl.mu.lastIndex + 1
+	hi := tc.repl.mu.lastIndexNotDurable + 1
 
 	tc.store.raftEntryCache.Clear(tc.repl.RangeID, hi)
 	ents, err := logstore.LoadEntries(
@@ -199,7 +199,7 @@ func TestRaftSSTableSideloading(t *testing.T) {
 	var idx int
 	for idx = 0; idx < len(ents); idx++ {
 		// Get the SST back from the raft log.
-		if typ, _ := raftlog.EncodingOf(ents[idx]); typ != raftlog.EntryEncodingSideloaded {
+		if typ, _ := raftlog.EncodingOf(ents[idx]); !typ.IsSideloaded() {
 			continue
 		}
 		ent, err := logstore.MaybeInlineSideloadedRaftCommand(ctx, tc.repl.RangeID, ents[idx], tc.repl.raftMu.sideloaded, tc.store.raftEntryCache)

@@ -48,7 +48,7 @@ var PerChangefeedMemLimit = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"changefeed.memory.per_changefeed_limit",
 	"controls amount of data that can be buffered per changefeed",
-	1<<27, // 128MiB
+	1<<29, // 512MiB
 )
 
 // SlowSpanLogThreshold controls when we will log slow spans.
@@ -129,8 +129,8 @@ var ScanRequestSize = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"changefeed.backfill.scan_request_size",
 	"the maximum number of bytes returned by each scan request",
-	16<<20, // 16 MiB
-)
+	1<<19, // 1/2 MiB
+).WithPublic()
 
 // SinkThrottleConfig describes throttling configuration for the sink.
 // 0 values for any of the settings disable that setting.
@@ -224,7 +224,7 @@ var UseMuxRangeFeed = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"changefeed.mux_rangefeed.enabled",
 	"if true, changefeed uses multiplexing rangefeed RPC",
-	false,
+	util.ConstantWithMetamorphicTestBool("changefeed.mux_rangefeed.enabled", false),
 )
 
 // EventConsumerWorkers specifies the maximum number of workers to use when

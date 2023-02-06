@@ -44,7 +44,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -59,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -1054,6 +1057,18 @@ func TestHotRangesResponse(t *testing.T) {
 				if r.Desc.RangeID == 0 || (len(r.Desc.StartKey) == 0 && len(r.Desc.EndKey) == 0) {
 					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
 				}
+				if r.QueriesPerSecond > 0 {
+					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond)
+					}
+					// If the architecture doesn't support sampling CPU, it
+					// will also be zero.
+					if grunning.Supported() && r.CPUTimePerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero",
+							r.QueriesPerSecond, r.CPUTimePerSecond)
+					}
+				}
 				if r.QueriesPerSecond > lastQPS {
 					t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f, desc=%v",
 						lastQPS, r.QueriesPerSecond, r.Desc)
@@ -1082,6 +1097,17 @@ func TestHotRanges2Response(t *testing.T) {
 	for _, r := range hotRangesResp.Ranges {
 		if r.RangeID == 0 {
 			t.Errorf("unexpected empty range id: %d", r.RangeID)
+		}
+		if r.QPS > 0 {
+			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
+					r.QPS, r.ReadsPerSecond, r.WritesPerSecond)
+			}
+			// If the architecture doesn't support sampling CPU, it
+			// will also be zero.
+			if grunning.Supported() && r.CPUTimePerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected cpu=%.2f to be non-zero", r.QPS, r.CPUTimePerSecond)
+			}
 		}
 		if r.QPS > lastQPS {
 			t.Errorf("unexpected increase in qps between ranges; prev=%.2f, current=%.2f", lastQPS, r.QPS)
@@ -1619,7 +1645,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -1754,7 +1780,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	}
 
 	// Construct a map of all the statement fingerprint IDs.
-	statementFingerprintIDs := make(map[roachpb.StmtFingerprintID]bool, len(resp.Statements))
+	statementFingerprintIDs := make(map[appstatspb.StmtFingerprintID]bool, len(resp.Statements))
 	for _, respStatement := range resp.Statements {
 		statementFingerprintIDs[respStatement.ID] = true
 	}
@@ -2143,7 +2169,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 		thirdServerSQL.Exec(t, stmt)
 	}
 	query := `INSERT INTO posts VALUES (_, '_')`
-	fingerprintID := roachpb.ConstructStatementFingerprintID(query,
+	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
 		false, true, `roachblog`)
 	path := fmt.Sprintf(`stmtdetails/%v`, fingerprintID)
 
@@ -2337,7 +2363,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	selectQuery := "SELECT _, _, _, _"
-	fingerprintID = roachpb.ConstructStatementFingerprintID(selectQuery, false,
+	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, false,
 		true, "defaultdb")
 
 	testPath(
@@ -3709,6 +3735,9 @@ func TestTransactionContentionEvents(t *testing.T) {
 				}
 
 				for _, event := range resp.Events {
+					require.NotEqual(t, event.WaitingStmtFingerprintID, 0)
+					require.NotEqual(t, event.WaitingStmtID.String(), clusterunique.ID{}.String())
+
 					require.Equal(t, tc.canViewContendingKey, len(event.BlockingEvent.Key) > 0,
 						"expected to %s, but the contending key has length of %d",
 						expectationStr,
