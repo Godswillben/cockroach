@@ -14,11 +14,9 @@ import (
 	"context"
 	"reflect"
 	"testing"
-	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -39,7 +37,7 @@ func newStores(ambientCtx log.AmbientContext, clock *hlc.Clock) *Stores {
 func TestStoresAddStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockWithSystemTimeSource(time.Nanosecond) /* maxOffset */)
+	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockForTesting(nil))
 	store := Store{
 		Ident: &roachpb.StoreIdent{StoreID: 123},
 	}
@@ -55,7 +53,7 @@ func TestStoresAddStore(t *testing.T) {
 func TestStoresRemoveStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockWithSystemTimeSource(time.Nanosecond) /* maxOffset */)
+	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockForTesting(nil))
 
 	storeID := roachpb.StoreID(89)
 
@@ -71,7 +69,7 @@ func TestStoresRemoveStore(t *testing.T) {
 func TestStoresGetStoreCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockWithSystemTimeSource(time.Nanosecond) /* maxOffset */)
+	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockForTesting(nil))
 	if ls.GetStoreCount() != 0 {
 		t.Errorf("expected 0 stores in new local sender")
 	}
@@ -88,7 +86,7 @@ func TestStoresGetStoreCount(t *testing.T) {
 func TestStoresVisitStores(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockWithSystemTimeSource(time.Nanosecond) /* maxOffset */)
+	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockForTesting(nil))
 	numStores := 10
 	for i := 0; i < numStores; i++ {
 		ls.AddStore(&Store{Ident: &roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
@@ -121,7 +119,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 
 	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), clock)
 	numStores := 10
@@ -156,8 +154,8 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 		}
 
 		require.NoError(t,
-			logstore.NewStateLoader(desc.RangeID).SetRaftReplicaID(ctx, store.engine, replicaID))
-		replica, err := newReplica(ctx, desc, store, replicaID)
+			logstore.NewStateLoader(desc.RangeID).SetRaftReplicaID(ctx, store.TODOEngine(), replicaID))
+		replica, err := loadInitializedReplicaForTesting(ctx, store, desc, replicaID)
 		if err != nil {
 			t.Fatalf("unexpected error when creating replica: %+v", err)
 		}
@@ -186,7 +184,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 	if replica2 != nil {
 		t.Fatalf("expected replica to be nil; was %v", replica2)
 	}
-	expectedError := roachpb.NewRangeNotFoundError(rangeID2, 0)
+	expectedError := kvpb.NewRangeNotFoundError(rangeID2, 0)
 	if err2.Error() != expectedError.Error() {
 		t.Fatalf("expected err to be %v; was %v", expectedError, err2)
 	}
@@ -195,7 +193,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 func TestStoresGetStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockWithSystemTimeSource(time.Nanosecond) /* maxOffset */)
+	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), hlc.NewClockForTesting(nil))
 	store := Store{Ident: &roachpb.StoreIdent{StoreID: 1}}
 	replica := roachpb.ReplicaDescriptor{StoreID: store.Ident.StoreID}
 	s, pErr := ls.GetStore(replica.StoreID)
@@ -221,7 +219,7 @@ var storeIDAlloc roachpb.StoreID
 func createStores(count int) (*timeutil.ManualTime, []*Store, *Stores, *stop.Stopper) {
 	stopper := stop.NewStopper()
 	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
-	cfg := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
+	cfg := TestStoreConfig(hlc.NewClockForTesting(manual))
 	ls := newStores(log.MakeTestingAmbientCtxWithNewTracer(), cfg.Clock)
 
 	// Create two stores with ranges we care about.
@@ -339,138 +337,5 @@ func TestStoresGossipStorageReadLatest(t *testing.T) {
 	}
 	if !reflect.DeepEqual(bi, verifyBI) {
 		t.Errorf("bootstrap info %+v not equal to expected %+v", verifyBI, bi)
-	}
-}
-
-// TestStoresClusterVersionWriteSynthesize verifies that the cluster version is
-// written to all stores and that missing versions are filled in appropriately.
-//
-// TODO(tbg): if this test were a little more principled about only creating
-// what it needs, it could move closer to SynthesizeClusterVersionFromEngines.
-func TestClusterVersionWriteSynthesize(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	_, stores, _, stopper := createStores(3)
-	ctx := context.Background()
-	defer stopper.Stop(ctx)
-
-	v1_0 := roachpb.Version{Major: 1}
-	// Hard-code binaryVersion of 1.1 for this test.
-	// Hard-code binaryMinSupportedVersion of 1.0 for this test.
-	binV := roachpb.Version{Major: 1, Minor: 1}
-	minV := v1_0
-
-	makeStores := func() *Stores {
-		ls := NewStores(log.MakeTestingAmbientCtxWithNewTracer(), stores[0].Clock())
-		return ls
-	}
-
-	ls0 := makeStores()
-
-	// If there are no stores, default to binaryMinSupportedVersion
-	// (v1_0 in this test)
-	if initialCV, err := kvstorage.SynthesizeClusterVersionFromEngines(ctx, ls0.engines(), binV, minV); err != nil {
-		t.Fatal(err)
-	} else {
-		expCV := clusterversion.ClusterVersion{
-			Version: v1_0,
-		}
-		if !reflect.DeepEqual(initialCV, expCV) {
-			t.Fatalf("expected %+v; got %+v", expCV, initialCV)
-		}
-	}
-
-	ls0.AddStore(stores[0])
-
-	versionA := roachpb.Version{Major: 1, Minor: 0, Internal: 1} // 1.0-1
-	versionB := roachpb.Version{Major: 1, Minor: 0, Internal: 2} // 1.0-2
-
-	// Verify that the initial read of an empty store synthesizes v1.0-0. This
-	// is the code path that runs after starting the 1.1 binary for the first
-	// time after the rolling upgrade from 1.0.
-	if initialCV, err := kvstorage.SynthesizeClusterVersionFromEngines(ctx, ls0.engines(), binV, minV); err != nil {
-		t.Fatal(err)
-	} else {
-		expCV := clusterversion.ClusterVersion{
-			Version: v1_0,
-		}
-		if !reflect.DeepEqual(initialCV, expCV) {
-			t.Fatalf("expected %+v; got %+v", expCV, initialCV)
-		}
-	}
-
-	// Bump a version to something more modern (but supported by this binary).
-	// Note that there's still only one store.
-	{
-		cv := clusterversion.ClusterVersion{
-			Version: versionB,
-		}
-		if err := kvstorage.WriteClusterVersionToEngines(ctx, ls0.engines(), cv); err != nil {
-			t.Fatal(err)
-		}
-
-		// Verify the same thing comes back on read.
-		if newCV, err := kvstorage.SynthesizeClusterVersionFromEngines(ctx, ls0.engines(), binV, minV); err != nil {
-			t.Fatal(err)
-		} else {
-			expCV := cv
-			if !reflect.DeepEqual(newCV, cv) {
-				t.Fatalf("expected %+v; got %+v", expCV, newCV)
-			}
-		}
-	}
-
-	// Make a stores with store0 and store1. It reads as v1.0 because store1 has
-	// no entry, lowering the use version to v1.0 (but not the min version).
-	{
-		ls01 := makeStores()
-		ls01.AddStore(stores[0])
-		ls01.AddStore(stores[1])
-
-		expCV := clusterversion.ClusterVersion{
-			Version: v1_0,
-		}
-		if cv, err := kvstorage.SynthesizeClusterVersionFromEngines(ctx, ls01.engines(), binV, minV); err != nil {
-			t.Fatal(err)
-		} else if !reflect.DeepEqual(cv, expCV) {
-			t.Fatalf("expected %+v, got %+v", expCV, cv)
-		}
-
-		// Write an updated Version to both stores.
-		cv := clusterversion.ClusterVersion{
-			Version: versionB,
-		}
-		if err := kvstorage.WriteClusterVersionToEngines(ctx, ls01.engines(), cv); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Third node comes along, for now it's alone. It has a lower use version.
-	cv := clusterversion.ClusterVersion{
-		Version: versionA,
-	}
-
-	{
-		ls3 := makeStores()
-		ls3.AddStore(stores[2])
-		if err := kvstorage.WriteClusterVersionToEngines(ctx, ls3.engines(), cv); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	ls012 := makeStores()
-	for _, store := range stores {
-		ls012.AddStore(store)
-	}
-
-	// Reading across all stores, we expect to pick up the lowest useVersion both
-	// from the third store.
-	expCV := clusterversion.ClusterVersion{
-		Version: versionA,
-	}
-	if cv, err := kvstorage.SynthesizeClusterVersionFromEngines(ctx, ls012.engines(), binV, minV); err != nil {
-		t.Fatal(err)
-	} else if !reflect.DeepEqual(cv, expCV) {
-		t.Fatalf("expected %+v, got %+v", expCV, cv)
 	}
 }

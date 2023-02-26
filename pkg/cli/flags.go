@@ -476,7 +476,9 @@ func init() {
 
 			cliflagcfg.VarFlag(f, &storeSpecs, cliflags.Store)
 			cliflagcfg.VarFlag(f, &serverCfg.StorageEngine, cliflags.StorageEngine)
+			cliflagcfg.StringFlag(f, &serverCfg.SharedStorage, cliflags.SharedStorage)
 			cliflagcfg.VarFlag(f, &serverCfg.MaxOffset, cliflags.MaxOffset)
+			cliflagcfg.BoolFlag(f, &serverCfg.DisableMaxOffsetCheck, cliflags.DisableMaxOffsetCheck)
 			cliflagcfg.StringFlag(f, &serverCfg.ClockDevicePath, cliflags.ClockDevice)
 
 			cliflagcfg.StringFlag(f, &startCtx.listeningURLFile, cliflags.ListeningURLFile)
@@ -541,6 +543,10 @@ func init() {
 	telemetryEnabledCmds := append(serverCmds, demoCmd, statementBundleRecreateCmd)
 	telemetryEnabledCmds = append(telemetryEnabledCmds, demoCmd.Commands()...)
 	for _, cmd := range telemetryEnabledCmds {
+		f := cmd.Flags()
+		cliflagcfg.StringFlag(f, &serverCfg.ObsServiceAddr, cliflags.ObsServiceAddr)
+		_ = f.MarkHidden(cliflags.ObsServiceAddr.Name)
+
 		// Report flag usage for server commands in telemetry. We do this
 		// only for server commands, as there is no point in accumulating
 		// telemetry if there's no telemetry reporting loop being started.
@@ -574,7 +580,6 @@ func init() {
 		cliflagcfg.StringFlag(f, &certCtx.caKey, cliflags.CAKey)
 		cliflagcfg.IntFlag(f, &certCtx.keySize, cliflags.KeySize)
 		cliflagcfg.BoolFlag(f, &certCtx.overwriteFiles, cliflags.OverwriteFiles)
-		cliflagcfg.VarFlag(f, &tenantIDSetter{tenantIDs: &certCtx.tenantScope}, cliflags.TenantScope)
 
 		if strings.HasSuffix(cmd.Name(), "-ca") {
 			// CA-only commands.
@@ -590,6 +595,8 @@ func init() {
 		}
 
 		if cmd == createClientCertCmd {
+			cliflagcfg.VarFlag(f, &tenantIDSetter{tenantIDs: &certCtx.tenantScope}, cliflags.TenantScope)
+
 			// PKCS8 key format is only available for the client cert command.
 			cliflagcfg.BoolFlag(f, &certCtx.generatePKCS8Key, cliflags.GeneratePKCS8Key)
 			cliflagcfg.BoolFlag(f, &certCtx.disableUsernameValidation, cliflags.DisableUsernameValidation)

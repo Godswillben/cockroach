@@ -10,6 +10,13 @@
 
 package catalog
 
+import (
+	"fmt"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+)
+
 // chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
@@ -616,6 +623,8 @@ var charts = []sectionDescription{
 					"range.snapshots.applied-voter",
 					"range.snapshots.applied-initial",
 					"range.snapshots.applied-non-voter",
+					"range.snapshot.delegate.successes",
+					"range.snapshot.delegate.failures",
 				},
 			},
 			{
@@ -640,6 +649,7 @@ var charts = []sectionDescription{
 					"range.snapshots.rebalancing.sent-bytes",
 					"range.snapshots.unknown.rcvd-bytes",
 					"range.snapshots.unknown.sent-bytes",
+					"range.snapshots.delegate.sent-bytes",
 				},
 			},
 		},
@@ -1614,9 +1624,9 @@ var charts = []sectionDescription{
 				},
 			},
 			{
-				Title: "Ingested Bytes",
+				Title: "Logical Bytes",
 				Metrics: []string{
-					"replication.ingested_bytes",
+					"replication.logical_bytes",
 				},
 			},
 			{
@@ -1643,11 +1653,15 @@ var charts = []sectionDescription{
 			},
 			{
 				Title:   "Frontier Lag",
-				Metrics: []string{"replication.frontier_lag_seconds"},
+				Metrics: []string{"replication.frontier_lag_nanos"},
 			},
 			{
 				Title:   "Job Progress Updates",
 				Metrics: []string{"replication.job_progress_updates"},
+			},
+			{
+				Title:   "Ranges To Revert",
+				Metrics: []string{"replication.cutover_progress"},
 			},
 		},
 	},
@@ -2536,6 +2550,14 @@ var charts = []sectionDescription{
 				Metrics: []string{"sql.mem.internal.session.current"},
 			},
 			{
+				Title:   "Prepared Statements All",
+				Metrics: []string{"sql.mem.internal.session.prepared.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.internal.session.prepared.current"},
+			},
+			{
 				Title:   "Txn All",
 				Metrics: []string{"sql.mem.internal.txn.max"},
 			},
@@ -2555,6 +2577,14 @@ var charts = []sectionDescription{
 			{
 				Title:   "Max",
 				Metrics: []string{"sql.mem.sql.session.max"},
+			},
+			{
+				Title:   "Prepared Statements Current",
+				Metrics: []string{"sql.mem.sql.session.prepared.current"},
+			},
+			{
+				Title:   "Prepared Statements Max",
+				Metrics: []string{"sql.mem.sql.session.prepared.max"},
 			},
 		},
 	},
@@ -3025,6 +3055,10 @@ var charts = []sectionDescription{
 				Title:   "Range Key Set Count",
 				Metrics: []string{"storage.keys.range-key-set.count"},
 			},
+			{
+				Title:   "Tombstone Count",
+				Metrics: []string{"storage.keys.tombstone.count"},
+			},
 		},
 	},
 	{
@@ -3073,6 +3107,13 @@ var charts = []sectionDescription{
 			{
 				Title:   "L0 Sublevels",
 				Metrics: []string{"storage.l0-sublevels"},
+			},
+			{
+				Title: "Shared Storage Reads/Writes",
+				Metrics: []string{
+					"storage.shared-storage.read",
+					"storage.shared-storage.write",
+				},
 			},
 			{
 				Title: "L0 Files",
@@ -3368,48 +3409,12 @@ var charts = []sectionDescription{
 					"jobs.running_non_idle",
 				},
 			},
-			{
-				Title: "Currently Running",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_running",
-					"jobs.backup.currently_running",
-					"jobs.changefeed.currently_running",
-					"jobs.create_stats.currently_running",
-					"jobs.import.currently_running",
-					"jobs.restore.currently_running",
-					"jobs.schema_change.currently_running",
-					"jobs.new_schema_change.currently_running",
-					"jobs.schema_change_gc.currently_running",
-					"jobs.typedesc_schema_change.currently_running",
-					"jobs.stream_ingestion.currently_running",
-					"jobs.migration.currently_running",
-					"jobs.auto_span_config_reconciliation.currently_running",
-					"jobs.auto_sql_stats_compaction.currently_running",
-					"jobs.stream_replication.currently_running",
-					"jobs.key_visualizer.currently_running",
-				},
-			},
-			{
-				Title: "Currently Idle",
-				Metrics: []string{
-					"jobs.auto_create_stats.currently_idle",
-					"jobs.auto_span_config_reconciliation.currently_idle",
-					"jobs.auto_sql_stats_compaction.currently_idle",
-					"jobs.backup.currently_idle",
-					"jobs.changefeed.currently_idle",
-					"jobs.create_stats.currently_idle",
-					"jobs.import.currently_idle",
-					"jobs.migration.currently_idle",
-					"jobs.new_schema_change.currently_idle",
-					"jobs.restore.currently_idle",
-					"jobs.schema_change.currently_idle",
-					"jobs.schema_change_gc.currently_idle",
-					"jobs.stream_ingestion.currently_idle",
-					"jobs.stream_replication.currently_idle",
-					"jobs.typedesc_schema_change.currently_idle",
-					"jobs.key_visualizer.currently_idle",
-				},
-			},
+			jobTypeCharts("Currently Running", "currently_running"),
+			jobTypeCharts("Currently Idle", "currently_idle"),
+			jobTypeCharts("Currently Paused", "currently_paused"),
+			jobTypeCharts("PTS Age", "protected_age_sec"),
+			jobTypeCharts("PTS Record Count", "protected_record_count"),
+			jobTypeCharts("Expired PTS Records", "expired_pts_records"),
 			{
 				Title: "Auto Create Stats",
 				Metrics: []string{
@@ -3593,6 +3598,17 @@ var charts = []sectionDescription{
 					"jobs.key_visualizer.resume_completed",
 					"jobs.key_visualizer.resume_failed",
 					"jobs.key_visualizer.resume_retry_error",
+				},
+			},
+			{
+				Title: "Jobs Stats Polling Job",
+				Metrics: []string{
+					"jobs.poll_jobs_stats.fail_or_cancel_completed",
+					"jobs.poll_jobs_stats.fail_or_cancel_failed",
+					"jobs.poll_jobs_stats.fail_or_cancel_retry_error",
+					"jobs.poll_jobs_stats.resume_completed",
+					"jobs.poll_jobs_stats.resume_failed",
+					"jobs.poll_jobs_stats.resume_retry_error",
 				},
 			},
 		},
@@ -3888,4 +3904,20 @@ var charts = []sectionDescription{
 			},
 		},
 	},
+}
+
+func jobTypeCharts(title string, varName string) chartDescription {
+	var metrics []string
+	for i := 0; i < jobspb.NumJobTypes; i++ {
+		jt := jobspb.Type(i)
+		if jt == jobspb.TypeUnspecified {
+			continue
+		}
+		metrics = append(metrics,
+			fmt.Sprintf("jobs.%s.%s", strings.ToLower(jobspb.Type_name[int32(i)]), varName))
+	}
+	return chartDescription{
+		Title:   title,
+		Metrics: metrics,
+	}
 }

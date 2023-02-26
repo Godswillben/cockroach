@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -1335,7 +1336,7 @@ func (s *adminServer) statsForSpan(
 	}
 	type nodeResponse struct {
 		nodeID roachpb.NodeID
-		resp   *serverpb.SpanStatsResponse
+		resp   *roachpb.SpanStatsResponse
 		err    error
 	}
 
@@ -1351,13 +1352,13 @@ func (s *adminServer) statsForSpan(
 			},
 			func(ctx context.Context) {
 				// Set a generous timeout on the context for each individual query.
-				var spanResponse *serverpb.SpanStatsResponse
+				var spanResponse *roachpb.SpanStatsResponse
 				err := contextutil.RunWithTimeout(ctx, "request remote stats", 20*time.Second,
 					func(ctx context.Context) error {
 						conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
 						if err == nil {
 							client := serverpb.NewStatusClient(conn)
-							req := serverpb.SpanStatsRequest{
+							req := roachpb.SpanStatsRequest{
 								StartKey: rSpan.Key,
 								EndKey:   rSpan.EndKey,
 								NodeID:   nodeID.String(),
@@ -2185,6 +2186,11 @@ func getLivenessResponse(
 	}, nil
 }
 
+// Liveness is implemented on the tenant-facing admin server
+// as a request through the tenant connector. Since at the
+// time of writing, the request contains no additional SQL
+// permission checks, the tenant capability gate is all
+// that is required. This is handled by the connector.
 func (s *adminServer) Liveness(
 	ctx context.Context, req *serverpb.LivenessRequest,
 ) (*serverpb.LivenessResponse, error) {
@@ -3254,8 +3260,8 @@ func (s *systemAdminServer) enqueueRangeLocal(
 // SendKVBatch proxies the given BatchRequest into KV, returning the
 // response. It is for use by the CLI `debug send-kv-batch` command.
 func (s *systemAdminServer) SendKVBatch(
-	ctx context.Context, ba *roachpb.BatchRequest,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 	// Note: the root user will bypass SQL auth checks, which is useful in case of
 	// a cluster outage.
@@ -3292,7 +3298,7 @@ func (s *systemAdminServer) SendKVBatch(
 	// setupSpanForIncomingRPC() call above; from now on the request is traced as
 	// per the span we just created.
 	ba.TraceInfo = nil
-	var br *roachpb.BatchResponse
+	var br *kvpb.BatchResponse
 	// NB: wrapped to delay br evaluation to its value when returning.
 	defer func() {
 		var redact redactOpt
@@ -3305,7 +3311,7 @@ func (s *systemAdminServer) SendKVBatch(
 	}()
 	br, pErr := s.db.NonTransactionalSender().Send(ctx, ba)
 	if br == nil {
-		br = &roachpb.BatchResponse{}
+		br = &kvpb.BatchResponse{}
 	}
 	br.Error = pErr
 	return br, nil
@@ -3375,7 +3381,7 @@ func (s *systemAdminServer) RecoveryVerify(
 		return nil, err
 	}
 
-	return s.server.recoveryServer.Verify(ctx, request)
+	return s.server.recoveryServer.Verify(ctx, request, s.nodeLiveness.GetIsLiveMap(), s.db)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses

@@ -30,6 +30,8 @@ import {
   selectStmtInsightsLoading,
   selectTransactionInsightsLoading,
   selectInsightTypes,
+  selectStmtInsightsMaxApiReached,
+  selectTxnInsightsMaxApiReached,
 } from "src/views/insights/insightsSelectors";
 import { bindActionCreators } from "redux";
 import { LocalSetting } from "src/redux/localsettings";
@@ -58,6 +60,7 @@ const transactionMapStateToProps = (
   sortSetting: sortSettingLocalSetting.selector(state),
   timeScale: selectTimeScale(state),
   isLoading: selectTransactionInsightsLoading(state),
+  maxSizeApiReached: selectTxnInsightsMaxApiReached(state),
 });
 
 const statementMapStateToProps = (
@@ -75,6 +78,7 @@ const statementMapStateToProps = (
     insightStatementColumnsLocalSetting.selectorToArray(state),
   timeScale: selectTimeScale(state),
   isLoading: selectStmtInsightsLoading(state),
+  maxSizeApiReached: selectStmtInsightsMaxApiReached(state),
 });
 
 const TransactionDispatchProps = {

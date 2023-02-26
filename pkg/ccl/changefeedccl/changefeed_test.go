@@ -39,13 +39,13 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // registers cloud storage providers
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -296,10 +296,6 @@ func TestChangefeedIdleness(t *testing.T) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		changefeedbase.IdleTimeout.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 3*time.Second)
-
-		// Idleness functionality is version gated
-		knobs := s.TestingKnobs.Server.(*server.TestingKnobs)
-		knobs.BinaryVersionOverride = clusterversion.ByKey(clusterversion.TODOPreV22_1)
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
 		currentlyIdle := registry.MetricsStruct().JobMetrics[jobspb.TypeChangefeed].CurrentlyIdle
@@ -1719,7 +1715,7 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	// Rangefeed will skip some of the checkpoints to simulate lagging spans.
 	var laggingSpans roachpb.SpanGroup
 	numLagging := 0
-	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *roachpb.RangeFeedCheckpoint) bool {
+	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) bool {
 		// Skip spans that were skipped before; otherwise skip some spans.
 		seenBefore := laggingSpans.Encloses(checkpoint.Span)
 		if seenBefore || (numLagging < 5 && rnd.Int()%3 == 0) {
@@ -2294,24 +2290,23 @@ func fetchDescVersionModificationTime(
 	t testing.TB, s TestServerWithSystem, tableName string, version int,
 ) hlc.Timestamp {
 	tblKey := s.Codec.TablePrefix(keys.DescriptorTableID)
-	header := roachpb.RequestHeader{
+	header := kvpb.RequestHeader{
 		Key:    tblKey,
 		EndKey: tblKey.PrefixEnd(),
 	}
 	dropColTblID := sqlutils.QueryTableID(t, s.DB, `d`, "public", tableName)
-	req := &roachpb.ExportRequest{
+	req := &kvpb.ExportRequest{
 		RequestHeader: header,
-		MVCCFilter:    roachpb.MVCCFilter_All,
+		MVCCFilter:    kvpb.MVCCFilter_All,
 		StartTime:     hlc.Timestamp{},
 	}
-	clock := hlc.NewClockWithSystemTimeSource(time.Minute /* maxOffset */)
-	hh := roachpb.Header{Timestamp: clock.Now()}
+	hh := kvpb.Header{Timestamp: hlc.NewClockForTesting(nil).Now()}
 	res, pErr := kv.SendWrappedWith(context.Background(),
 		s.SystemServer.DB().NonTransactionalSender(), hh, req)
 	if pErr != nil {
 		t.Fatal(pErr.GoError())
 	}
-	for _, file := range res.(*roachpb.ExportResponse).Files {
+	for _, file := range res.(*kvpb.ExportResponse).Files {
 		it, err := storage.NewMemSSTIterator(file.SST, false /* verify */, storage.IterOptions{
 			KeyTypes:   storage.IterKeyTypePointsAndRanges,
 			LowerBound: keys.MinKey,
@@ -4171,6 +4166,49 @@ func TestChangefeedDataTTL(t *testing.T) {
 	cdcTestWithSystem(t, testFn, feedTestForceSink("sinkless"), feedTestNoTenants)
 }
 
+// TestChangefeedCanceledWhenPTSIsOld verifies paused changefeed job which holds PTS
+// record gets canceled if paused for too long.
+func TestChangefeedCanceledWhenPTSIsOld(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms';`)
+		// Create the data table; it will only contain a
+		// single row with multiple versions.
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b INT)`)
+
+		feed, err := f.Feed("CREATE CHANGEFEED FOR TABLE foo WITH protect_data_from_gc_on_pause, gc_protect_expires_after='24h'")
+		require.NoError(t, err)
+		defer func() {
+			closeFeed(t, feed)
+		}()
+
+		jobFeed := feed.(cdctest.EnterpriseTestFeed)
+		require.NoError(t, jobFeed.Pause())
+
+		// While the job is paused, take opportunity to test that alter changefeed
+		// works when setting gc_protect_expires_after option.
+
+		// Verify we can set it to 0 -- i.e. disable.
+		sqlDB.Exec(t, fmt.Sprintf("ALTER CHANGEFEED %d SET gc_protect_expires_after = '0s'", jobFeed.JobID()))
+		// Now, set it to something very small.
+		sqlDB.Exec(t, fmt.Sprintf("ALTER CHANGEFEED %d SET gc_protect_expires_after = '250ms'", jobFeed.JobID()))
+
+		// Stale PTS record should trigger job cancellation.
+		require.NoError(t, jobFeed.WaitForStatus(func(s jobs.Status) bool {
+			return s == jobs.StatusCanceled
+		}))
+	}
+
+	// Ensure metrics poller loop runs fast.
+	st := cluster.MakeTestingClusterSettings()
+	jobs.PollJobsMetricsInterval.Override(context.Background(), &st.SV, 100*time.Millisecond)
+	cdcTest(t, testFn, feedTestEnterpriseSinks, withSettings(st))
+}
+
 // TestChangefeedSchemaTTL ensures that changefeeds fail with an error in the case
 // where the feed has fallen behind the GC TTL of the table's schema.
 func TestChangefeedSchemaTTL(t *testing.T) {
@@ -4541,6 +4579,10 @@ func TestChangefeedErrors(t *testing.T) {
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH topic_in_value, format='experimental_avro'`,
 		`kafka://nope`,
 	)
+
+	// Unordered flag required for some options, disallowed for others.
+	sqlDB.ExpectErr(t, `resolved timestamps cannot be guaranteed to be correct in unordered mode`, `CREATE CHANGEFEED FOR foo WITH resolved, unordered`)
+	sqlDB.ExpectErr(t, `Use of gcpubsub without specifying a region requires the WITH unordered option.`, `CREATE CHANGEFEED FOR foo INTO "gcpubsub://foo"`)
 
 	// The topics option should not be exposed to users since it is used
 	// internally to display topics in the show changefeed jobs query
@@ -5188,12 +5230,12 @@ func TestChangefeedProtectedTimestamps(t *testing.T) {
 			}
 		}
 		requestFilter = kvserverbase.ReplicaRequestFilter(func(
-			ctx context.Context, ba *roachpb.BatchRequest,
-		) *roachpb.Error {
+			ctx context.Context, ba *kvpb.BatchRequest,
+		) *kvpb.Error {
 			if ba.Txn == nil || ba.Txn.Name != "changefeed backfill" {
 				return nil
 			}
-			scanReq, ok := ba.GetArg(roachpb.Scan)
+			scanReq, ok := ba.GetArg(kvpb.Scan)
 			if !ok {
 				return nil
 			}
@@ -5623,6 +5665,104 @@ func TestChangefeedTelemetry(t *testing.T) {
 
 	cdcTest(t, testFn, feedTestForceSink("sinkless"))
 	cdcTest(t, testFn, feedTestForceSink("enterprise"))
+}
+
+func TestChangefeedContinuousTelemetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
+		interval := -10 * time.Millisecond
+		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		defer closeFeed(t, foo)
+		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
+
+		for i := 0; i < 5; i++ {
+			beforeCreate := timeutil.Now()
+			sqlDB.Exec(t, fmt.Sprintf(`INSERT INTO foo VALUES (%d) RETURNING cluster_logical_timestamp()`, i))
+			verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+		}
+	}
+
+	// TODO(#89421): include pubsub once it supports metrics
+	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
+}
+
+func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		interval := 24 * time.Hour
+		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		beforeCreate := timeutil.Now()
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
+
+		// Insert a row and wait for logs to be created.
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+		verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+
+		// Insert more rows. No logs should be created for these since we recently
+		// published them above and the interval is 24h.
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (2)`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (3)`)
+		assertPayloads(t, foo, []string{
+			`foo: [1]->{"after": {"id": 1}}`,
+			`foo: [2]->{"after": {"id": 2}}`,
+			`foo: [3]->{"after": {"id": 3}}`,
+		})
+
+		// Close the changefeed and ensure logs were created after closing.
+		beforeClose := timeutil.Now()
+		require.NoError(t, foo.Close())
+		verifyLogsWithEmittedBytes(t, jobID, beforeClose.UnixNano(), interval.Nanoseconds(), true)
+	}
+
+	// TODO(#89421): include pubsub once it supports metrics
+	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
+}
+
+func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
+		interval := -100 * time.Millisecond
+		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `CREATE TABLE foo2 (id INT PRIMARY KEY)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		foo2 := feed(t, f, `CREATE CHANGEFEED FOR foo2`)
+		job1 := foo.(cdctest.EnterpriseTestFeed).JobID()
+		job2 := foo2.(cdctest.EnterpriseTestFeed).JobID()
+
+		beforeInsert := timeutil.Now()
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (1)`)
+		verifyLogsWithEmittedBytes(t, job1, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		require.NoError(t, foo.Close())
+
+		beforeInsert = timeutil.Now()
+		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (2)`)
+		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		require.NoError(t, foo2.Close())
+	}
+
+	// TODO(#89421): include pubsub once it supports metrics
+	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
 }
 
 // Regression test for #41694.
@@ -7080,7 +7220,7 @@ INSERT INTO foo (a, b, e) VALUES (2, 'two', 'closed');
 CREATE CHANGEFEED 
 WITH schema_change_policy='stop'
 AS SELECT * FROM `+fromClause+` 
-WHERE e IN ('open', 'closed') AND NOT cdc_is_delete()`)
+WHERE e IN ('open', 'closed') AND event_op() != 'delete'`)
 			defer closeFeed(t, feed)
 
 			assertPayloads(t, feed, []string{

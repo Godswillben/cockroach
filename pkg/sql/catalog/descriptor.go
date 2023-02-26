@@ -13,6 +13,7 @@ package catalog
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -90,7 +91,7 @@ type DescriptorBuilder interface {
 	// built from a deserialized protobuf obtained by restoring a backup.
 	// This is to compensate for the fact that these are not subject to cluster
 	// upgrade migrations
-	RunRestoreChanges(descLookupFn func(id descpb.ID) Descriptor) error
+	RunRestoreChanges(version clusterversion.ClusterVersion, descLookupFn func(id descpb.ID) Descriptor) error
 
 	// SetRawBytesInStorage sets `rawBytesInStorage` field by deep-copying `rawBytes`.
 	SetRawBytesInStorage(rawBytes []byte)
@@ -577,6 +578,24 @@ type TableDescriptor interface {
 		databaseDesc DatabaseDescriptor, getType func(descpb.ID) (TypeDescriptor, error),
 	) (referencedAnywhere, referencedInColumns descpb.IDs, _ error)
 
+	// GetAllReferencedFunctionIDs returns descriptor IDs of all user defined
+	// functions referenced in this table.
+	GetAllReferencedFunctionIDs() (DescriptorIDSet, error)
+
+	// GetAllReferencedFunctionIDsInConstraint returns descriptor IDs of all user
+	// defined functions referenced in this check constraint.
+	GetAllReferencedFunctionIDsInConstraint(
+		cstID descpb.ConstraintID,
+	) (DescriptorIDSet, error)
+
+	// GetAllReferencedFunctionIDsInColumnExprs returns descriptor IDs of all user
+	// defined functions referenced by expressions in this column.
+	// Note: it extracts ids from expression strings, not from the UsesFunctionIDs
+	// field of column descriptors.
+	GetAllReferencedFunctionIDsInColumnExprs(
+		colID descpb.ColumnID,
+	) (DescriptorIDSet, error)
+
 	// ForeachDependedOnBy runs a function on all indexes, including those being
 	// added in the mutations.
 	ForeachDependedOnBy(f func(dep *descpb.TableDescriptor_Reference) error) error
@@ -588,6 +607,9 @@ type TableDescriptor interface {
 	// GetDependsOnTypes returns the IDs of all types that this view depends on.
 	// It's only non-nil if IsView is true.
 	GetDependsOnTypes() []descpb.ID
+	// GetDependsOnFunctions returns the IDs of all functions that this view
+	// depends on. It's only non-nil if IsView is true.
+	GetDependsOnFunctions() []descpb.ID
 
 	// AllConstraints returns all constraints in this table, regardless if
 	// they're enforced yet or not. The ordering of the constraints within this

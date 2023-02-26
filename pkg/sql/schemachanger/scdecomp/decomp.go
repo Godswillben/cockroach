@@ -551,15 +551,21 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 		if idx.GetEncodingType() == catenumpb.PrimaryIndexEncoding {
 			w.ev(idxStatus, &scpb.PrimaryIndex{Index: index})
 		} else {
-			sec := &scpb.SecondaryIndex{Index: index}
+			sec := &scpb.SecondaryIndex{
+				Index: index,
+			}
 			if idx.IsPartial() {
 				pp, err := w.newExpression(idx.GetPredicate())
 				onErrPanic(err)
-				w.ev(scpb.Status_PUBLIC, &scpb.SecondaryIndexPartial{
-					TableID:    index.TableID,
-					IndexID:    index.IndexID,
-					Expression: *pp,
-				})
+				if w.clusterVersion.IsActive(clusterversion.V23_1_SchemaChangerDeprecatedIndexPredicates) {
+					sec.EmbeddedExpr = pp
+				} else {
+					w.ev(scpb.Status_PUBLIC, &scpb.SecondaryIndexPartial{
+						TableID:    index.TableID,
+						IndexID:    index.IndexID,
+						Expression: *pp,
+					})
+				}
 			}
 			w.ev(idxStatus, sec)
 		}
@@ -601,20 +607,32 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 func (w *walkCtx) walkUniqueWithoutIndexConstraint(
 	tbl catalog.TableDescriptor, c catalog.UniqueWithoutIndexConstraint,
 ) {
-	uwi := &scpb.UniqueWithoutIndexConstraint{
-		TableID:      tbl.GetID(),
-		ConstraintID: c.GetConstraintID(),
-		ColumnIDs:    c.CollectKeyColumnIDs().Ordered(),
-	}
+	var expr *scpb.Expression
+	var err error
 	if c.IsPartial() {
-		expr, err := w.newExpression(c.GetPredicate())
+		expr, err = w.newExpression(c.GetPredicate())
 		if err != nil {
 			panic(errors.NewAssertionErrorWithWrappedErrf(err, "unique without index constraint %q in table %q (%d)",
 				c.GetName(), tbl.GetName(), tbl.GetID()))
 		}
-		uwi.Predicate = expr
 	}
-	w.ev(scpb.Status_PUBLIC, uwi)
+	if c.IsConstraintUnvalidated() && w.clusterVersion.IsActive(clusterversion.V23_1) {
+		uwi := &scpb.UniqueWithoutIndexConstraintUnvalidated{
+			TableID:      tbl.GetID(),
+			ConstraintID: c.GetConstraintID(),
+			ColumnIDs:    c.CollectKeyColumnIDs().Ordered(),
+			Predicate:    expr,
+		}
+		w.ev(scpb.Status_PUBLIC, uwi)
+	} else {
+		uwi := &scpb.UniqueWithoutIndexConstraint{
+			TableID:      tbl.GetID(),
+			ConstraintID: c.GetConstraintID(),
+			ColumnIDs:    c.CollectKeyColumnIDs().Ordered(),
+			Predicate:    expr,
+		}
+		w.ev(scpb.Status_PUBLIC, uwi)
+	}
 	w.ev(scpb.Status_PUBLIC, &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.GetID(),
 		ConstraintID: c.GetConstraintID(),
@@ -635,14 +653,22 @@ func (w *walkCtx) walkCheckConstraint(tbl catalog.TableDescriptor, c catalog.Che
 		panic(errors.NewAssertionErrorWithWrappedErrf(err, "check constraint %q in table %q (%d)",
 			c.GetName(), tbl.GetName(), tbl.GetID()))
 	}
-	// TODO(postamar): proper handling of constraint status
-	w.ev(scpb.Status_PUBLIC, &scpb.CheckConstraint{
-		TableID:               tbl.GetID(),
-		ConstraintID:          c.GetConstraintID(),
-		ColumnIDs:             c.CollectReferencedColumnIDs().Ordered(),
-		Expression:            *expr,
-		FromHashShardedColumn: c.IsHashShardingConstraint(),
-	})
+	if c.IsConstraintUnvalidated() && w.clusterVersion.IsActive(clusterversion.V23_1) {
+		w.ev(scpb.Status_PUBLIC, &scpb.CheckConstraintUnvalidated{
+			TableID:      tbl.GetID(),
+			ConstraintID: c.GetConstraintID(),
+			ColumnIDs:    c.CollectReferencedColumnIDs().Ordered(),
+			Expression:   *expr,
+		})
+	} else {
+		w.ev(scpb.Status_PUBLIC, &scpb.CheckConstraint{
+			TableID:               tbl.GetID(),
+			ConstraintID:          c.GetConstraintID(),
+			ColumnIDs:             c.CollectReferencedColumnIDs().Ordered(),
+			Expression:            *expr,
+			FromHashShardedColumn: c.IsHashShardingConstraint(),
+		})
+	}
 	w.ev(scpb.Status_PUBLIC, &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.GetID(),
 		ConstraintID: c.GetConstraintID(),
@@ -660,17 +686,29 @@ func (w *walkCtx) walkCheckConstraint(tbl catalog.TableDescriptor, c catalog.Che
 func (w *walkCtx) walkForeignKeyConstraint(
 	tbl catalog.TableDescriptor, c catalog.ForeignKeyConstraint,
 ) {
-	// TODO(postamar): proper handling of constraint status
-	w.ev(scpb.Status_PUBLIC, &scpb.ForeignKeyConstraint{
-		TableID:                 tbl.GetID(),
-		ConstraintID:            c.GetConstraintID(),
-		ColumnIDs:               c.ForeignKeyDesc().OriginColumnIDs,
-		ReferencedTableID:       c.GetReferencedTableID(),
-		ReferencedColumnIDs:     c.ForeignKeyDesc().ReferencedColumnIDs,
-		OnUpdateAction:          c.OnUpdate(),
-		OnDeleteAction:          c.OnDelete(),
-		CompositeKeyMatchMethod: c.Match(),
-	})
+	if c.IsConstraintUnvalidated() && w.clusterVersion.IsActive(clusterversion.V23_1) {
+		w.ev(scpb.Status_PUBLIC, &scpb.ForeignKeyConstraintUnvalidated{
+			TableID:                 tbl.GetID(),
+			ConstraintID:            c.GetConstraintID(),
+			ColumnIDs:               c.ForeignKeyDesc().OriginColumnIDs,
+			ReferencedTableID:       c.GetReferencedTableID(),
+			ReferencedColumnIDs:     c.ForeignKeyDesc().ReferencedColumnIDs,
+			OnUpdateAction:          c.OnUpdate(),
+			OnDeleteAction:          c.OnDelete(),
+			CompositeKeyMatchMethod: c.Match(),
+		})
+	} else {
+		w.ev(scpb.Status_PUBLIC, &scpb.ForeignKeyConstraint{
+			TableID:                 tbl.GetID(),
+			ConstraintID:            c.GetConstraintID(),
+			ColumnIDs:               c.ForeignKeyDesc().OriginColumnIDs,
+			ReferencedTableID:       c.GetReferencedTableID(),
+			ReferencedColumnIDs:     c.ForeignKeyDesc().ReferencedColumnIDs,
+			OnUpdateAction:          c.OnUpdate(),
+			OnDeleteAction:          c.OnDelete(),
+			CompositeKeyMatchMethod: c.Match(),
+		})
+	}
 	w.ev(scpb.Status_PUBLIC, &scpb.ConstraintWithoutIndexName{
 		TableID:      tbl.GetID(),
 		ConstraintID: c.GetConstraintID(),
@@ -785,6 +823,9 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 				panic(err)
 			}
 		}
+	}
+	for _, backRef := range fnDesc.GetDependedOnBy() {
+		w.backRefs.Add(backRef.ID)
 	}
 	w.ev(scpb.Status_PUBLIC, fnBody)
 }

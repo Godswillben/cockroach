@@ -170,6 +170,11 @@ func (tc *Collection) ResetMaxTimestampBound() {
 	tc.maxTimestampBoundDeadlineHolder.maxTimestampBound = hlc.Timestamp{}
 }
 
+// GetMaxTimestampBound returns the maximum timestamp to read schemas at.
+func (tc *Collection) GetMaxTimestampBound() hlc.Timestamp {
+	return tc.maxTimestampBoundDeadlineHolder.maxTimestampBound
+}
+
 // SkipValidationOnWrite avoids validating stored descriptors prior to
 // a transaction commit.
 func (tc *Collection) SkipValidationOnWrite() {
@@ -1206,7 +1211,7 @@ func MakeTestCollection(ctx context.Context, leaseManager *lease.Manager) Collec
 }
 
 // InternalExecFn is the type of functions that operates using an internalExecutor.
-type InternalExecFn func(ctx context.Context, txn isql.Txn, descriptors *Collection) error
+type InternalExecFn func(ctx context.Context, txn Txn) error
 
 // HistoricalInternalExecTxnRunnerFn callback for executing with the internal executor
 // at a fixed timestamp.

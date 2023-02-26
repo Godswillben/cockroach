@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -73,7 +74,7 @@ type EvalContext interface {
 	// for details about its arguments, return values, and preconditions.
 	CanCreateTxnRecord(
 		ctx context.Context, txnID uuid.UUID, txnKey []byte, txnMinTS hlc.Timestamp,
-	) (ok bool, reason roachpb.TransactionAbortedReason)
+	) (ok bool, reason kvpb.TransactionAbortedReason)
 
 	// MinTxnCommitTS determines the minimum timestamp at which a transaction with
 	// the provided ID and key can commit. See Replica.MinTxnCommitTS for details
@@ -87,20 +88,19 @@ type EvalContext interface {
 	// results due to concurrent writes.
 	GetMVCCStats() enginepb.MVCCStats
 
-	// GetMaxSplitQPS returns the Replicas maximum queries/s request rate over a
-	// configured retention period.
+	// GetMaxSplitQPS returns the Replica's maximum queries/s request rate over
+	// a configured retention period.
 	//
 	// NOTE: This should not be used when the load based splitting cluster setting
 	// is disabled.
 	GetMaxSplitQPS(context.Context) (float64, bool)
 
-	// GetLastSplitQPS returns the Replica's most recent queries/s request rate.
+	// GetMaxSplitCPU returns the Replica's maximum request cpu/s rate over a
+	// configured retention period.
 	//
 	// NOTE: This should not be used when the load based splitting cluster setting
 	// is disabled.
-	//
-	// TODO(nvanbenschoten): remove this method in v22.1.
-	GetLastSplitQPS(context.Context) float64
+	GetMaxSplitCPU(context.Context) (float64, bool)
 
 	GetGCThreshold() hlc.Timestamp
 	ExcludeDataFromBackup() bool
@@ -169,10 +169,11 @@ type MockEvalCtx struct {
 	Clock                *hlc.Clock
 	Stats                enginepb.MVCCStats
 	QPS                  float64
+	CPU                  float64
 	AbortSpan            *abortspan.AbortSpan
 	GCThreshold          hlc.Timestamp
 	Term, FirstIndex     uint64
-	CanCreateTxnRecordFn func() (bool, roachpb.TransactionAbortedReason)
+	CanCreateTxnRecordFn func() (bool, kvpb.TransactionAbortedReason)
 	MinTxnCommitTSFn     func() hlc.Timestamp
 	Lease                roachpb.Lease
 	CurrentReadSummary   rspb.ReadSummary
@@ -248,12 +249,12 @@ func (m *mockEvalCtxImpl) GetMVCCStats() enginepb.MVCCStats {
 func (m *mockEvalCtxImpl) GetMaxSplitQPS(context.Context) (float64, bool) {
 	return m.QPS, true
 }
-func (m *mockEvalCtxImpl) GetLastSplitQPS(context.Context) float64 {
-	return m.QPS
+func (m *mockEvalCtxImpl) GetMaxSplitCPU(context.Context) (float64, bool) {
+	return m.CPU, true
 }
 func (m *mockEvalCtxImpl) CanCreateTxnRecord(
 	context.Context, uuid.UUID, []byte, hlc.Timestamp,
-) (bool, roachpb.TransactionAbortedReason) {
+) (bool, kvpb.TransactionAbortedReason) {
 	if m.CanCreateTxnRecordFn == nil {
 		return true, 0
 	}

@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
@@ -1106,7 +1107,7 @@ func cmdDelete(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 	return e.withWriter("del", func(rw storage.ReadWriter) error {
 		foundKey, err := storage.MVCCDelete(e.ctx, rw, e.ms, key, ts, localTs, txn)
-		if err == nil || errors.HasType(err, &roachpb.WriteTooOldError{}) {
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			// We want to output foundKey even if a WriteTooOldError is returned,
 			// since the error may be swallowed/deferred during evaluation.
 			e.results.buf.Printf("del: %v: found key %v\n", key, foundKey)
@@ -1195,7 +1196,7 @@ func cmdDeleteRangePredicate(e *evalCtx) error {
 	if e.hasArg("maxBytes") {
 		e.scanArg("maxBytes", &maxBytes)
 	}
-	predicates := roachpb.DeleteRangePredicates{
+	predicates := kvpb.DeleteRangePredicates{
 		StartTime: e.getTsWithName("startTime"),
 	}
 	rangeThreshold := 64
@@ -1384,13 +1385,13 @@ func cmdExport(e *evalCtx) error {
 
 	sstFile := &storage.MemFile{}
 
-	var summary roachpb.BulkOpSummary
-	var resume storage.MVCCKey
+	var summary kvpb.BulkOpSummary
+	var resumeInfo storage.ExportRequestResumeInfo
 	var fingerprint uint64
 	var hasRangeKeys bool
 	var err error
 	if shouldFingerprint {
-		summary, resume, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(e.ctx, e.st, r,
+		summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(e.ctx, e.st, r,
 			opts, sstFile)
 		if err != nil {
 			return err
@@ -1401,15 +1402,15 @@ func cmdExport(e *evalCtx) error {
 		e.results.buf.Printf("export: %s", &summary)
 		e.results.buf.Print(" fingerprint=true")
 	} else {
-		summary, resume, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, sstFile)
+		summary, resumeInfo, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, sstFile)
 		if err != nil {
 			return err
 		}
 		e.results.buf.Printf("export: %s", &summary)
 	}
 
-	if resume.Key != nil {
-		e.results.buf.Printf(" resume=%s", resume)
+	if resumeInfo.ResumeKey.Key != nil {
+		e.results.buf.Printf(" resume=%s", resumeInfo.ResumeKey)
 	}
 	e.results.buf.Printf("\n")
 
@@ -2253,7 +2254,7 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) er
 	if batch != nil {
 		// WriteTooOldError is sometimes expected to leave behind a provisional
 		// value at a higher timestamp. We commit this for parity with the engine.
-		if err == nil || errors.HasType(err, &roachpb.WriteTooOldError{}) {
+		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			if err := batch.Commit(true); err != nil {
 				return err
 			}

@@ -14,9 +14,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -29,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -186,7 +188,7 @@ func executeStage(
 	if err := scexec.ExecuteStage(ctx, deps, stage.Phase, stage.Ops()); err != nil {
 		// Don't go through the effort to wrap the error if it's a retry or it's a
 		// cancelation.
-		if !errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) &&
+		if !errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) &&
 			!errors.Is(err, context.Canceled) &&
 			!scerrors.HasSchemaChangerUserError(err) {
 			err = p.DecorateErrorWithPlanDetails(err)
@@ -229,7 +231,8 @@ func makePostCommitPlan(
 				descriptorIDs)
 		}
 		// Rebuild the state from its constituent parts.
-		state, err = makeState(ctx, jobID, descriptorIDs, descriptors)
+		activeVersion := deps.ClusterSettings().Version.ActiveVersion(ctx)
+		state, err = makeState(ctx, jobID, descriptorIDs, descriptors, activeVersion)
 		if err != nil {
 			return err
 		}
@@ -290,6 +293,7 @@ func makeState(
 	jobID jobspb.JobID,
 	descriptorIDs []descpb.ID,
 	descriptors []catalog.Descriptor,
+	version clusterversion.ClusterVersion,
 ) (state scpb.CurrentState, err error) {
 	defer scerrors.StartEventf(
 		ctx,
@@ -326,6 +330,11 @@ func makeState(
 			err = errors.Wrapf(err, "descriptor %q (%d)", desc.GetName(), desc.GetID())
 		}()
 		cs := desc.GetDeclarativeSchemaChangerState()
+		// Copy and apply migration for the state, this should normally do nothing,
+		// but TXN_DROPPED is special and should be cleaned up in memory before
+		// executing on a newer node.
+		cs = protoutil.Clone(cs).(*scpb.DescriptorState)
+		scpb.MigrateDescriptorState(version, cs)
 		if cs == nil {
 			return errors.New("missing schema changer state")
 		}

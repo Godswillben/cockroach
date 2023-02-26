@@ -15,8 +15,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -1001,17 +1001,17 @@ func (s *Store) receiveSnapshot(
 	var placeholder *ReplicaPlaceholder
 	if pErr := s.withReplicaForRequest(
 		ctx, &header.RaftMessageRequest, func(ctx context.Context, r *Replica,
-		) *roachpb.Error {
+		) *kvpb.Error {
 			var err error
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			placeholder, err = s.canAcceptSnapshotLocked(ctx, header)
 			if err != nil {
-				return roachpb.NewError(err)
+				return kvpb.NewError(err)
 			}
 			if placeholder != nil {
 				if err := s.addPlaceholderLocked(placeholder); err != nil {
-					return roachpb.NewError(err)
+					return kvpb.NewError(err)
 				}
 			}
 			return nil
@@ -1361,18 +1361,6 @@ func SendEmptySnapshot(
 		return err
 	}
 
-	supportsGCHints := st.Version.IsActive(ctx, clusterversion.V22_2GCHintInReplicaState)
-	// SendEmptySnapshot is only used by the cockroach debug reset-quorum tool.
-	// It is experimental and unlikely to be used in cluster versions that are
-	// older than GCHintInReplicaState. We do not want the cluster version to
-	// fully dictate the value of the supportsGCHints parameter, since if this
-	// node's view of the version is stale we could regress to a state before the
-	// migration. Instead, we return an error if the cluster version is old.
-	if !supportsGCHints {
-		return errors.Errorf("cluster version is too old %s",
-			st.Version.ActiveVersionOrEmpty(ctx))
-	}
-
 	ms, err = stateloader.WriteInitialReplicaState(
 		ctx,
 		eng,
@@ -1382,7 +1370,6 @@ func SendEmptySnapshot(
 		hlc.Timestamp{}, // gcThreshold
 		roachpb.GCHint{},
 		st.Version.ActiveVersionOrEmpty(ctx).Version,
-		supportsGCHints, /* 22.2: GCHintInReplicaState */
 	)
 	if err != nil {
 		return err

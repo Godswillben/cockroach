@@ -24,10 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -1287,13 +1289,54 @@ func TestIncompatibleVersion(t *testing.T) {
 		dir: "",
 		fs:  vfs.NewMem(),
 	}
-	oldVer := roachpb.Version{Major: 21, Minor: 1}
-	stOld := cluster.MakeTestingClusterSettingsWithVersions(oldVer, oldVer, true /* initializeVersion */)
-	p, err := Open(ctx, loc, stOld)
+
+	p, err := Open(ctx, loc, cluster.MakeTestingClusterSettings())
 	require.NoError(t, err)
 	p.Close()
 
-	stNew := cluster.MakeTestingClusterSettings()
-	_, err = Open(ctx, loc, stNew)
+	// Overwrite the min version file with an unsupported version.
+	version := roachpb.Version{Major: 21, Minor: 1}
+	b, err := protoutil.Marshal(&version)
+	require.NoError(t, err)
+	require.NoError(t, fs.SafeWriteToFile(loc.fs, loc.dir, MinVersionFilename, b))
+
+	_, err = Open(ctx, loc, cluster.MakeTestingClusterSettings())
 	require.ErrorContains(t, err, "is too old for running version")
+}
+
+func TestNoMinVerFile(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	loc := Location{
+		dir: "",
+		fs:  vfs.NewMem(),
+	}
+
+	st := cluster.MakeTestingClusterSettings()
+	p, err := Open(ctx, loc, st)
+	require.NoError(t, err)
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	// We are still allowed the open the store if we haven't written anything to it.
+	// This is useful in case the initial Open crashes right before writinng the
+	// min version file.
+	p, err = Open(ctx, loc, st)
+	require.NoError(t, err)
+
+	// Now write something to the store.
+	k := MVCCKey{Key: []byte("a"), Timestamp: hlc.Timestamp{WallTime: 1}}
+	v := MVCCValue{Value: roachpb.MakeValueFromString("a1")}
+	require.NoError(t, p.PutMVCC(k, v))
+	p.Close()
+
+	// Remove the min version filename.
+	require.NoError(t, loc.fs.Remove(loc.fs.PathJoin(loc.dir, MinVersionFilename)))
+
+	_, err = Open(ctx, loc, st)
+	require.ErrorContains(t, err, "store has no min-version file")
 }

@@ -23,6 +23,7 @@ type ImmediateMutationOp interface {
 // ImmediateMutationVisitor is a visitor for ImmediateMutationOp operations.
 type ImmediateMutationVisitor interface {
 	NotImplemented(context.Context, NotImplemented) error
+	NotImplementedForPublicObjects(context.Context, NotImplementedForPublicObjects) error
 	UndoAllInTxnImmediateMutationOpSideEffects(context.Context, UndoAllInTxnImmediateMutationOpSideEffects) error
 	MakeAbsentTempIndexDeleteOnly(context.Context, MakeAbsentTempIndexDeleteOnly) error
 	MakeAbsentIndexBackfilling(context.Context, MakeAbsentIndexBackfilling) error
@@ -53,18 +54,18 @@ type ImmediateMutationVisitor interface {
 	RemoveSequenceOwner(context.Context, RemoveSequenceOwner) error
 	RemoveCheckConstraint(context.Context, RemoveCheckConstraint) error
 	RemoveColumnNotNull(context.Context, RemoveColumnNotNull) error
-	MakeAbsentCheckConstraintWriteOnly(context.Context, MakeAbsentCheckConstraintWriteOnly) error
+	AddCheckConstraint(context.Context, AddCheckConstraint) error
 	MakeAbsentColumnNotNullWriteOnly(context.Context, MakeAbsentColumnNotNullWriteOnly) error
 	MakePublicCheckConstraintValidated(context.Context, MakePublicCheckConstraintValidated) error
 	MakePublicColumnNotNullValidated(context.Context, MakePublicColumnNotNullValidated) error
 	MakeValidatedCheckConstraintPublic(context.Context, MakeValidatedCheckConstraintPublic) error
 	MakeValidatedColumnNotNullPublic(context.Context, MakeValidatedColumnNotNullPublic) error
-	MakeAbsentForeignKeyConstraintWriteOnly(context.Context, MakeAbsentForeignKeyConstraintWriteOnly) error
+	AddForeignKeyConstraint(context.Context, AddForeignKeyConstraint) error
 	MakeValidatedForeignKeyConstraintPublic(context.Context, MakeValidatedForeignKeyConstraintPublic) error
 	MakePublicForeignKeyConstraintValidated(context.Context, MakePublicForeignKeyConstraintValidated) error
 	RemoveForeignKeyConstraint(context.Context, RemoveForeignKeyConstraint) error
 	RemoveForeignKeyBackReference(context.Context, RemoveForeignKeyBackReference) error
-	MakeAbsentUniqueWithoutIndexConstraintWriteOnly(context.Context, MakeAbsentUniqueWithoutIndexConstraintWriteOnly) error
+	AddUniqueWithoutIndexConstraint(context.Context, AddUniqueWithoutIndexConstraint) error
 	MakeValidatedUniqueWithoutIndexConstraintPublic(context.Context, MakeValidatedUniqueWithoutIndexConstraintPublic) error
 	MakePublicUniqueWithoutIndexConstraintValidated(context.Context, MakePublicUniqueWithoutIndexConstraintValidated) error
 	RemoveUniqueWithoutIndexConstraint(context.Context, RemoveUniqueWithoutIndexConstraint) error
@@ -80,6 +81,9 @@ type ImmediateMutationVisitor interface {
 	RemoveBackReferenceInTypes(context.Context, RemoveBackReferenceInTypes) error
 	UpdateTableBackReferencesInSequences(context.Context, UpdateTableBackReferencesInSequences) error
 	RemoveBackReferencesInRelations(context.Context, RemoveBackReferencesInRelations) error
+	AddTableConstraintBackReferencesInFunctions(context.Context, AddTableConstraintBackReferencesInFunctions) error
+	RemoveTableConstraintBackReferencesFromFunctions(context.Context, RemoveTableConstraintBackReferencesFromFunctions) error
+	RemoveTableColumnBackReferencesInFunctions(context.Context, RemoveTableColumnBackReferencesInFunctions) error
 	SetColumnName(context.Context, SetColumnName) error
 	SetIndexName(context.Context, SetIndexName) error
 	SetConstraintName(context.Context, SetConstraintName) error
@@ -119,6 +123,11 @@ type ImmediateMutationVisitor interface {
 // Visit is part of the ImmediateMutationOp interface.
 func (op NotImplemented) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.NotImplemented(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op NotImplementedForPublicObjects) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.NotImplementedForPublicObjects(ctx, op)
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -272,8 +281,8 @@ func (op RemoveColumnNotNull) Visit(ctx context.Context, v ImmediateMutationVisi
 }
 
 // Visit is part of the ImmediateMutationOp interface.
-func (op MakeAbsentCheckConstraintWriteOnly) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
-	return v.MakeAbsentCheckConstraintWriteOnly(ctx, op)
+func (op AddCheckConstraint) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.AddCheckConstraint(ctx, op)
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -302,8 +311,8 @@ func (op MakeValidatedColumnNotNullPublic) Visit(ctx context.Context, v Immediat
 }
 
 // Visit is part of the ImmediateMutationOp interface.
-func (op MakeAbsentForeignKeyConstraintWriteOnly) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
-	return v.MakeAbsentForeignKeyConstraintWriteOnly(ctx, op)
+func (op AddForeignKeyConstraint) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.AddForeignKeyConstraint(ctx, op)
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -327,8 +336,8 @@ func (op RemoveForeignKeyBackReference) Visit(ctx context.Context, v ImmediateMu
 }
 
 // Visit is part of the ImmediateMutationOp interface.
-func (op MakeAbsentUniqueWithoutIndexConstraintWriteOnly) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
-	return v.MakeAbsentUniqueWithoutIndexConstraintWriteOnly(ctx, op)
+func (op AddUniqueWithoutIndexConstraint) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.AddUniqueWithoutIndexConstraint(ctx, op)
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -404,6 +413,21 @@ func (op UpdateTableBackReferencesInSequences) Visit(ctx context.Context, v Imme
 // Visit is part of the ImmediateMutationOp interface.
 func (op RemoveBackReferencesInRelations) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.RemoveBackReferencesInRelations(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op AddTableConstraintBackReferencesInFunctions) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.AddTableConstraintBackReferencesInFunctions(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op RemoveTableConstraintBackReferencesFromFunctions) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.RemoveTableConstraintBackReferencesFromFunctions(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op RemoveTableColumnBackReferencesInFunctions) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.RemoveTableColumnBackReferencesInFunctions(ctx, op)
 }
 
 // Visit is part of the ImmediateMutationOp interface.

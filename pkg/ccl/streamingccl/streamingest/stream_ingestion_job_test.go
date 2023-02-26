@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -113,7 +114,7 @@ SET CLUSTER SETTING stream_replication.consumer_heartbeat_frequency = '100ms';
 SET CLUSTER SETTING bulkio.stream_ingestion.minimum_flush_interval = '500ms';
 SET CLUSTER SETTING bulkio.stream_ingestion.cutover_signal_poll_interval = '100ms';
 SET CLUSTER SETTING stream_replication.job_checkpoint_frequency = '100ms';
-SET enable_experimental_stream_replication = true;
+SET CLUSTER SETTING cross_cluster_replication.enabled = true;
 `,
 		";")...)
 
@@ -125,8 +126,13 @@ SET enable_experimental_stream_replication = true;
 	sourceSQL.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&startTime)
 
 	destSQL.Exec(t,
-		`CREATE TENANT "destination-tenant" FROM REPLICATION OF "source-tenant" ON $1 `,
-		pgURL.String(),
+		fmt.Sprintf(`CREATE EXTERNAL CONNECTION "replication-source-addr" AS "%s"`,
+			pgURL.String()),
+	)
+
+	destSQL.Exec(t,
+		`CREATE TENANT "destination-tenant" FROM REPLICATION OF "source-tenant" ON $1`,
+		"external://replication-source-addr",
 	)
 	streamProducerJobID, ingestionJobID := replicationtestutils.GetStreamJobIds(t, ctx, destSQL, "destination-tenant")
 
@@ -191,7 +197,7 @@ func TestTenantStreamingCreationErrors(t *testing.T) {
 	SrcSysSQL.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 
 	DestSysSQL := sqlutils.MakeSQLRunner(destDB)
-	DestSysSQL.Exec(t, `SET enable_experimental_stream_replication = true`)
+	DestSysSQL.Exec(t, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`)
 
 	// Sink to read data from.
 	srcPgURL, cleanupSink := sqlutils.PGUrl(t, srcServer.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
@@ -203,6 +209,12 @@ func TestTenantStreamingCreationErrors(t *testing.T) {
 	DestSysSQL.Exec(t, "CREATE TENANT \"100\"")
 	DestSysSQL.ExpectErr(t, "pq: tenant with name \"100\" already exists",
 		`CREATE TENANT "100" FROM REPLICATION OF source ON $1`, srcPgURL.String())
+
+	badPgURL := srcPgURL
+	badPgURL.Host = "nonexistent_test_endpoint"
+	DestSysSQL.ExpectErr(t, "pq: failed to construct External Connection details: failed to connect",
+		fmt.Sprintf(`CREATE EXTERNAL CONNECTION "replication-source-addr" AS "%s"`,
+			badPgURL.String()))
 }
 
 func TestCutoverBuiltin(t *testing.T) {
@@ -405,10 +417,10 @@ func TestCutoverFractionProgressed(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingResponseFilter: func(ctx context.Context, ba *roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 					for _, ru := range br.Responses {
 						switch ru.GetInner().(type) {
-						case *roachpb.RevertRangeResponse:
+						case *kvpb.RevertRangeResponse:
 							respRecvd <- struct{}{}
 							<-continueRevert
 						}
@@ -469,6 +481,9 @@ func TestCutoverFractionProgressed(t *testing.T) {
 		return jobs.UpdateHighwaterProgressed(cutover, md, ju)
 	}))
 
+	metrics := registry.MetricsStruct().StreamIngest.(*Metrics)
+	require.Equal(t, int64(0), metrics.ReplicationCutoverProgress.Value())
+
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(func(ctx context.Context) error {
 		defer close(respRecvd)
@@ -491,6 +506,7 @@ func TestCutoverFractionProgressed(t *testing.T) {
 		"0.67": false,
 		"0.83": false,
 	}
+	var expectedRanges int64 = 6
 	g.GoCtx(func(ctx context.Context) error {
 		for {
 			select {
@@ -506,6 +522,14 @@ func TestCutoverFractionProgressed(t *testing.T) {
 				if _, ok := progressMap[s]; !ok {
 					t.Fatalf("unexpected progress fraction %s", s)
 				}
+				// We sometimes see the same progress, which is valid, no need to update
+				// the expected range count.
+				if expectedRanges != metrics.ReplicationCutoverProgress.Value() {
+					// There is progress, which means that another range was reverted,
+					// updated the expected range count.
+					expectedRanges--
+				}
+				require.Equal(t, expectedRanges, metrics.ReplicationCutoverProgress.Value())
 				progressMap[s] = true
 				continueRevert <- struct{}{}
 			}
@@ -514,6 +538,7 @@ func TestCutoverFractionProgressed(t *testing.T) {
 	require.NoError(t, g.Wait())
 	sip := loadProgress()
 	require.Equal(t, sip.GetFractionCompleted(), float32(1))
+	require.Equal(t, int64(0), metrics.ReplicationCutoverProgress.Value())
 
 	// Ensure we have hit all our expected progress fractions.
 	for k, v := range progressMap {

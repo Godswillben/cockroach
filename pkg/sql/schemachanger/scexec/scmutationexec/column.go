@@ -143,7 +143,7 @@ func (i *immediateVisitor) MakePublicColumnWriteOnly(
 	ctx context.Context, op scop.MakePublicColumnWriteOnly,
 ) error {
 	tbl, err := i.checkOutTable(ctx, op.TableID)
-	if err != nil {
+	if err != nil || tbl.Dropped() {
 		return err
 	}
 	for i, col := range tbl.PublicColumns() {
@@ -162,7 +162,7 @@ func (i *immediateVisitor) MakeWriteOnlyColumnDeleteOnly(
 	ctx context.Context, op scop.MakeWriteOnlyColumnDeleteOnly,
 ) error {
 	tbl, err := i.checkOutTable(ctx, op.TableID)
-	if err != nil {
+	if err != nil || tbl.Dropped() {
 		return err
 	}
 	return mutationStateChange(
@@ -237,7 +237,7 @@ func (i *immediateVisitor) AddColumnFamily(ctx context.Context, op scop.AddColum
 
 func (i *immediateVisitor) SetColumnName(ctx context.Context, op scop.SetColumnName) error {
 	tbl, err := i.checkOutTable(ctx, op.TableID)
-	if err != nil {
+	if err != nil || tbl.Dropped() {
 		return err
 	}
 	col, err := catalog.MustFindColumnByID(tbl, op.ColumnID)
@@ -285,7 +285,10 @@ func (i *immediateVisitor) RemoveColumnDefaultExpression(
 	}
 	d := col.ColumnDesc()
 	d.DefaultExpr = nil
-	return updateColumnExprSequenceUsage(d)
+	if err := updateColumnExprSequenceUsage(d); err != nil {
+		return err
+	}
+	return updateColumnExprFunctionsUsage(d)
 }
 
 func (i *immediateVisitor) AddColumnOnUpdateExpression(

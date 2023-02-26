@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -56,6 +58,8 @@ type testClusterCfg struct {
 	numNodes            int
 	setupClusterSetting *settings.BoolSetting
 	queryClusterSetting *settings.BoolSetting
+	setupCapability     tenantcapabilitiespb.TenantCapabilityName
+	queryCapability     tenantcapabilitiespb.TenantCapabilityName
 }
 
 func createTestClusterArgs(numReplicas, numVoters int32) base.TestClusterArgs {
@@ -217,7 +221,8 @@ type testCase struct {
 	desc string
 	// Prereq setup statement(s) that must succeed.
 	setup string
-	// Multiple setup statements required because of https://github.com/cockroachdb/cockroach/issues/90535.
+	// Multiple setup statements required because of
+	// https://github.com/cockroachdb/cockroach/issues/90535.
 	setups []string
 	// Query being tested.
 	query string
@@ -225,14 +230,21 @@ type testCase struct {
 	system tenantExpected
 	// Expected secondary tenant results.
 	secondary tenantExpected
-	// Expected secondary tenant without required cluster setting (not all functions are gated by cluster setting).
+	// Expected secondary tenant without required cluster setting
+	// (not all functions are gated by cluster setting).
 	secondaryWithoutClusterSetting tenantExpected
 	// Expected secondary tenant without required capability.
 	secondaryWithoutCapability tenantExpected
-	// Used for tests that have a cluster setting prereq (eq SPLIT AT is required for UNSPLIT AT).
+	// Used for tests that have a cluster setting prereq
+	// (eq SPLIT AT is required for UNSPLIT AT).
 	setupClusterSetting *settings.BoolSetting
 	// Cluster setting required for secondary tenant query.
 	queryClusterSetting *settings.BoolSetting
+	// Used for tests that have a capability prereq
+	// (eq SPLIT AT is required for UNSPLIT AT).
+	setupCapability tenantcapabilitiespb.TenantCapabilityName
+	// Capability required for secondary tenant query.
+	queryCapability tenantcapabilitiespb.TenantCapabilityName
 }
 
 func (tc testCase) runTest(
@@ -266,9 +278,14 @@ func (tc testCase) runTest(
 	)
 
 	var secondaryTenants []serverutils.TestTenantInterface
-	createSecondaryDB := func(tenantID roachpb.TenantID, skipSQLSystemTentantCheck bool, clusterSettings ...*settings.BoolSetting) *gosql.DB {
+	createSecondaryDB := func(
+		tenantID roachpb.TenantID,
+		skipSQLSystemTentantCheck bool,
+		clusterSettings ...*settings.BoolSetting,
+	) *gosql.DB {
 		testingClusterSettings := cluster.MakeTestingClusterSettings()
 		for _, clusterSetting := range clusterSettings {
+			// Filter out nil cluster settings.
 			if clusterSetting != nil {
 				clusterSetting.Override(ctx, &testingClusterSettings.SV, true)
 			}
@@ -288,26 +305,66 @@ func (tc testCase) runTest(
 		return db
 	}
 
+	var waitForTenantCapabilitiesFns []func()
+	setCapabilities := func(
+		tenantID roachpb.TenantID,
+		capabilities ...tenantcapabilitiespb.TenantCapabilityName,
+	) {
+		// Filter out empty capabilities.
+		var caps []tenantcapabilitiespb.TenantCapabilityName
+		for _, capability := range capabilities {
+			if capability.IsSet() {
+				caps = append(caps, capability)
+			}
+		}
+		capabilities = caps
+		if len(capabilities) > 0 {
+			var builder strings.Builder
+			for i, capability := range capabilities {
+				if i > 0 {
+					builder.WriteString(", ")
+				}
+				builder.WriteString(capability.String())
+			}
+			query := fmt.Sprintf("ALTER TENANT [$1] GRANT CAPABILITY %s", builder.String())
+			_, err := systemDB.ExecContext(ctx, query, tenantID.ToUint64())
+			require.NoError(t, err, query)
+			waitForTenantCapabilitiesFns = append(waitForTenantCapabilitiesFns, func() {
+				testCluster.WaitForTenantCapabilities(t, tenantID, capabilities...)
+			})
+		}
+	}
+
+	tenantID1 := serverutils.TestTenantID()
 	secondaryDB := createSecondaryDB(
-		serverutils.TestTenantID(),
+		tenantID1,
 		true, /* skipSQLSystemTentantCheck */
 		cfg.setupClusterSetting,
 		cfg.queryClusterSetting,
 	)
+	setCapabilities(tenantID1, cfg.setupCapability, cfg.queryCapability)
 
+	tenantID2 := serverutils.TestTenantID2()
 	secondaryWithoutClusterSettingDB := createSecondaryDB(
-		serverutils.TestTenantID2(),
+		tenantID2,
 		false, /* skipSQLSystemTentantCheck */
 		cfg.setupClusterSetting,
-		nil, /* clusterSettings */
 	)
+	setCapabilities(tenantID2, cfg.setupCapability)
 
+	tenantID3 := serverutils.TestTenantID3()
 	secondaryWithoutCapabilityDB := createSecondaryDB(
-		serverutils.TestTenantID3(),
+		tenantID3,
 		false, /* skipSQLSystemTentantCheck */
 		cfg.setupClusterSetting,
 		cfg.queryClusterSetting,
 	)
+	setCapabilities(tenantID3, cfg.setupCapability)
+
+	// Wait for cluster settings to propagate async.
+	for _, fn := range waitForTenantCapabilitiesFns {
+		fn()
+	}
 
 	// Wait for splits after starting all tenants to make test start up faster.
 	for _, tenant := range secondaryTenants {
@@ -405,7 +462,11 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 			secondaryWithoutClusterSetting: tenantExpected{
 				errorMessage: "tenant cluster setting sql.split_at.allow_for_secondary_tenant.enabled disabled",
 			},
+			secondaryWithoutCapability: tenantExpected{
+				errorMessage: `does not have admin split capability`,
+			},
 			queryClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			queryCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc:  "ALTER INDEX x SPLIT AT",
@@ -420,7 +481,11 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 			secondaryWithoutClusterSetting: tenantExpected{
 				errorMessage: "tenant cluster setting sql.split_at.allow_for_secondary_tenant.enabled disabled",
 			},
+			secondaryWithoutCapability: tenantExpected{
+				errorMessage: `does not have admin split capability`,
+			},
 			queryClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			queryCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc:  "ALTER TABLE x UNSPLIT AT",
@@ -436,6 +501,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 				errorMessage: errorutil.UnsupportedWithMultiTenancyMessage,
 			},
 			setupClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			setupCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc: "ALTER INDEX x UNSPLIT AT",
@@ -454,6 +520,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 				errorMessage: errorutil.UnsupportedWithMultiTenancyMessage,
 			},
 			setupClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			setupCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc:  "ALTER TABLE x UNSPLIT ALL",
@@ -469,6 +536,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 				errorMessage: errorutil.UnsupportedWithMultiTenancyMessage,
 			},
 			setupClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			setupCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc: "ALTER INDEX x UNSPLIT ALL",
@@ -487,6 +555,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 				errorMessage: errorutil.UnsupportedWithMultiTenancyMessage,
 			},
 			setupClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+			setupCapability:     tenantcapabilitiespb.CanAdminSplit,
 		},
 		{
 			desc:  "ALTER TABLE x SCATTER",
@@ -527,6 +596,8 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 					return testClusterCfg{
 						setupClusterSetting: tc.setupClusterSetting,
 						queryClusterSetting: tc.queryClusterSetting,
+						setupCapability:     tc.setupCapability,
+						queryCapability:     tc.queryCapability,
 					}
 				},
 				func(testCluster serverutils.TestClusterInterface, db *gosql.DB, tenant string, expected tenantExpected) {
@@ -549,7 +620,8 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 	}
 }
 
-// TestTruncateTable tests that range splits are retained after a table is truncated.
+// TestTruncateTable tests that range splits are retained after a table is
+// truncated.
 func TestTruncateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -579,7 +651,17 @@ func TestTruncateTable(t *testing.T) {
 		t,
 		func() testClusterCfg {
 			return testClusterCfg{
+				TestClusterArgs: base.TestClusterArgs{
+					ServerArgs: base.TestServerArgs{
+						Knobs: base.TestingKnobs{
+							TenantCapabilitiesTestingKnobs: &tenantcapabilities.TestingKnobs{
+								AuthorizerSkipAdminSplitCapabilityChecks: true,
+							},
+						},
+					},
+				},
 				setupClusterSetting: sql.SecondaryTenantSplitAtEnabled,
+				setupCapability:     tenantcapabilitiespb.CanAdminSplit,
 			}
 		},
 		func(_ serverutils.TestClusterInterface, db *gosql.DB, tenant string, expected tenantExpected) {

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -684,6 +685,9 @@ func TestTenantStreamingMultipleNodes(t *testing.T) {
 			clientAddresses[addr] = struct{}{}
 		},
 	}
+	args.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
+		AuthorizerSkipAdminSplitCapabilityChecks: true,
+	}
 
 	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
 	defer cleanup()
@@ -937,7 +941,9 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 	require.Equal(t, "replicating", status)
 	require.Equal(t, "none", serviceMode)
 	require.Equal(t, "source", source)
-	require.Equal(t, c.SrcURL.String(), sourceUri)
+	expectedURI, err := redactSourceURI(c.SrcURL.String())
+	require.NoError(t, err)
+	require.Equal(t, expectedURI, sourceUri)
 	require.Equal(t, ingestionJobID, jobId)
 	require.Less(t, maxReplTime, timeutil.Now())
 	require.Less(t, protectedTime, timeutil.Now())

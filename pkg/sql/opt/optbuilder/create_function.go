@@ -12,6 +12,7 @@ package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
@@ -32,9 +33,6 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 		if string(cf.FuncName.CatalogName) != b.evalCtx.SessionData().Database {
 			panic(unimplemented.New("CREATE FUNCTION", "cross-db references not supported"))
 		}
-	}
-	if cf.ReturnType.IsSet {
-		panic(unimplemented.NewWithIssue(86391, "user-defined functions with SETOF return types are not supported"))
 	}
 
 	sch, resName := b.resolveSchemaForCreateFunction(&cf.FuncName)
@@ -81,6 +79,10 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 			funcBodyStr = string(opt)
 		case tree.FunctionLanguage:
 			languageFound = true
+			// Check the language here, before attempting to parse the function body.
+			if _, err := funcdesc.FunctionLangToProto(opt); err != nil {
+				panic(err)
+			}
 		}
 	}
 
@@ -133,10 +135,18 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 		panic(err)
 	}
 
+	targetVolatility := tree.GetFuncVolatility(cf.Options)
 	// Validate each statement and collect the dependencies.
 	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
 	for i, stmt := range stmts {
-		stmtScope := b.buildStmt(stmts[i].AST, nil /* desiredTypes */, bodyScope)
+		var stmtScope *scope
+		// We need to disable stable function folding because we want to catch the
+		// volatility of stable functions. If folded, we only get a scalar and lose
+		// the volatility.
+		b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+			stmtScope = b.buildStmt(stmts[i].AST, nil /* desiredTypes */, bodyScope)
+		})
+		checkStmtVolatility(targetVolatility, stmtScope, stmt.AST)
 
 		// Format the statements with qualified datasource names.
 		formatFuncBodyStmt(fmtCtx, stmt.AST, i > 0 /* newLine */)
@@ -155,9 +165,20 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateFunction, inScope *scope) (
 
 		deps = append(deps, b.schemaDeps...)
 		typeDeps.UnionWith(b.schemaTypeDeps)
+		// Add statement ast into CreateFunction node for logging purpose.
+		cf.BodyStatements = append(cf.BodyStatements, stmt.AST)
 		// Reset the tracked dependencies for next statement.
 		b.schemaDeps = nil
 		b.schemaTypeDeps = intsets.Fast{}
+	}
+
+	if targetVolatility == tree.FunctionImmutable && len(deps) > 0 {
+		panic(
+			pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"referencing relations is not allowed in immutable function",
+			),
+		)
 	}
 
 	// Override the function body so that references are fully qualified.
@@ -191,6 +212,10 @@ func formatFuncBodyStmt(fmtCtx *tree.FmtCtx, ast tree.Statement, newLine bool) {
 func validateReturnType(expected *types.T, cols []scopeColumn) error {
 	// If return type is void, any column types are valid.
 	if expected.Equivalent(types.Void) {
+		return nil
+	}
+	// If return type is RECORD, any column types are valid.
+	if types.IsRecordType(expected) {
 		return nil
 	}
 
@@ -269,4 +294,22 @@ func validateReturnType(expected *types.T, cols []scopeColumn) error {
 	}
 
 	return nil
+}
+
+func checkStmtVolatility(
+	expectedVolatility tree.FunctionVolatility, stmtScope *scope, stmt tree.Statement,
+) {
+	switch expectedVolatility {
+	case tree.FunctionImmutable:
+		if stmtScope.expr.Relational().VolatilitySet.HasVolatile() {
+			panic(pgerror.Newf(pgcode.InvalidParameterValue, "volatile statement not allowed in immutable function: %s", stmt.String()))
+		}
+		if stmtScope.expr.Relational().VolatilitySet.HasStable() {
+			panic(pgerror.Newf(pgcode.InvalidParameterValue, "stable statement not allowed in immutable function: %s", stmt.String()))
+		}
+	case tree.FunctionStable:
+		if stmtScope.expr.Relational().VolatilitySet.HasVolatile() {
+			panic(pgerror.Newf(pgcode.InvalidParameterValue, "volatile statement not allowed in stable function: %s", stmt.String()))
+		}
+	}
 }

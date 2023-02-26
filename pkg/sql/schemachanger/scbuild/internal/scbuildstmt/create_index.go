@@ -346,10 +346,10 @@ func processColNodeType(
 			// we're going to inverted index.
 			switch columnNode.OpClass {
 			case "gin_trgm_ops", "gist_trgm_ops":
-				if !b.EvalCtx().Settings.Version.IsActive(b, clusterversion.V22_2TrigramInvertedIndexes) {
+				if !b.EvalCtx().Settings.Version.IsActive(b, clusterversion.TODODelete_V22_2TrigramInvertedIndexes) {
 					panic(pgerror.Newf(pgcode.FeatureNotSupported,
 						"version %v must be finalized to create trigram inverted indexes",
-						clusterversion.ByKey(clusterversion.V22_2TrigramInvertedIndexes)))
+						clusterversion.ByKey(clusterversion.TODODelete_V22_2TrigramInvertedIndexes)))
 				}
 			case "":
 				panic(errors.WithHint(
@@ -930,11 +930,7 @@ func maybeAddIndexPredicate(b BuildCtx, n *tree.CreateIndex, idxSpec *indexSpec)
 		return
 	}
 	expr := b.PartialIndexPredicateExpression(idxSpec.secondary.TableID, n.Predicate)
-	idxSpec.partial = &scpb.SecondaryIndexPartial{
-		TableID:    idxSpec.secondary.TableID,
-		IndexID:    idxSpec.secondary.IndexID,
-		Expression: *expr,
-	}
+	idxSpec.secondary.EmbeddedExpr = expr
 	b.IncrementSchemaChangeIndexCounter("partial")
 	if n.Inverted {
 		b.IncrementSchemaChangeIndexCounter("partial_inverted")

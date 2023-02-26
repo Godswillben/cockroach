@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/errors"
 )
 
 func (i *immediateVisitor) RemoveSchemaParent(
@@ -69,9 +70,32 @@ func (i *immediateVisitor) RemoveForeignKeyBackReference(
 	ctx context.Context, op scop.RemoveForeignKeyBackReference,
 ) error {
 	in, err := i.checkOutTable(ctx, op.ReferencedTableID)
-	if err != nil || in.Dropped() {
+	if err != nil {
 		// Exit early if the foreign key back-reference holder is getting dropped.
 		return err
+	}
+	// Retrieve foreign key name in origin table to identify it in the referenced
+	// table.
+	var name string
+	{
+		out, err := i.getDescriptor(ctx, op.OriginTableID)
+		if err != nil {
+			return err
+		}
+		tbl, err := catalog.AsTableDescriptor(out)
+		if err != nil {
+			return err
+		}
+		for _, fk := range tbl.OutboundForeignKeys() {
+			if fk.GetConstraintID() == op.OriginConstraintID {
+				name = fk.GetName()
+				break
+			}
+		}
+		if name == "" {
+			return errors.AssertionFailedf("foreign key with ID %d not found in origin table %q (%d)",
+				op.OriginConstraintID, out.GetName(), out.GetID())
+		}
 	}
 	// Attempt to remove back reference.
 	// Note how we
@@ -83,7 +107,7 @@ func (i *immediateVisitor) RemoveForeignKeyBackReference(
 	//  this is because if we roll back before the adding FK is published in `out`,
 	//  such a back-reference won't exist in `in` yet.
 	for idx, fk := range in.InboundFKs {
-		if fk.OriginTableID == op.OriginTableID && fk.ConstraintID == op.OriginConstraintID {
+		if fk.OriginTableID == op.OriginTableID && fk.Name == name {
 			in.InboundFKs = append(in.InboundFKs[:idx], in.InboundFKs[idx+1:]...)
 			if len(in.InboundFKs) == 0 {
 				in.InboundFKs = nil
@@ -177,7 +201,7 @@ func (i *immediateVisitor) UpdateTypeBackReferencesInTypes(
 	var forwardRefs catalog.DescriptorIDSet
 	if desc, err := i.getDescriptor(ctx, op.BackReferencedTypeID); err != nil {
 		return err
-	} else if !desc.Dropped() {
+	} else {
 		typ, err := catalog.AsTypeDescriptor(desc)
 		if err != nil {
 			return err
@@ -225,6 +249,62 @@ func (i *immediateVisitor) UpdateTableBackReferencesInSequences(
 		); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (i *immediateVisitor) AddTableConstraintBackReferencesInFunctions(
+	ctx context.Context, op scop.AddTableConstraintBackReferencesInFunctions,
+) error {
+	for _, fnID := range op.FunctionIDs {
+		fnDesc, err := i.checkOutFunction(ctx, fnID)
+		if err != nil {
+			return err
+		}
+		if err := fnDesc.AddConstraintReference(op.BackReferencedTableID, op.BackReferencedConstraintID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (i *immediateVisitor) RemoveTableConstraintBackReferencesFromFunctions(
+	ctx context.Context, op scop.RemoveTableConstraintBackReferencesFromFunctions,
+) error {
+	for _, fnID := range op.FunctionIDs {
+		fnDesc, err := i.checkOutFunction(ctx, fnID)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveConstraintReference(op.BackReferencedTableID, op.BackReferencedConstraintID)
+	}
+	return nil
+}
+
+func (i *immediateVisitor) RemoveTableColumnBackReferencesInFunctions(
+	ctx context.Context, op scop.RemoveTableColumnBackReferencesInFunctions,
+) error {
+	tblDesc, err := i.checkOutTable(ctx, op.BackReferencedTableID)
+	if err != nil {
+		return err
+	}
+	var fnIDsInUse catalog.DescriptorIDSet
+	if !tblDesc.Dropped() {
+		// If table is dropped then there is no functions in use.
+		fnIDsInUse, err = tblDesc.GetAllReferencedFunctionIDsInColumnExprs(op.BackReferencedColumnID)
+		if err != nil {
+			return err
+		}
+	}
+	for _, id := range op.FunctionIDs {
+		if fnIDsInUse.Contains(id) {
+			continue
+		}
+		fnDesc, err := i.checkOutFunction(ctx, id)
+		if err != nil {
+			return err
+		}
+		fnDesc.RemoveColumnReference(op.BackReferencedTableID, op.BackReferencedColumnID)
 	}
 	return nil
 }

@@ -11,10 +11,12 @@
 package funcdesc
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 // VolatilityToProto converts sql statement input volatility to protobuf
@@ -54,9 +56,11 @@ func FunctionLangToProto(v tree.FunctionLanguage) (catpb.Function_Language, erro
 	switch v {
 	case tree.FunctionLangSQL:
 		return catpb.Function_SQL, nil
+	case tree.FunctionLangPlPgSQL:
+		return -1, unimplemented.NewWithIssue(91569, "PL/pgSQL is not yet supported")
 	}
 
-	return -1, pgerror.Newf(pgcode.InvalidParameterValue, "Unknown function language %q", v)
+	return -1, pgerror.Newf(pgcode.UndefinedObject, "language %q does not exist", v)
 }
 
 // ParamClassToProto converts sql statement input argument class to protobuf
@@ -74,4 +78,28 @@ func ParamClassToProto(v tree.FuncParamClass) (catpb.Function_Param_Class, error
 	}
 
 	return -1, pgerror.Newf(pgcode.InvalidParameterValue, "unknown function parameter class %q", v)
+}
+
+var schemaExprContextAllowingUDF = map[tree.SchemaExprContext]clusterversion.Key{
+	tree.CheckConstraintExpr:           clusterversion.V23_1,
+	tree.ColumnDefaultExprInNewTable:   clusterversion.V23_1,
+	tree.ColumnDefaultExprInSetDefault: clusterversion.V23_1,
+}
+
+// MaybeFailOnUDFUsage returns an error if the given expression or any
+// sub-expression used a UDF unless it's explicitly listed as an allowed use
+// case.
+// TODO(chengxiong): remove this function when we start allowing UDF references.
+func MaybeFailOnUDFUsage(
+	expr tree.TypedExpr, exprContext tree.SchemaExprContext, version clusterversion.ClusterVersion,
+) error {
+	if supportedVersion, ok := schemaExprContextAllowingUDF[exprContext]; ok && version.IsActive(supportedVersion) {
+		return nil
+	}
+	visitor := &tree.UDFDisallowanceVisitor{}
+	tree.WalkExpr(visitor, expr)
+	if visitor.FoundUDF {
+		return unimplemented.NewWithIssue(83234, "usage of user-defined function from relations not supported")
+	}
+	return nil
 }

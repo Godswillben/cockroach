@@ -90,10 +90,12 @@ const (
 	OptSchemaChangePolicy       = `schema_change_policy`
 	OptSplitColumnFamilies      = `split_column_families`
 	OptProtectDataFromGCOnPause = `protect_data_from_gc_on_pause`
+	OptExpirePTSAfter           = `gc_protect_expires_after`
 	OptWebhookAuthHeader        = `webhook_auth_header`
 	OptWebhookClientTimeout     = `webhook_client_timeout`
 	OptOnError                  = `on_error`
 	OptMetricsScope             = `metrics_label`
+	OptUnordered                = `unordered`
 	OptVirtualColumns           = `virtual_columns`
 
 	OptVirtualColumnsOmitted VirtualColumnVisibility = `omitted`
@@ -319,12 +321,14 @@ var ChangefeedOptionExpectValues = map[string]OptionPermittedValues{
 	OptNoInitialScan:            flagOption,
 	OptInitialScanOnly:          flagOption,
 	OptProtectDataFromGCOnPause: flagOption,
+	OptExpirePTSAfter:           durationOption.thatCanBeZero(),
 	OptKafkaSinkConfig:          jsonOption,
 	OptWebhookSinkConfig:        jsonOption,
 	OptWebhookAuthHeader:        stringOption,
 	OptWebhookClientTimeout:     durationOption,
 	OptOnError:                  enum("pause", "fail"),
 	OptMetricsScope:             stringOption,
+	OptUnordered:                flagOption,
 	OptVirtualColumns:           enum("omitted", "null"),
 }
 
@@ -336,8 +340,8 @@ var CommonOptions = makeStringSet(OptCursor, OptEndTime, OptEnvelope,
 	OptMVCCTimestamps, OptDiff, OptSplitColumnFamilies,
 	OptSchemaChangeEvents, OptSchemaChangePolicy,
 	OptProtectDataFromGCOnPause, OptOnError,
-	OptInitialScan, OptNoInitialScan, OptInitialScanOnly,
-	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics)
+	OptInitialScan, OptNoInitialScan, OptInitialScanOnly, OptUnordered,
+	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics, OptExpirePTSAfter)
 
 // SQLValidOptions is options exclusive to SQL sink
 var SQLValidOptions map[string]struct{} = nil
@@ -435,6 +439,25 @@ var AlterChangefeedTargetOptions = map[string]OptionPermittedValues{
 	OptInitialScan:   enum("yes", "no", "only").orEmptyMeans("yes"),
 	OptNoInitialScan: flagOption,
 }
+
+type incompatibleOptions struct {
+	opt1   string
+	opt2   string
+	reason string
+}
+
+func makeInvertedIndex(pairs []incompatibleOptions) map[string][]incompatibleOptions {
+	m := make(map[string][]incompatibleOptions, len(pairs)*2)
+	for _, p := range pairs {
+		m[p.opt1] = append(m[p.opt1], p)
+		m[p.opt2] = append(m[p.opt2], p)
+	}
+	return m
+}
+
+var incompatibleOptionsMap = makeInvertedIndex([]incompatibleOptions{
+	{opt1: OptUnordered, opt2: OptResolvedTimestamps, reason: `resolved timestamps cannot be guaranteed to be correct in unordered mode`},
+})
 
 // MakeStatementOptions wraps and canonicalizes the options we get
 // from TypeAsStringOpts or the job record.
@@ -862,6 +885,19 @@ func (s StatementOptions) GetMinCheckpointFrequency() (*time.Duration, error) {
 	return s.getDurationValue(OptMinCheckpointFrequency)
 }
 
+// GetPTSExpiration returns the maximum age of the protected timestamp record.
+// Changefeeds that fail to update their records in time will be canceled.
+func (s StatementOptions) GetPTSExpiration() (time.Duration, error) {
+	exp, err := s.getDurationValue(OptExpirePTSAfter)
+	if err != nil {
+		return 0, err
+	}
+	if exp == nil {
+		return 0, nil
+	}
+	return *exp, nil
+}
+
 // ForceKeyInValue sets the encoding option KeyInValue to true and then validates the
 // resoluting encoding options.
 func (s StatementOptions) ForceKeyInValue() error {
@@ -979,6 +1015,13 @@ func (s StatementOptions) ValidateForCreateChangefeed(isPredicateChangefeed bool
 		} else {
 			if err := validateInitialScanUnsupportedOptions(string(OptFormatParquet)); err != nil {
 				return err
+			}
+		}
+	}
+	for o := range s.m {
+		for _, pair := range incompatibleOptionsMap[o] {
+			if s.IsSet(pair.opt1) && s.IsSet(pair.opt2) {
+				return errors.Newf(`%s is not usable with %s because %s`, pair.opt1, pair.opt2, pair.reason)
 			}
 		}
 	}

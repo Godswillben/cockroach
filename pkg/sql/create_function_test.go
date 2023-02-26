@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -60,7 +61,7 @@ CREATE TYPE notmyworkday AS ENUM ('Monday', 'Tuesday');
 	)
 
 	tDB.Exec(t, `
-CREATE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE FUNCTION f(a notmyworkday) RETURNS INT VOLATILE LANGUAGE SQL AS $$
   SELECT a FROM t;
   SELECT b FROM t@t_idx_b;
   SELECT c FROM t@t_idx_c;
@@ -155,12 +156,14 @@ SELECT nextval(105:::REGCLASS);`,
 func TestGatingCreateFunction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	skip.WithIssue(t, 95530, "bump minBinary to 22.2. Skip 22.2 mixed-version tests for future cleanup")
+
 	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
 		params, _ := tests.CreateTestServerParams()
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_2SchemaChangeSupportsCreateFunction),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.TODODelete_V22_2SchemaChangeSupportsCreateFunction),
 		}
 
 		s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -175,7 +178,7 @@ func TestGatingCreateFunction(t *testing.T) {
 		// Override binary version to be older.
 		params.Knobs.Server = &server.TestingKnobs{
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_2SchemaChangeSupportsCreateFunction - 1),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.TODODelete_V22_2SchemaChangeSupportsCreateFunction - 1),
 		}
 
 		s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -184,6 +187,96 @@ func TestGatingCreateFunction(t *testing.T) {
 		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
 		require.Error(t, err)
 		require.Equal(t, "pq: cannot run CREATE FUNCTION before system is fully upgraded to v22.2", err.Error())
+	})
+}
+
+func TestVersionGatingUDFInCheckConstraints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE TABLE t(a INT CHECK (f() > 0));`)
+		require.NoError(t, err)
+	})
+
+	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1 - 1),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		// Need to turn new schema changer off, because function related rules are
+		// only valid in 23.1.
+		_, err := sqlDB.Exec(`SET use_declarative_schema_changer = 'off'`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE TABLE t(a INT CHECK (f() > 0));`)
+		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
+	})
+}
+
+func TestVersionGatingUDFInColumnDefault(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE TABLE t(a INT DEFAULT f());`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`ALTER TABLE t ALTER COLUMN a SET DEFAULT (f() + 1)`)
+		require.NoError(t, err)
+	})
+
+	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
+		params, _ := tests.CreateTestServerParams()
+		// Override binary version to be older.
+		params.Knobs.Server = &server.TestingKnobs{
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1 - 1),
+		}
+
+		s, sqlDB, _ := serverutils.StartServer(t, params)
+		defer s.Stopper().Stop(context.Background())
+
+		// Need to turn new schema changer off, because function related rules are
+		// only valid in 23.1.
+		_, err := sqlDB.Exec(`SET use_declarative_schema_changer = 'off'`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`CREATE TABLE t(a INT DEFAULT f());`)
+		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
+		_, err = sqlDB.Exec(`CREATE TABLE t(a INT);`)
+		require.NoError(t, err)
+		_, err = sqlDB.Exec(`ALTER TABLE t ALTER COLUMN a SET DEFAULT (f() + 1)`)
+		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
 	})
 }
 
@@ -248,7 +341,7 @@ CREATE SEQUENCE sq2;
 CREATE VIEW v1 AS SELECT 1;
 CREATE VIEW v2 AS SELECT 2;
 CREATE TYPE notmyworkday AS ENUM ('Monday', 'Tuesday');
-CREATE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE FUNCTION f(a notmyworkday) RETURNS INT VOLATILE LANGUAGE SQL AS $$
   SELECT b FROM t1@t1_idx_b;
   SELECT a FROM v1;
   SELECT nextval('sq1');
@@ -292,7 +385,7 @@ SELECT nextval(106:::REGCLASS);`,
 	// Replace the function body with another group of objects and make sure
 	// references are modified correctly.
 	tDB.Exec(t, `
-CREATE OR REPLACE FUNCTION f(a notmyworkday) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$
+CREATE OR REPLACE FUNCTION f(a notmyworkday) RETURNS INT VOLATILE LANGUAGE SQL AS $$
   SELECT b FROM t2@t2_idx_b;
   SELECT a FROM v2;
   SELECT nextval('sq2');

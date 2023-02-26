@@ -1441,11 +1441,15 @@ func init() {
 	f.BoolVar(&debugRecoverPlanOpts.force, "force", false,
 		"force creation of plan even when problems were encountered; applying this plan may "+
 			"result in additional problems and should be done only with care and as a last resort")
+	f.UintVar(&formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Name,
+		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
 
 	f = debugRecoverExecuteCmd.Flags()
 	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
 	f.VarP(&debugRecoverExecuteOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
 		cliflags.ConfirmActions.Usage())
+	f.UintVar(&formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Name,
+		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
 
 	f = debugMergeLogsCmd.Flags()
 	f.Var(flagutil.Time(&debugMergeLogsOpts.from), "from",
@@ -1532,17 +1536,14 @@ func pebbleCryptoInitializer() error {
 		}
 	}
 
-	cfg := storage.PebbleConfig{
-		StorageConfig: storageConfig,
-		Opts:          storage.DefaultPebbleOptions(),
-	}
-
-	// This has the side effect of storing the encrypted FS into cfg.Opts.FS.
-	_, _, err := storage.ResolveEncryptedEnvOptions(&cfg)
+	_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(&storageConfig, vfs.Default, false /* readOnly */)
 	if err != nil {
 		return err
 	}
-
-	pebbleToolFS.set(cfg.Opts.FS)
+	if encryptedEnv != nil {
+		pebbleToolFS.set(encryptedEnv.FS)
+	} else {
+		pebbleToolFS.set(vfs.Default)
+	}
 	return nil
 }

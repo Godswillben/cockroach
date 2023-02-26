@@ -157,7 +157,7 @@ upsert descriptor #105
   +    relevantStatements:
   +    - statement:
   +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  +          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT 1;$$"
+  +          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
   +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
   +          1 $$"
   +        statementTag: CREATE FUNCTION
@@ -419,7 +419,7 @@ begin transaction #9
 validate forward indexes [2] in table #104
 commit transaction #9
 begin transaction #10
-## PostCommitNonRevertiblePhase stage 1 of 2 with 7 MutationType ops
+## PostCommitNonRevertiblePhase stage 1 of 2 with 9 MutationType ops
 upsert descriptor #104
   ...
            statementTag: CREATE INDEX
@@ -583,7 +583,7 @@ upsert descriptor #105
   -    relevantStatements:
   -    - statement:
   -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  -          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT 1;$$"
+  -          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
   -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
   -          1 $$"
   -        statementTag: CREATE FUNCTION

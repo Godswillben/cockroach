@@ -60,6 +60,11 @@ export type SqlExecutionErrorMessage = {
   source: { file: string; line: number; function: "string" };
 };
 
+export type SqlApiResponse<ResultType> = {
+  maxSizeReached: boolean;
+  results: ResultType;
+};
+
 export const SQL_API_PATH = "/api/v2/sql/";
 
 /**
@@ -129,8 +134,8 @@ const UPGRADE_RELATED_ERRORS = [
   /column "(.*)" does not exist/i,
 ];
 
-function isUpgradeError(message: string): boolean {
-  return UPGRADE_RELATED_ERRORS.some(err => message.search(err));
+export function isUpgradeError(message: string): boolean {
+  return UPGRADE_RELATED_ERRORS.some(err => message.search(err) !== -1);
 }
 
 /**
@@ -148,13 +153,39 @@ function isUpgradeError(message: string): boolean {
  * @param message
  */
 export function sqlApiErrorMessage(message: string): string {
+  if (isUpgradeError(message)) {
+    return "This page may not be available during an upgrade.";
+  }
+
   message = message.replace("run-query-via-api: ", "");
   if (message.includes(":")) {
     return message.split(":")[1];
   }
-  if (isUpgradeError(message)) {
-    message = "This page may not be available during an upgrade.";
-  }
 
   return message;
+}
+
+export function isMaxSizeError(message: string): boolean {
+  return !!message?.includes("max result size exceeded");
+}
+
+export function formatApiResult(
+  results: Array<any>,
+  error: SqlExecutionErrorMessage,
+  errorMessageContext: string,
+): SqlApiResponse<any> {
+  const maxSizeError = isMaxSizeError(error?.message);
+
+  if (error && !maxSizeError) {
+    throw new Error(
+      `Error while ${errorMessageContext}: ${sqlApiErrorMessage(
+        error?.message,
+      )}`,
+    );
+  }
+
+  return {
+    maxSizeReached: maxSizeError,
+    results: results,
+  };
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -97,7 +98,7 @@ type Connector struct {
 
 // client represents an RPC client that proxies to a KV instance.
 type client struct {
-	roachpb.InternalClient
+	kvpb.InternalClient
 	serverpb.StatusClient
 	serverpb.AdminClient
 	tspb.TimeSeriesClient
@@ -230,7 +231,7 @@ func (c *Connector) runGossipSubscription(ctx context.Context, startupCh chan st
 		if err != nil {
 			continue
 		}
-		stream, err := client.GossipSubscription(ctx, &roachpb.GossipSubscriptionRequest{
+		stream, err := client.GossipSubscription(ctx, &kvpb.GossipSubscriptionRequest{
 			Patterns: gossipSubsPatterns,
 		})
 		if err != nil {
@@ -436,7 +437,7 @@ func (c *Connector) RangeLookup(
 		if err != nil {
 			continue
 		}
-		resp, err := client.RangeLookup(ctx, &roachpb.RangeLookupRequest{
+		resp, err := client.RangeLookup(ctx, &kvpb.RangeLookupRequest{
 			Key: key,
 			// See the comment on (*kvcoord.DistSender).RangeLookup or kv.RangeLookup
 			// for more discussion on the choice of ReadConsistency and its
@@ -461,15 +462,15 @@ func (c *Connector) RangeLookup(
 		}
 		return resp.Descriptors, resp.PrefetchedDescriptors, nil
 	}
-	return nil, nil, ctx.Err()
+	return nil, nil, errors.Wrap(ctx.Err(), "range lookup")
 }
 
-// NodesUI implements the serverpb.TenantStatusServer interface
-func (c *Connector) NodesUI(
+// Nodes implements the serverpb.TenantStatusServer interface
+func (c *Connector) Nodes(
 	ctx context.Context, req *serverpb.NodesRequest,
-) (resp *serverpb.NodesResponseExternal, retErr error) {
+) (resp *serverpb.NodesResponse, retErr error) {
 	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
-		resp, err = client.NodesUI(ctx, req)
+		resp, err = client.Nodes(ctx, req)
 		return
 	})
 	return
@@ -513,7 +514,7 @@ func (c *Connector) NewIterator(
 		if err != nil {
 			continue
 		}
-		stream, err := client.GetRangeDescriptors(ctx, &roachpb.GetRangeDescriptorsRequest{
+		stream, err := client.GetRangeDescriptors(ctx, &kvpb.GetRangeDescriptorsRequest{
 			Span: span,
 		})
 		if err != nil {
@@ -544,13 +545,13 @@ func (c *Connector) NewIterator(
 			rangeDescriptors = append(rangeDescriptors, e.RangeDescriptors...)
 		}
 	}
-	return nil, ctx.Err()
+	return nil, errors.Wrap(ctx.Err(), "new iterator")
 }
 
 // TokenBucket implements the kvtenant.TokenBucketProvider interface.
 func (c *Connector) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest,
-) (*roachpb.TokenBucketResponse, error) {
+	ctx context.Context, in *kvpb.TokenBucketRequest,
+) (*kvpb.TokenBucketResponse, error) {
 	// Proxy token bucket requests through the Internal service.
 	ctx = c.AnnotateCtx(ctx)
 	for ctx.Err() == nil {
@@ -575,7 +576,7 @@ func (c *Connector) TokenBucket(
 		}
 		return resp, nil
 	}
-	return nil, ctx.Err()
+	return nil, errors.Wrap(ctx.Err(), "token bucket")
 }
 
 // GetSpanConfigRecords implements the spanconfig.KVAccessor interface.
@@ -587,7 +588,7 @@ func (c *Connector) GetSpanConfigRecords(
 			Targets: spanconfig.TargetsToProtos(targets),
 		})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "get span configs error")
 		}
 
 		records, err = spanconfig.EntriesToRecords(resp.SpanConfigEntries)
@@ -617,7 +618,7 @@ func (c *Connector) UpdateSpanConfigRecords(
 			MaxCommitTimestamp: maxCommitTS,
 		})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "update span configs error")
 		}
 		if resp.Error.IsSet() {
 			// Logical error; propagate as such.
@@ -648,6 +649,22 @@ func (c *Connector) SpanConfigConformance(
 	return report, nil
 }
 
+// SpanStats implements the serverpb.TenantStatusServer interface.
+func (c *Connector) SpanStats(
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
+	var response *roachpb.SpanStatsResponse
+	err := c.withClient(ctx, func(ctx context.Context, c *client) error {
+		stats, err := c.SpanStats(ctx, req)
+		if err != nil {
+			return err
+		}
+		response = stats
+		return nil
+	})
+	return response, err
+}
+
 // GetAllSystemSpanConfigsThatApply implements the spanconfig.KVAccessor
 // interface.
 func (c *Connector) GetAllSystemSpanConfigsThatApply(
@@ -655,13 +672,12 @@ func (c *Connector) GetAllSystemSpanConfigsThatApply(
 ) ([]roachpb.SpanConfig, error) {
 	var spanConfigs []roachpb.SpanConfig
 	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
 		resp, err := c.GetAllSystemSpanConfigsThatApply(
 			ctx, &roachpb.GetAllSystemSpanConfigsThatApplyRequest{
 				TenantID: id,
 			})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "get all system span configs that apply error")
 		}
 
 		spanConfigs = resp.SpanConfigs
@@ -713,7 +729,7 @@ func (c *Connector) withClient(
 		}
 		return f(ctx, c)
 	}
-	return ctx.Err()
+	return errors.Wrap(ctx.Err(), "with client")
 }
 
 // getClient returns the singleton InternalClient if one is currently active. If
@@ -771,14 +787,14 @@ func (c *Connector) dialAddrs(ctx context.Context) (*client, error) {
 				continue
 			}
 			return &client{
-				InternalClient:   roachpb.NewInternalClient(conn),
+				InternalClient:   kvpb.NewInternalClient(conn),
 				StatusClient:     serverpb.NewStatusClient(conn),
 				AdminClient:      serverpb.NewAdminClient(conn),
 				TimeSeriesClient: tspb.NewTimeSeriesClient(conn),
 			}, nil
 		}
 	}
-	return nil, ctx.Err()
+	return nil, errors.Wrap(ctx.Err(), "dial addrs")
 }
 
 func (c *Connector) dialAddr(ctx context.Context, addr string) (conn *grpc.ClientConn, err error) {
@@ -792,7 +808,7 @@ func (c *Connector) dialAddr(ctx context.Context, addr string) (conn *grpc.Clien
 	return conn, err
 }
 
-func (c *Connector) tryForgetClient(ctx context.Context, client roachpb.InternalClient) {
+func (c *Connector) tryForgetClient(ctx context.Context, client kvpb.InternalClient) {
 	if ctx.Err() != nil {
 		// Error (may be) due to context. Don't forget client.
 		return

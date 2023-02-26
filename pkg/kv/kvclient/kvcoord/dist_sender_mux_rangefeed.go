@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
 
@@ -31,7 +33,7 @@ import (
 // each range feed request on an appropriate node.
 type rangefeedMuxer struct {
 	// eventCh receives events from all active muxStreams.
-	eventCh chan *roachpb.MuxRangeFeedEvent
+	eventCh chan *kvpb.MuxRangeFeedEvent
 
 	// Context group controlling execution of MuxRangeFeed calls. When this group
 	// cancels, the entire muxer shuts down. The goroutines started in `g` will
@@ -67,7 +69,7 @@ type muxClientState struct {
 	doneCtx terminationContext // signaled when client shuts down.
 
 	// RPC state. Valid only after initCtx.Done().
-	client roachpb.Internal_MuxRangeFeedClient
+	client kvpb.Internal_MuxRangeFeedClient
 	cancel context.CancelFunc
 
 	// Number of consumers (ranges) running on this node; accessed under rangefeedMuxer lock.
@@ -76,7 +78,7 @@ type muxClientState struct {
 
 func newRangefeedMuxer(g ctxgroup.Group) *rangefeedMuxer {
 	m := &rangefeedMuxer{
-		eventCh:       make(chan *roachpb.MuxRangeFeedEvent),
+		eventCh:       make(chan *kvpb.MuxRangeFeedEvent),
 		demuxLoopDone: make(chan struct{}),
 		g:             g,
 	}
@@ -103,14 +105,14 @@ type channelRangeFeedEventProducer struct {
 	callerCtx    context.Context
 	muxClientCtx terminationContext
 
-	streamID int64                        // stream ID for this producer.
-	eventCh  chan *roachpb.RangeFeedEvent // consumer event channel.
+	streamID int64                     // stream ID for this producer.
+	eventCh  chan *kvpb.RangeFeedEvent // consumer event channel.
 }
 
-var _ roachpb.RangeFeedEventProducer = (*channelRangeFeedEventProducer)(nil)
+var _ kvpb.RangeFeedEventProducer = (*channelRangeFeedEventProducer)(nil)
 
 // Recv implements rangeFeedEventProducer interface.
-func (c *channelRangeFeedEventProducer) Recv() (*roachpb.RangeFeedEvent, error) {
+func (c *channelRangeFeedEventProducer) Recv() (*kvpb.RangeFeedEvent, error) {
 	select {
 	case <-c.callerCtx.Done():
 		return nil, c.callerCtx.Err()
@@ -125,8 +127,8 @@ func (c *channelRangeFeedEventProducer) Recv() (*roachpb.RangeFeedEvent, error) 
 // RangeFeedRequest.
 // The passed in client is only needed to establish MuxRangeFeed RPC.
 func (m *rangefeedMuxer) startMuxRangeFeed(
-	ctx context.Context, client rpc.RestrictedInternalClient, req *roachpb.RangeFeedRequest,
-) (roachpb.RangeFeedEventProducer, func(), error) {
+	ctx context.Context, client rpc.RestrictedInternalClient, req *kvpb.RangeFeedRequest,
+) (kvpb.RangeFeedEventProducer, func(), error) {
 	ms, err := m.establishMuxConnection(ctx, client, req.Replica.NodeID)
 	if err != nil {
 		return nil, nil, err
@@ -138,7 +140,7 @@ func (m *rangefeedMuxer) startMuxRangeFeed(
 		callerCtx:    streamCtx,
 		muxClientCtx: ms.doneCtx,
 		streamID:     req.StreamID,
-		eventCh:      make(chan *roachpb.RangeFeedEvent),
+		eventCh:      make(chan *kvpb.RangeFeedEvent),
 	}
 	m.producers.Store(req.StreamID, unsafe.Pointer(producer))
 
@@ -345,10 +347,10 @@ func (m *rangefeedMuxer) receiveEventsFromNode(ctx context.Context, ms *muxClien
 			// Normally, when ctx is done, we would receive streamErr above.
 			// But it's possible that the context was canceled right after the last Recv(),
 			// and in that case we must exit.
-			return nil
+			return ctx.Err()
 		case <-m.demuxLoopDone:
 			// demuxLoop exited, and so should we (happens when main context group completes)
-			return nil
+			return errors.Wrapf(context.Canceled, "demux loop terminated")
 		case m.eventCh <- event:
 		}
 	}

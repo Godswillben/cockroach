@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
@@ -510,14 +511,6 @@ var experimentalUseNewSchemaChanger = settings.RegisterEnumSetting(
 		int64(sessiondatapb.UseNewSchemaChangerUnsafe):       "unsafe",
 		int64(sessiondatapb.UseNewSchemaChangerUnsafeAlways): "unsafe_always",
 	},
-).WithPublic()
-
-var experimentalStreamReplicationEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.defaults.experimental_stream_replication.enabled",
-	"default value for experimental_stream_replication session setting;"+
-		"enables the ability to setup a replication stream",
-	false,
 ).WithPublic()
 
 var stubCatalogTablesEnabledClusterValue = settings.RegisterBoolSetting(
@@ -1375,7 +1368,7 @@ type ExecutorConfig struct {
 	RangeStatsFetcher eval.RangeStatsFetcher
 
 	// EventsExporter is the client for the Observability Service.
-	EventsExporter obs.EventsExporter
+	EventsExporter obs.EventsExporterInterface
 
 	// NodeDescs stores {Store,Node}Descriptors in an in-memory cache.
 	NodeDescs kvcoord.NodeDescStore
@@ -1503,7 +1496,7 @@ type ExecutorTestingKnobs struct {
 	// query (i.e. no subqueries). The physical plan is only safe for use for the
 	// lifetime of this function. Note that returning a nil function is
 	// unsupported and will lead to a panic.
-	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains) error
+	TestingSaveFlows func(stmt string) func(map[base.SQLInstanceID]*execinfrapb.FlowSpec, execopnode.OpChains, bool) error
 
 	// DeterministicExplain, if set, will result in overriding fields in EXPLAIN
 	// and EXPLAIN ANALYZE that can vary between runs (like elapsed times).
@@ -1640,13 +1633,17 @@ type BackupRestoreTestingKnobs struct {
 	// execution.
 	CaptureResolvedTableDescSpans func([]roachpb.Span)
 
+	// RunAfterSplitAndScatteringEntry allows blocking the RESTORE job after a
+	// single RestoreSpanEntry has been split and scattered.
+	RunAfterSplitAndScatteringEntry func(ctx context.Context)
+
 	// RunAfterProcessingRestoreSpanEntry allows blocking the RESTORE job after a
 	// single RestoreSpanEntry has been processed and added to the SSTBatcher.
 	RunAfterProcessingRestoreSpanEntry func(ctx context.Context)
 
 	// RunAfterExportingSpanEntry allows blocking the BACKUP job after a single
 	// span has been exported.
-	RunAfterExportingSpanEntry func(ctx context.Context, response *roachpb.ExportResponse)
+	RunAfterExportingSpanEntry func(ctx context.Context, response *kvpb.ExportResponse)
 
 	// BackupMonitor is used to overwrite the monitor used by backup during
 	// testing. This is typically the bulk mem monitor if not
@@ -1721,8 +1718,7 @@ func shouldDistributeGivenRecAndMode(
 // completed but is quite annoying to do at the moment.
 func getPlanDistribution(
 	ctx context.Context,
-	p *planner,
-	nodeID *base.SQLIDContainer,
+	txnHasUncommittedTypes bool,
 	distSQLMode sessiondatapb.DistSQLExecMode,
 	plan planMaybePhysical,
 ) physicalplan.PlanDistribution {
@@ -1733,7 +1729,7 @@ func getPlanDistribution(
 	// If this transaction has modified or created any types, it is not safe to
 	// distribute due to limitations around leasing descriptors modified in the
 	// current transaction.
-	if p.Descriptors().HasUncommittedTypes() {
+	if txnHasUncommittedTypes {
 		return physicalplan.LocalPlan
 	}
 
@@ -2934,11 +2930,14 @@ func (m *sessionDataMutator) bufferParamStatusUpdate(param string, status string
 
 // SetApplicationName sets the application name.
 func (m *sessionDataMutator) SetApplicationName(appName string) {
+	oldName := m.data.ApplicationName
 	m.data.ApplicationName = appName
 	if m.onApplicationNameChange != nil {
 		m.onApplicationNameChange(appName)
 	}
-	m.bufferParamStatusUpdate("application_name", appName)
+	if oldName != appName {
+		m.bufferParamStatusUpdate("application_name", appName)
+	}
 }
 
 // SetAvoidBuffering sets avoid buffering option.
@@ -3106,8 +3105,11 @@ func (m *sessionDataMutator) UpdateSearchPath(paths []string) {
 }
 
 func (m *sessionDataMutator) SetLocation(loc *time.Location) {
+	oldLocation := sessionDataTimeZoneFormat(m.data.Location)
 	m.data.Location = loc
-	m.bufferParamStatusUpdate("TimeZone", sessionDataTimeZoneFormat(loc))
+	if formatted := sessionDataTimeZoneFormat(loc); oldLocation != formatted {
+		m.bufferParamStatusUpdate("TimeZone", formatted)
+	}
 }
 
 func (m *sessionDataMutator) SetCustomOption(name, val string) {
@@ -3243,14 +3245,20 @@ func (m *sessionDataMutator) initSequenceCache() {
 
 // SetIntervalStyle sets the IntervalStyle for the given session.
 func (m *sessionDataMutator) SetIntervalStyle(style duration.IntervalStyle) {
+	oldStyle := m.data.DataConversionConfig.IntervalStyle
 	m.data.DataConversionConfig.IntervalStyle = style
-	m.bufferParamStatusUpdate("IntervalStyle", strings.ToLower(style.String()))
+	if oldStyle != style {
+		m.bufferParamStatusUpdate("IntervalStyle", strings.ToLower(style.String()))
+	}
 }
 
 // SetDateStyle sets the DateStyle for the given session.
 func (m *sessionDataMutator) SetDateStyle(style pgdate.DateStyle) {
+	oldStyle := m.data.DataConversionConfig.DateStyle
 	m.data.DataConversionConfig.DateStyle = style
-	m.bufferParamStatusUpdate("DateStyle", style.SQLString())
+	if oldStyle != style {
+		m.bufferParamStatusUpdate("DateStyle", style.SQLString())
+	}
 }
 
 // SetStubCatalogTablesEnabled sets default value for stub_catalog_tables.
@@ -3374,6 +3382,10 @@ func (m *sessionDataMutator) SetCopyFromAtomicEnabled(val bool) {
 
 func (m *sessionDataMutator) SetCopyFromRetriesEnabled(val bool) {
 	m.data.CopyFromRetriesEnabled = val
+}
+
+func (m *sessionDataMutator) SetDeclareCursorStatementTimeoutEnabled(val bool) {
+	m.data.DeclareCursorStatementTimeoutEnabled = val
 }
 
 func (m *sessionDataMutator) SetEnforceHomeRegion(val bool) {

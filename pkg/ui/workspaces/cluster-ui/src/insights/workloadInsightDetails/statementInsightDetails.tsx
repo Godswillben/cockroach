@@ -124,7 +124,7 @@ export const StatementInsightDetails: React.FC<
     getStmtInsightsApi({ stmtExecutionID: executionID, start, end })
       .then(res => {
         setInsightDetails({
-          details: res?.length ? res[0] : null,
+          details: res?.results?.length ? res.results[0] : null,
           loaded: true,
         });
       })
@@ -144,7 +144,7 @@ export const StatementInsightDetails: React.FC<
         iconPosition="left"
         className={commonStyles("small-margin")}
       >
-        Insights
+        Previous page
       </Button>
       <h3 className={commonStyles("base-heading", "no-margin-bottom")}>
         Statement Execution ID: {executionID}

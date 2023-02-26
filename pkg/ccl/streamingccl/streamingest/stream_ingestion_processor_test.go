@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -366,7 +367,7 @@ func assertEqualKVs(
 
 	// Iterate over the store.
 	store := tc.GetFirstStoreFromServer(t, 0)
-	it := store.Engine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound: key,
 		UpperBound: key.PrefixEnd(),
 	})
@@ -458,7 +459,7 @@ func TestRandomClientGeneration(t *testing.T) {
 	streamAddr := getTestRandomClientURI(tenantID, tenantName)
 
 	// The random client returns system and table data partitions.
-	streamClient, err := streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(streamAddr))
+	streamClient, err := streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(streamAddr), nil)
 	require.NoError(t, err)
 
 	randomStreamClient, ok := streamClient.(*streamclient.RandomStreamClient)
@@ -487,7 +488,7 @@ func TestRandomClientGeneration(t *testing.T) {
 	streamValidator := newStreamClientValidator(rekeyer)
 
 	randomStreamClient.ClearInterceptors()
-	randomStreamClient.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) roachpb.RangeFeedSSTable {
+	randomStreamClient.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
 		return sstMaker(t, keyValues)
 	})
 	randomStreamClient.RegisterInterception(cancelAfterCheckpoints)

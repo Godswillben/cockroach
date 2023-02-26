@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -276,6 +277,12 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 	doCheck := func(c *descpb.TableDescriptor_CheckConstraint) error {
 		return f(&c.Expr)
 	}
+	doUwi := func(uwi *descpb.UniqueWithoutIndexConstraint) error {
+		if uwi.Predicate != "" {
+			return f(&uwi.Predicate)
+		}
+		return nil
+	}
 
 	// Process columns.
 	for i := range desc.Columns {
@@ -300,6 +307,13 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 		}
 	}
 
+	// Process uwis.
+	for i := range desc.UniqueWithoutIndexConstraints {
+		if err := doUwi(&desc.UniqueWithoutIndexConstraints[i]); err != nil {
+			return err
+		}
+	}
+
 	// Process all non-index mutations.
 	for _, mut := range desc.Mutations {
 		if c := mut.GetColumn(); c != nil {
@@ -310,6 +324,12 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 		if c := mut.GetConstraint(); c != nil &&
 			c.ConstraintType == descpb.ConstraintToUpdate_CHECK {
 			if err := doCheck(&c.Check); err != nil {
+				return err
+			}
+		}
+		if c := mut.GetConstraint(); c != nil &&
+			c.ConstraintType == descpb.ConstraintToUpdate_UNIQUE_WITHOUT_INDEX {
+			if err := doUwi(&c.UniqueWithoutIndexConstraint); err != nil {
 				return err
 			}
 		}
@@ -344,6 +364,71 @@ func (desc *wrapper) GetAllReferencedTypeIDs(
 	}
 
 	return ids.Ordered(), referencedInColumns, nil
+}
+
+// GetAllReferencedFunctionIDs implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedFunctionIDs() (catalog.DescriptorIDSet, error) {
+	var ret catalog.DescriptorIDSet
+	for _, c := range desc.AllConstraints() {
+		ids, err := desc.GetAllReferencedFunctionIDsInConstraint(c.GetConstraintID())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
+		}
+		ret = ret.Union(ids)
+	}
+	for _, c := range desc.AllColumns() {
+		for _, id := range c.ColumnDesc().UsesFunctionIds {
+			ret.Add(id)
+		}
+	}
+	// TODO(chengxiong): add logic to extract references from indexes when UDFs
+	// are allowed in them.
+	return ret.Union(catalog.MakeDescriptorIDSet(desc.DependsOnFunctions...)), nil
+}
+
+// GetAllReferencedFunctionIDsInConstraint implements the TableDescriptor
+// interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInConstraint(
+	cstID descpb.ConstraintID,
+) (fnIDs catalog.DescriptorIDSet, err error) {
+	c := catalog.FindConstraintByID(desc, cstID)
+	ck := c.AsCheck()
+	if ck == nil {
+		return catalog.DescriptorIDSet{}, nil
+	}
+	ret, err := schemaexpr.GetUDFIDsFromExprStr(ck.GetExpr())
+	if err != nil {
+		return catalog.DescriptorIDSet{}, err
+	}
+	return ret, nil
+}
+
+// GetAllReferencedFunctionIDsInColumnExprs implements the TableDescriptor
+// interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInColumnExprs(
+	colID descpb.ColumnID,
+) (fnIDs catalog.DescriptorIDSet, err error) {
+	col := catalog.FindColumnByID(desc, colID)
+	if col == nil {
+		return catalog.DescriptorIDSet{}, nil
+	}
+
+	var ret catalog.DescriptorIDSet
+	// TODO(chengxiong): add support for computed columns when UDFs are allowed in
+	// them.
+	if !col.IsComputed() {
+		if col.HasDefault() {
+			ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetDefaultExpr())
+			if err != nil {
+				return catalog.DescriptorIDSet{}, err
+			}
+			ret = ret.Union(ids)
+		}
+		// TODO(chengxiong): add support for ON UPDATE expressions when UDFs are
+		// allowed in them.
+	}
+
+	return ret, nil
 }
 
 // getAllReferencedTypesInTableColumns returns a map of all user defined
@@ -1158,7 +1243,9 @@ func (desc *Mutable) FindActiveOrNewColumnByName(name tree.Name) (catalog.Column
 // DropConstraint drops a constraint, either by removing it from the table
 // descriptor or by queuing a mutation for a schema change.
 func (desc *Mutable) DropConstraint(
-	constraint catalog.Constraint, removeFKBackRef func(catalog.ForeignKeyConstraint) error,
+	constraint catalog.Constraint,
+	removeFKBackRef func(catalog.ForeignKeyConstraint) error,
+	removeFnBackRef func(*descpb.TableDescriptor_CheckConstraint) error,
 ) error {
 	if u := constraint.AsUniqueWithIndex(); u != nil {
 		if u.Primary() {
@@ -1208,6 +1295,9 @@ func (desc *Mutable) DropConstraint(
 				// unless the cluster is fully upgraded to 19.2, for backward
 				// compatibility.
 				if ck.IsConstraintUnvalidated() {
+					if err := removeFnBackRef(c); err != nil {
+						return err
+					}
 					desc.Checks = append(desc.Checks[:i], desc.Checks[i+1:]...)
 					return nil
 				}
@@ -1372,9 +1462,19 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 							break
 						}
 					}
-				case descpb.ConstraintValidity_Unvalidated:
+				case descpb.ConstraintValidity_Unvalidated, descpb.ConstraintValidity_Validated:
 					// add the constraint to the list of check constraints on the table
 					// descriptor.
+					//
+					// The "validated" validity seems strange -- why would we ever complete
+					// a constraint mutation whose validity is already "validated"?
+					// This is because of how legacy schema changer is implemented and will
+					// occur for the following case:
+					// `ALTER TABLE .. ADD CONSTRAINT .. NOT VALID, VALIDATE CONSTRAINT ..`
+					// where the constraint mutation's validity is changed by `VALIDATE CONSTRAINT`
+					// to "validated", and in the job of `ADD CONSTRAINT .. NOT VALID` we
+					// came to mark the constraint mutation as completed.
+					// The same is true for FK and UWI constraints.
 					desc.Checks = append(desc.Checks, &t.Constraint.Check)
 				default:
 					return errors.AssertionFailedf("invalid constraint validity state: %d", t.Constraint.Check.Validity)
@@ -1390,7 +1490,7 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 							break
 						}
 					}
-				case descpb.ConstraintValidity_Unvalidated:
+				case descpb.ConstraintValidity_Unvalidated, descpb.ConstraintValidity_Validated:
 					// Takes care of adding the Foreign Key to the table index. Adding the
 					// backreference to the referenced table index must be taken care of
 					// in another call.
@@ -1408,7 +1508,7 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 							break
 						}
 					}
-				case descpb.ConstraintValidity_Unvalidated:
+				case descpb.ConstraintValidity_Unvalidated, descpb.ConstraintValidity_Validated:
 					// add the constraint to the list of unique without index constraints
 					// on the table descriptor.
 					desc.UniqueWithoutIndexConstraints = append(

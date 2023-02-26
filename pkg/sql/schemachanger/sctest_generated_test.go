@@ -120,6 +120,56 @@ func TestRollback_add_column_no_default(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/add_column_no_default", sctest.SingleNodeCluster)
 }
+func TestEndToEndSideEffects_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", sctest.SingleNodeCluster)
+}
+func TestPause_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", sctest.SingleNodeCluster)
+}
+func TestRollback_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", sctest.SingleNodeCluster)
+}
+func TestEndToEndSideEffects_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", sctest.SingleNodeCluster)
+}
+func TestPause_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", sctest.SingleNodeCluster)
+}
+func TestRollback_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", sctest.SingleNodeCluster)
+}
 func TestEndToEndSideEffects_alter_table_add_check_vanilla(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -395,6 +445,31 @@ func TestRollback_alter_table_drop_constraint_uwi(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_drop_constraint_uwi", sctest.SingleNodeCluster)
 }
+func TestEndToEndSideEffects_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", sctest.SingleNodeCluster)
+}
+func TestPause_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", sctest.SingleNodeCluster)
+}
+func TestRollback_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", sctest.SingleNodeCluster)
+}
 func TestEndToEndSideEffects_create_function(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -595,6 +670,56 @@ func TestRollback_drop_column_with_index(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_index", sctest.SingleNodeCluster)
 }
+func TestEndToEndSideEffects_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", sctest.SingleNodeCluster)
+}
+func TestPause_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", sctest.SingleNodeCluster)
+}
+func TestRollback_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", sctest.SingleNodeCluster)
+}
+func TestEndToEndSideEffects_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", sctest.SingleNodeCluster)
+}
+func TestPause_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", sctest.SingleNodeCluster)
+}
+func TestRollback_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", sctest.SingleNodeCluster)
+}
 func TestEndToEndSideEffects_drop_function(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -794,4 +919,29 @@ func TestRollback_drop_table(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table", sctest.SingleNodeCluster)
+}
+func TestEndToEndSideEffects_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.EndToEndSideEffects(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", sctest.SingleNodeCluster)
+}
+func TestExecuteWithDMLInjection_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.ExecuteWithDMLInjection(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", sctest.SingleNodeCluster)
+}
+func TestGenerateSchemaChangeCorpus_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.GenerateSchemaChangeCorpus(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", sctest.SingleNodeCluster)
+}
+func TestPause_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Pause(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", sctest.SingleNodeCluster)
+}
+func TestRollback_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Rollback(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", sctest.SingleNodeCluster)
 }

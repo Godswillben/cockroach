@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -51,12 +52,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
+
+const importJobRecoveryEventType eventpb.RecoveryEventType = "import_job"
 
 type importTestingKnobs struct {
 	afterImport            func(summary roachpb.RowCount) error
@@ -264,7 +268,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 					return errors.Wrap(err, "checking if existing table is empty")
 				}
 				details.Tables[i].WasEmpty = len(res) == 0
-				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V22_2Start) {
+				if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2Start) {
 					// Update the descriptor in the job record and in the database with the ImportStartTime
 					details.Tables[i].Desc.ImportStartWallTime = details.Walltime
 					err := bindImportStartTime(ctx, p, tblDesc.GetID(), details.Walltime)
@@ -290,7 +294,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 	pkIDs := make(map[uint64]struct{}, len(details.Tables))
 	for _, t := range details.Tables {
-		pkIDs[roachpb.BulkOpSummaryID(uint64(t.Desc.ID), uint64(t.Desc.PrimaryIndex.ID))] = struct{}{}
+		pkIDs[kvpb.BulkOpSummaryID(uint64(t.Desc.ID), uint64(t.Desc.PrimaryIndex.ID))] = struct{}{}
 	}
 	r.res.DataSize = res.DataSize
 	for id, count := range res.EntryCounts {
@@ -306,6 +310,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			return err
 		}
 	}
+
 	if err := p.ExecCfg().JobRegistry.CheckPausepoint("import.after_ingest"); err != nil {
 		return err
 	}
@@ -343,7 +348,6 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	}); err != nil {
 		log.Errorf(ctx, "failed to release protected timestamp: %v", err)
 	}
-
 	emitImportJobEvent(ctx, p, jobs.StatusSucceeded, r.job)
 
 	addToFileFormatTelemetry(details.Format.Format.String(), "succeeded")
@@ -363,6 +367,8 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	if sizeMb > 10 {
 		telemetry.CountBucketed("import.speed-mbps.over10mb", mbps)
 	}
+
+	logutil.LogJobCompletion(ctx, importJobRecoveryEventType, r.job.ID(), true, nil, r.res.Rows)
 
 	return nil
 }
@@ -925,7 +931,7 @@ func parseAndCreateBundleTableDescs(
 
 // publishTables updates the status of imported tables from OFFLINE to PUBLIC.
 func (r *importResumer) publishTables(
-	ctx context.Context, execCfg *sql.ExecutorConfig, res roachpb.BulkOpSummary,
+	ctx context.Context, execCfg *sql.ExecutorConfig, res kvpb.BulkOpSummary,
 ) error {
 	details := r.job.Details().(jobspb.ImportDetails)
 	// Tables should only be published once.
@@ -1013,13 +1019,13 @@ func (r *importResumer) publishTables(
 // writeStubStatisticsForImportedTables writes "stub" statistics for new tables
 // created during an import.
 func (r *importResumer) writeStubStatisticsForImportedTables(
-	ctx context.Context, execCfg *sql.ExecutorConfig, res roachpb.BulkOpSummary,
+	ctx context.Context, execCfg *sql.ExecutorConfig, res kvpb.BulkOpSummary,
 ) {
 	details := r.job.Details().(jobspb.ImportDetails)
 	for _, tbl := range details.Tables {
 		if tbl.IsNew {
 			desc := tabledesc.NewBuilder(tbl.Desc).BuildImmutableTable()
-			id := roachpb.BulkOpSummaryID(uint64(desc.GetID()), uint64(desc.GetPrimaryIndexID()))
+			id := kvpb.BulkOpSummaryID(uint64(desc.GetID()), uint64(desc.GetPrimaryIndexID()))
 			rowCount := uint64(res.EntryCounts[id])
 			// TODO(michae2): collect distinct and null counts during import.
 			distinctCount := uint64(float64(rowCount) * memo.UnknownDistinctCountRatio)
@@ -1229,7 +1235,7 @@ func ingestWithRetry(
 	walltime int64,
 	testingKnobs importTestingKnobs,
 	procsPerNode int,
-) (roachpb.BulkOpSummary, error) {
+) (kvpb.BulkOpSummary, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "importer.ingestWithRetry")
 	defer sp.Finish()
 
@@ -1244,7 +1250,7 @@ func ingestWithRetry(
 	// We want to retry an import if there are transient failures (i.e. worker
 	// nodes dying), so if we receive a retryable error, re-plan and retry the
 	// import.
-	var res roachpb.BulkOpSummary
+	var res kvpb.BulkOpSummary
 	var err error
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
@@ -1259,7 +1265,7 @@ func ingestWithRetry(
 			break
 		}
 
-		if errors.HasType(err, &roachpb.InsufficientSpaceError{}) {
+		if errors.HasType(err, &kvpb.InsufficientSpaceError{}) {
 			return res, jobs.MarkPauseRequestError(errors.UnwrapAll(err))
 		}
 
@@ -1267,19 +1273,26 @@ func ingestWithRetry(
 			return res, err
 		}
 
-		// Re-load the job in order to update our progress object, which may have
-		// been updated by the changeFrontier processor since the flow started.
+		// If we are draining, it is unlikely we can start a new DistSQL
+		// flow. Exit with a retryable error so that another node can
+		// pick up the job.
+		if execCtx.ExecCfg().JobRegistry.IsDraining() {
+			return res, jobs.MarkAsRetryJobError(errors.Wrapf(err, "job encountered retryable error on draining node"))
+		}
+
+		// Re-load the job in order to update our progress object, which
+		// may have been updated since the flow started.
 		reloadedJob, reloadErr := execCtx.ExecCfg().JobRegistry.LoadClaimedJob(ctx, job.ID())
 		if reloadErr != nil {
 			if ctx.Err() != nil {
 				return res, ctx.Err()
 			}
-			log.Warningf(ctx, `IMPORT job %d could not reload job progress when retrying: %+v`,
-				int64(job.ID()), reloadErr)
+			log.Warningf(ctx, "IMPORT job %d could not reload job progress when retrying: %+v",
+				job.ID(), reloadErr)
 		} else {
 			job = reloadedJob
 		}
-		log.Warningf(ctx, `encountered retryable error: %+v`, err)
+		log.Warningf(ctx, "encountered retryable error: %+v", err)
 	}
 
 	// We have exhausted retries, but we have not seen a "PermanentBulkJobError" so
@@ -1382,13 +1395,19 @@ func createNonDropDatabaseChangeJob(
 // been committed from a import that has failed or been canceled. It does this
 // by adding the table descriptors in DROP state, which causes the schema change
 // stuff to delete the keys in the background.
-func (r *importResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}, _ error) error {
+func (r *importResumer) OnFailOrCancel(
+	ctx context.Context, execCtx interface{}, jobErr error,
+) error {
 	p := execCtx.(sql.JobExecContext)
 
 	// Emit to the event log that the job has started reverting.
 	emitImportJobEvent(ctx, p, jobs.StatusReverting, r.job)
 
+	// TODO(sql-exp): increase telemetry count for import.total.failed and
+	// import.duration-sec.failed.
 	details := r.job.Details().(jobspb.ImportDetails)
+	logutil.LogJobCompletion(ctx, importJobRecoveryEventType, r.job.ID(), false, jobErr, r.res.Rows)
+
 	addToFileFormatTelemetry(details.Format.Format.String(), "failed")
 	cfg := execCtx.(sql.JobExecContext).ExecCfg()
 	var jobsToRunAfterTxnCommit []jobspb.JobID
@@ -1484,7 +1503,7 @@ func (r *importResumer) dropTables(
 		// admin knob (e.g. ALTER TABLE REVERT TO SYSTEM TIME) if anything goes wrong.
 		ts := hlc.Timestamp{WallTime: details.Walltime}.Prev()
 		if useDeleteRange {
-			predicates := roachpb.DeleteRangePredicates{StartTime: ts}
+			predicates := kvpb.DeleteRangePredicates{StartTime: ts}
 			if err := sql.DeleteTableWithPredicate(
 				ctx,
 				execCfg.DB,

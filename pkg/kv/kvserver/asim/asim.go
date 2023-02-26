@@ -16,12 +16,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/metrics"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/op"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/queue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/storerebalancer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // Simulator simulates an entire cluster, and runs the allocator of each store
@@ -33,17 +33,11 @@ type Simulator struct {
 	// as the queues, store rebalancer and state changers. It should be set
 	// lower than the bgInterval, as updated occur more frequently.
 	interval time.Duration
-	// bgInterval is the step between ticks for background simulation
-	// components, such as the metrics, state exchange and workload generators.
-	// It should be set higher than the interval, as it is generally more
-	// costly and requires less frequent updates.
-	bgInterval time.Duration
-	bgLastTick time.Time
 
 	// The simulator can run multiple workload Generators in parallel.
 	generators []workload.Generator
 
-	pacers map[state.StoreID]ReplicaPacer
+	pacers map[state.StoreID]queue.ReplicaPacer
 
 	// Store replicate queues.
 	rqs map[state.StoreID]queue.RangeQueue
@@ -59,19 +53,31 @@ type Simulator struct {
 	gossip   gossip.Gossip
 	shuffler func(n int, swap func(i, j int))
 
-	metrics *MetricsTracker
+	metrics *metrics.Tracker
+	history History
+}
+
+// History contains recorded information that summarizes a simulation run.
+// Currently it only contains the store metrics of the run.
+// TODO(kvoli): Add a range log like structure to the history.
+type History struct {
+	Recorded [][]metrics.StoreMetrics
+}
+
+// Listen implements the metrics.StoreMetricListener interface.
+func (h *History) Listen(ctx context.Context, sms []metrics.StoreMetrics) {
+	h.Recorded = append(h.Recorded, sms)
 }
 
 // NewSimulator constructs a valid Simulator.
 func NewSimulator(
 	duration time.Duration,
-	interval, bgInterval time.Duration,
 	wgs []workload.Generator,
 	initialState state.State,
 	settings *config.SimulationSettings,
-	metrics *MetricsTracker,
+	m *metrics.Tracker,
 ) *Simulator {
-	pacers := make(map[state.StoreID]ReplicaPacer)
+	pacers := make(map[state.StoreID]queue.ReplicaPacer)
 	rqs := make(map[state.StoreID]queue.RangeQueue)
 	sqs := make(map[state.StoreID]queue.RangeQueue)
 	srs := make(map[state.StoreID]storerebalancer.StoreRebalancer)
@@ -100,7 +106,7 @@ func NewSimulator(
 			settings.RangeSizeSplitThreshold,
 			settings.StartTime,
 		)
-		pacers[storeID] = NewScannerReplicaPacer(
+		pacers[storeID] = queue.NewScannerReplicaPacer(
 			initialState.NextReplicasFn(storeID),
 			settings.PacerLoopInterval,
 			settings.PacerMinIterInterval,
@@ -112,6 +118,7 @@ func NewSimulator(
 			allocator,
 			storePool,
 			settings,
+			storeID,
 		)
 		srs[storeID] = storerebalancer.NewStoreRebalancer(
 			settings.StartTime,
@@ -124,11 +131,10 @@ func NewSimulator(
 		)
 	}
 
-	return &Simulator{
+	s := &Simulator{
 		curr:        settings.StartTime,
 		end:         settings.StartTime.Add(duration),
-		interval:    interval,
-		bgInterval:  bgInterval,
+		interval:    settings.TickInterval,
 		generators:  wgs,
 		state:       initialState,
 		changer:     changer,
@@ -138,9 +144,12 @@ func NewSimulator(
 		srs:         srs,
 		pacers:      pacers,
 		gossip:      gossip.NewGossip(initialState, settings),
-		metrics:     metrics,
+		metrics:     m,
 		shuffler:    state.NewShuffler(settings.Seed),
+		history:     History{Recorded: [][]metrics.StoreMetrics{}},
 	}
+	m.Register(&s.history)
+	return s
 }
 
 // GetNextTickTime returns a simulated tick time, or an indication that the
@@ -151,6 +160,12 @@ func (s *Simulator) GetNextTickTime() (done bool, tick time.Time) {
 		return true, time.Time{}
 	}
 	return false, s.curr
+}
+
+// History returns the current recorded history of a simulation run. Calling
+// this on a Simulator that has not begun will return an empty history.
+func (s *Simulator) History() History {
+	return s.history
 }
 
 // RunSim runs a simulation until GetNextTickTime() is done. A simulation is
@@ -167,6 +182,7 @@ func (s *Simulator) GetNextTickTime() (done bool, tick time.Time) {
 // TODO: simulation run settings should be loaded from a config such as a yaml
 // file or a "datadriven" style file.
 func (s *Simulator) RunSim(ctx context.Context) {
+
 	for {
 		done, tick := s.GetNextTickTime()
 		if done {
@@ -197,14 +213,6 @@ func (s *Simulator) RunSim(ctx context.Context) {
 
 		// Print tick metrics.
 		s.tickMetrics(ctx, tick)
-
-		// If we ticked the background tickable components, update the last
-		// tick time.
-		// TODO(kvoli): Variable component tick rates requires a proper
-		// abstraction.
-		if !s.bgLastTick.Add(s.bgInterval).After(tick) {
-			s.bgLastTick = tick
-		}
 	}
 }
 
@@ -301,9 +309,5 @@ func (s *Simulator) tickStoreRebalancers(ctx context.Context, tick time.Time, st
 
 // tickMetrics prints the metrics up to the given tick.
 func (s *Simulator) tickMetrics(ctx context.Context, tick time.Time) {
-	if !s.bgLastTick.Add(s.bgInterval).After(tick) {
-		if err := s.metrics.Tick(tick, s.state); err != nil {
-			log.Errorf(ctx, "error writing to csv: %v", err)
-		}
-	}
+	s.metrics.Tick(ctx, tick, s.state)
 }

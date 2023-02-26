@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -263,10 +264,10 @@ func startConnExecutor(
 ) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
-	clock := hlc.NewClockWithSystemTimeSource(0 /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	factory := kv.MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, *roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			return nil, nil
 		})
 	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)

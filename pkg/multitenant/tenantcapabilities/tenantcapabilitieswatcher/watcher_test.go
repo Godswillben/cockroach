@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package tenantcapabilitieswatcher
+package tenantcapabilitieswatcher_test
 
 import (
 	"context"
@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiestestutils"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -41,13 +42,16 @@ import (
 //
 // "start": starts the Watcher.
 //
-// "update-state": updates the underlying global tenant capability state.
+// "upsert" and "delete": updates the underlying global tenant capability state.
 // Example:
 //
-//	update-state
-//	upsert {ten=10}:{CanAdminSplit=true}
-//	delete {ten=15}
-//	----
+// upsert ten=10 can_admin_split=true
+// ----
+// ok
+//
+// delete ten=15
+// ----
+// ok
 //
 // "updates": lists out updates observed by the watcher after the underlying
 // tenant capability state has been updated.
@@ -99,39 +103,41 @@ func TestDataDriven(t *testing.T) {
 			close(restartAfterErrCh)
 		}()
 
-		watcher := New(
+		watcher := tenantcapabilitieswatcher.New(
 			ts.Clock(),
 			ts.RangeFeedFactory().(*rangefeed.Factory),
 			dummyTableID,
 			ts.Stopper(),
 			1<<20, /* 1 MB */
 			&tenantcapabilities.TestingKnobs{
-				WatcherRangeFeedKnobs: &rangefeedcache.TestingKnobs{
-					PostRangeFeedStart: func() {
-						mu.Lock()
-						defer mu.Unlock()
+				WatcherTestingKnobs: &tenantcapabilitieswatcher.TestingKnobs{
+					WatcherRangeFeedKnobs: &rangefeedcache.TestingKnobs{
+						PostRangeFeedStart: func() {
+							mu.Lock()
+							defer mu.Unlock()
 
-						mu.rangeFeedRunning = true
+							mu.rangeFeedRunning = true
+						},
+						OnTimestampAdvance: func(ts hlc.Timestamp) {
+							mu.Lock()
+							defer mu.Unlock()
+							mu.lastFrontierTS = ts
+						},
+						ErrorInjectionCh: errorInjectionCh,
+						PreExit: func() {
+							mu.Lock()
+							mu.rangeFeedRunning = false
+							mu.Unlock()
+							// Block until the test directives indicate otherwise.
+							<-restartAfterErrCh
+						},
 					},
-					OnTimestampAdvance: func(ts hlc.Timestamp) {
+					WatcherUpdatesInterceptor: func(UpdateType rangefeedcache.UpdateType, updates []tenantcapabilities.Update) {
 						mu.Lock()
 						defer mu.Unlock()
-						mu.lastFrontierTS = ts
+						mu.receivedUpdates = append(mu.receivedUpdates, updates...)
+						mu.receivedUpdateType = UpdateType
 					},
-					ErrorInjectionCh: errorInjectionCh,
-					PreExit: func() {
-						mu.Lock()
-						mu.rangeFeedRunning = false
-						mu.Unlock()
-						// Block until the test directives indicate otherwise.
-						<-restartAfterErrCh
-					},
-				},
-				WatcherUpdatesInterceptor: func(UpdateType rangefeedcache.UpdateType, updates []tenantcapabilities.Update) {
-					mu.Lock()
-					defer mu.Unlock()
-					mu.receivedUpdates = append(mu.receivedUpdates, updates...)
-					mu.receivedUpdateType = UpdateType
 				},
 			})
 
@@ -190,53 +196,48 @@ func TestDataDriven(t *testing.T) {
 					if i+1 != len(receivedUpdates) && receivedUpdates[i+1].TenantID.Equal(receivedUpdates[i].TenantID) {
 						continue // de-duplicate
 					}
-					output.WriteString(
-						fmt.Sprintf(
-							"%s\n", tenantcapabilitiestestutils.PrintTenantCapabilityUpdate(receivedUpdates[i]),
-						),
-					)
+					output.WriteString(fmt.Sprintf("%+v\n", receivedUpdates[i]))
 				}
 				return output.String()
 
-			case "update-state":
-				updates := tenantcapabilitiestestutils.ParseTenantCapabilityUpdateStateArguments(t, d.Input)
-				for _, update := range updates {
-					if !update.Deleted {
-						info := mtinfopb.ProtoInfo{
-							Capabilities: update.TenantCapabilities,
-						}
-						buf, err := protoutil.Marshal(&info)
-						require.NoError(t, err)
-						tdb.Exec(
-							t,
-							fmt.Sprintf("UPSERT INTO %s (id, active, info) VALUES ($1, $2, $3)", dummyTableName),
-							update.TenantID.ToUint64(),
-							true, /* active */
-							buf,
-						)
-					} else {
-						tdb.Exec(
-							t,
-							fmt.Sprintf("DELETE FROM %s WHERE id = $1", dummyTableName),
-							update.TenantID.ToUint64(),
-						)
-					}
+			case "upsert":
+				update, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
+				require.NoError(t, err)
+				info := mtinfopb.ProtoInfo{
+					Capabilities: update.TenantCapabilities,
 				}
+				buf, err := protoutil.Marshal(&info)
+				require.NoError(t, err)
+				tdb.Exec(
+					t,
+					fmt.Sprintf("UPSERT INTO %s (id, active, info) VALUES ($1, $2, $3)", dummyTableName),
+					update.TenantID.ToUint64(),
+					true, /* active */
+					buf,
+				)
+				lastUpdateTS = ts.Clock().Now()
+			case "delete":
+				delete := tenantcapabilitiestestutils.ParseTenantCapabilityDelete(t, d)
+				tdb.Exec(
+					t,
+					fmt.Sprintf("DELETE FROM %s WHERE id = $1", dummyTableName),
+					delete.TenantID.ToUint64(),
+				)
 				lastUpdateTS = ts.Clock().Now()
 
 			case "get-capabilities":
-				tenID := tenantcapabilitiestestutils.ParseTenantID(t, d.Input)
-				cp, found := watcher.GetCapabilities(tenID)
+				tID := tenantcapabilitiestestutils.GetTenantID(t, d)
+				cp, found := watcher.GetCapabilities(tID)
 				if !found {
 					return "not-found"
 				}
-				return tenantcapabilitiestestutils.PrintTenantCapability(cp)
+				return fmt.Sprintf("%+v", cp)
 
 			case "flush-state":
 				var output strings.Builder
-				entries := watcher.testingFlushCapabilitiesState()
+				entries := watcher.TestingFlushCapabilitiesState()
 				for _, entry := range entries {
-					output.WriteString(fmt.Sprintf("%s\n", tenantcapabilitiestestutils.PrintTenantCapabilityEntry(entry)))
+					output.WriteString(fmt.Sprintf("%+v\n", entry))
 				}
 				return output.String()
 			case "inject-error":

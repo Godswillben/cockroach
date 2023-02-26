@@ -1761,7 +1761,7 @@ func (ef *execFactory) ConstructDeleteRange(
 
 	splitter := span.NoopSplitter()
 	canUsePointDelete := ef.planner.ExecCfg().Settings.Version.IsActive(
-		ef.ctx, clusterversion.V22_2DeleteRequestReturnKey,
+		ef.ctx, clusterversion.TODODelete_V22_2DeleteRequestReturnKey,
 	)
 	if canUsePointDelete {
 		splitter = span.MakeSplitterForDelete(
@@ -2180,7 +2180,7 @@ func (ef *execFactory) ConstructExplain(
 	}
 	flags := explain.MakeFlags(options)
 	if ef.planner.execCfg.TestingKnobs.DeterministicExplain {
-		flags.Redact = explain.RedactVolatile
+		flags.Deflake = explain.DeflakeVolatile
 	}
 	n := &explainPlanNode{
 		options: options,

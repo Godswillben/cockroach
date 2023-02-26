@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -111,8 +112,8 @@ type Registry struct {
 	adoptionCh  chan adoptionNotice
 	sqlInstance sqlliveness.Instance
 
-	// sessionBoundInternalExecutorFactory provides a way for jobs to create
-	// internal executors. This is rarely needed, and usually job resumers should
+	// internalDB provides a way for jobs to create internal executors.
+	// This is rarely needed, and usually job resumers should
 	// use the internal executor from the JobExecCtx. The intended user of this
 	// interface is the schema change job resumer, which needs to set the
 	// tableCollectionModifier on the internal executor to different values in
@@ -151,6 +152,16 @@ type Registry struct {
 		// passively polling for these jobs to complete. If they complete locally,
 		// the waitingSet will be updated appropriately.
 		waiting jobWaitingSets
+
+		// draining indicates whether this node is draining or
+		// not. It is set by the drain server when the drain
+		// process starts.
+		//
+		// TODO(ssd): We may want to prevent the adoption of
+		// jobs onto a draining node. At the moment, jobs can
+		// access this to make per-job decisions about what to
+		// do.
+		draining bool
 	}
 
 	// withSessionEvery ensures that logging when failing to get a live session
@@ -289,6 +300,9 @@ const (
 	// KeyVisualizerJobID A static job ID is used to easily check if the
 	// Key Visualizer job already exists.
 	KeyVisualizerJobID = jobspb.JobID(100)
+
+	// JobMetricsPollerJobID A static job ID is used for the job metrics polling job.
+	JobMetricsPollerJobID = jobspb.JobID(101)
 )
 
 // MakeJobID generates a new job ID.
@@ -329,6 +343,7 @@ func (r *Registry) makePayload(ctx context.Context, record *Record) (jobspb.Payl
 		Noncancelable:          record.NonCancelable,
 		CreationClusterVersion: r.settings.Version.ActiveVersion(ctx).Version,
 		CreationClusterID:      r.clusterID.Get(),
+		MaximumPTSAge:          record.MaximumPTSAge,
 	}, nil
 }
 
@@ -626,25 +641,26 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 			createdByType = j.createdBy.Name
 			createdByID = j.createdBy.ID
 		}
+		typ := j.mu.payload.Type().String()
 
+		nCols := 7
+		cols := [7]string{"id", "status", "payload", "progress", "created_by_type", "created_by_id", "job_type"}
+		placeholders := [7]string{"$1", "$2", "$3", "$4", "$5", "$6", "$7"}
+		values := [7]interface{}{jobID, StatusRunning, payloadBytes, progressBytes, createdByType, createdByID, typ}
+		if !r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable) {
+			nCols -= 1
+		}
 		// Insert the job row, but do not set a `claim_session_id`. By not
 		// setting the claim, the job can be adopted by any node and will
 		// be adopted by the node which next runs the adoption loop.
-		const stmt = `INSERT
-  INTO system.jobs (
-                    id,
-                    status,
-                    payload,
-                    progress,
-                    created_by_type,
-                    created_by_id
-                   )
-VALUES ($1, $2, $3, $4, $5, $6);`
+		stmt := fmt.Sprintf(
+			`INSERT INTO system.jobs (%s) VALUES (%s);`,
+			strings.Join(cols[:nCols], ","), strings.Join(placeholders[:nCols], ","),
+		)
 		_, err = txn.ExecEx(ctx, "job-insert", txn.KV(), sessiondata.InternalExecutorOverride{
 			User:     username.NodeUserName(),
 			Database: catconstants.SystemDatabaseName,
-		}, stmt,
-			jobID, StatusRunning, payloadBytes, progressBytes, createdByType, createdByID)
+		}, stmt, values[:nCols]...)
 		return err
 	}
 	run := r.db.Txn
@@ -821,9 +837,9 @@ func (r *Registry) IterateJobInfo(
 	rows, err := txn.QueryIteratorEx(
 		ctx, "job-info-iter", txn.KV(),
 		sessiondata.NodeUserSessionDataOverride,
-		`SELECT info_key, value 
-		FROM system.job_info 
-		WHERE job_id = $1 AND substring(info_key for $2) = $3 
+		`SELECT info_key, value
+		FROM system.job_info
+		WHERE job_id = $1 AND substring(info_key for $2) = $3
 		ORDER BY info_key ASC, written DESC`,
 		jobID, len(infoPrefix), infoPrefix,
 	)
@@ -1376,6 +1392,14 @@ var UsesTenantCostControl = func(opts *registerOptions) {
 	opts.hasTenantCostControlOption = true
 }
 
+// WithJobMetrics returns a RegisterOption which Will configure jobs of this
+// type to use specified metrics
+func WithJobMetrics(m metric.Struct) RegisterOption {
+	return func(opts *registerOptions) {
+		opts.metrics = m
+	}
+}
+
 // registerOptions are passed to RegisterConstructor and control how a job
 // resumer is created and configured.
 type registerOptions struct {
@@ -1387,6 +1411,9 @@ type registerOptions struct {
 	// UsesTenantCostControl was specified as an option. RegisterConstructor will
 	// panic if this is false.
 	hasTenantCostControlOption bool
+
+	// metrics allow jobs to register job specific metrics.
+	metrics metric.Struct
 }
 
 // PauseRequester is an extension of Resumer which allows job implementers to inject
@@ -1522,6 +1549,9 @@ func (r *Registry) stepThroughStateMachine(
 			// paused. We should make this error clearer.
 			jm.ResumeRetryError.Inc(1)
 			return errors.Errorf("job %d: node liveness error: restarting in background", job.ID())
+		}
+		if errors.Is(err, errJobLeaseNotHeld) {
+			return err
 		}
 
 		if errors.Is(err, errPauseSelfSentinel) {
@@ -1818,6 +1848,45 @@ func (r *Registry) CheckPausepoint(name string) error {
 		}
 	}
 	return nil
+}
+
+func (r *Registry) RelocateLease(
+	ctx context.Context,
+	txn isql.Txn,
+	id jobspb.JobID,
+	destID base.SQLInstanceID,
+	destSession sqlliveness.SessionID,
+) (sentinel error, failure error) {
+	if _, err := r.db.Executor().Exec(ctx, "job-relocate-coordinator", txn.KV(),
+		"UPDATE system.jobs SET claim_instance_id = $2, claim_session_id = $3 WHERE id = $1",
+		id, destID, destSession.UnsafeBytes(),
+	); err != nil {
+		return nil, errors.Wrapf(err, "failed to relocate job coordinator to %d", destID)
+	}
+
+	return errors.Mark(errors.Newf("execution of job %d relocated to %d", id, destID), errJobLeaseNotHeld), nil
+}
+
+// IsDraining returns true if the job system has been informed that
+// the local node is draining.
+//
+// Jobs that depend on distributed SQL infrastructure may choose to
+// exit early in this case.
+func (r *Registry) IsDraining() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.mu.draining
+}
+
+// SetDraining informs the job system if the node is draining.
+//
+// NB: Check the implementation of drain before adding code that would
+// make this block.
+func (r *Registry) SetDraining(draining bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mu.draining = draining
 }
 
 // TestingIsJobIdle returns true if the job is adopted and currently idle.

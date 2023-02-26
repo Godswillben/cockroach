@@ -84,6 +84,9 @@ const (
 	// ReferencedSequenceIDs corresponds to a slice of sequence descriptor IDs
 	// referenced by an element.
 	ReferencedSequenceIDs
+	// ReferencedFunctionIDs corresponds to a slice of function descriptor IDs
+	// referenced by an element.
+	ReferencedFunctionIDs
 
 	// AttrMax is the largest possible Attr value.
 	// Note: add any new enum values before TargetStatus, leave these at the end.
@@ -178,6 +181,10 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
 	),
+	rel.EntityMapping(t((*scpb.UniqueWithoutIndexConstraintUnvalidated)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+	),
 	rel.EntityMapping(t((*scpb.CheckConstraint)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
@@ -185,11 +192,22 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
 		rel.EntityAttr(IndexID, "IndexIDForValidation"),
 	),
+	rel.EntityMapping(t((*scpb.CheckConstraintUnvalidated)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+	),
 	rel.EntityMapping(t((*scpb.ForeignKeyConstraint)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ReferencedDescID, "ReferencedTableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
 		rel.EntityAttr(IndexID, "IndexIDForValidation"),
+	),
+	rel.EntityMapping(t((*scpb.ForeignKeyConstraintUnvalidated)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ReferencedDescID, "ReferencedTableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
 	),
 	rel.EntityMapping(t((*scpb.RowLevelTTL)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -230,6 +248,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(ColumnID, "ColumnID"),
 		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
 		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(ReferencedFunctionIDs, "UsesFunctionIDs"),
 	),
 	rel.EntityMapping(t((*scpb.ColumnOnUpdateExpression)(nil)),
 		rel.EntityAttr(DescID, "TableID"),

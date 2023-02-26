@@ -38,6 +38,16 @@ func TestBackup_base_add_column_no_default(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/add_column_no_default", newCluster)
 }
+func TestBackup_base_alter_table_add_check_udf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_udf", newCluster)
+}
+func TestBackup_base_alter_table_add_check_unvalidated(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_add_check_unvalidated", newCluster)
+}
 func TestBackup_base_alter_table_add_check_vanilla(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -93,6 +103,11 @@ func TestBackup_base_alter_table_drop_constraint_uwi(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_drop_constraint_uwi", newCluster)
 }
+func TestBackup_base_alter_table_validate_constraint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/alter_table_validate_constraint", newCluster)
+}
 func TestBackup_base_create_function(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -133,6 +148,16 @@ func TestBackup_base_drop_column_with_index(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_index", newCluster)
 }
+func TestBackup_base_drop_column_with_partial_index(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_partial_index", newCluster)
+}
+func TestBackup_base_drop_column_with_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_column_with_udf_default", newCluster)
+}
 func TestBackup_base_drop_function(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -172,4 +197,9 @@ func TestBackup_base_drop_table(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table", newCluster)
+}
+func TestBackup_base_drop_table_udf_default(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	sctest.Backup(t, "pkg/sql/schemachanger/testdata/end_to_end/drop_table_udf_default", newCluster)
 }

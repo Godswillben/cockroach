@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
@@ -109,6 +110,10 @@ type TenantServer struct {
 
 var _ tspb.TenantTimeSeriesServer = &TenantServer{}
 
+// Query delegates to the tenant connector to query
+// the tsdb on the system tenant. The only authorization
+// necessary is the tenant capability check on the
+// connector.
 func (t *TenantServer) Query(
 	ctx context.Context, req *tspb.TimeSeriesQueryRequest,
 ) (*tspb.TimeSeriesQueryResponse, error) {
@@ -472,7 +477,7 @@ func dumpTimeseriesAllSources(
 
 	for span != nil {
 		b := &kv.Batch{}
-		scan := roachpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
+		scan := kvpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
 		b.AddRawRequest(scan)
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		err := db.Run(ctx, b)

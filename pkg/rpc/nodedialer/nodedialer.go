@@ -19,6 +19,7 @@ import (
 
 	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -105,7 +106,7 @@ func (n *Dialer) Dial(
 	}
 	// Don't trip the breaker if we're already canceled.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, errors.Wrap(ctxErr, "dial")
 	}
 	breaker := n.getBreaker(nodeID, class)
 	addr, err := n.resolver(nodeID)
@@ -138,7 +139,7 @@ func (n *Dialer) DialNoBreaker(
 }
 
 // DialInternalClient is a specialization of DialClass for callers that
-// want a roachpb.InternalClient. This supports an optimization to bypass the
+// want a kvpb.InternalClient. This supports an optimization to bypass the
 // network for the local node.
 //
 // For a more contextualized explanation, see the comment that decorates
@@ -160,14 +161,14 @@ func (n *Dialer) DialInternalClient(
 
 	addr, err := n.resolver(nodeID)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "resolver error")
 	}
 	log.VEventf(ctx, 2, "sending request to %s", addr)
 	conn, err := n.dial(ctx, nodeID, addr, n.getBreaker(nodeID, class), true /* checkBreaker */, class)
 	if err != nil {
 		return nil, err
 	}
-	return TracingInternalClient{InternalClient: roachpb.NewInternalClient(conn)}, err
+	return TracingInternalClient{InternalClient: kvpb.NewInternalClient(conn)}, nil
 }
 
 // dial performs the dialing of the remote connection. If breaker is nil,
@@ -180,9 +181,10 @@ func (n *Dialer) dial(
 	checkBreaker bool,
 	class rpc.ConnectionClass,
 ) (_ *grpc.ClientConn, err error) {
+	const ctxWrapMsg = "dial"
 	// Don't trip the breaker if we're already canceled.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+		return nil, errors.Wrap(ctxErr, ctxWrapMsg)
 	}
 	if checkBreaker && !breaker.Ready() {
 		err = errors.Wrapf(circuit.ErrBreakerOpen, "unable to dial n%d", nodeID)
@@ -198,7 +200,7 @@ func (n *Dialer) dial(
 	if err != nil {
 		// If we were canceled during the dial, don't trip the breaker.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return nil, errors.Wrap(ctxErr, ctxWrapMsg)
 		}
 		err = errors.Wrapf(err, "failed to connect to n%d at %v", nodeID, addr)
 		if breaker != nil {
@@ -304,13 +306,13 @@ func (n *Dialer) Latency(nodeID roachpb.NodeID) (time.Duration, error) {
 // Note that TracingInternalClient is not used to wrap the internalClientAdapter
 // - local RPCs don't need this tracing functionality.
 type TracingInternalClient struct {
-	roachpb.InternalClient
+	kvpb.InternalClient
 }
 
 // Batch overrides the Batch RPC client method and fills in tracing information.
 func (tic TracingInternalClient) Batch(
-	ctx context.Context, ba *roachpb.BatchRequest, opts ...grpc.CallOption,
-) (*roachpb.BatchResponse, error) {
+	ctx context.Context, ba *kvpb.BatchRequest, opts ...grpc.CallOption,
+) (*kvpb.BatchResponse, error) {
 	sp := tracing.SpanFromContext(ctx)
 	if sp != nil && !sp.IsNoop() {
 		ba = ba.ShallowCopy()

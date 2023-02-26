@@ -243,12 +243,13 @@ CREATE TABLE system.web_sessions (
 	"revokedAt"    TIMESTAMP,
 	"lastUsedAt"   TIMESTAMP  NOT NULL DEFAULT now(),
 	"auditInfo"    STRING,
+	user_id        OID,
 	CONSTRAINT "primary" PRIMARY KEY (id),
 	INDEX ("expiresAt"),
 	INDEX ("createdAt"),
   INDEX ("revokedAt"),
   INDEX ("lastUsedAt"),
-	FAMILY (id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo")
+	FAMILY "fam_0_id_hashedSecret_username_createdAt_expiresAt_revokedAt_lastUsedAt_auditInfo" (id, "hashedSecret", username, "createdAt", "expiresAt", "revokedAt", "lastUsedAt", "auditInfo", user_id)
 );`
 
 	// table_statistics is used to track statistics collected about individual
@@ -601,11 +602,14 @@ CREATE TABLE system.database_role_settings (
     database_id  OID NOT NULL,
     role_name    STRING NOT NULL,
     settings     STRING[] NOT NULL,
+    role_id      OID NULL,
     CONSTRAINT "primary" PRIMARY KEY (database_id, role_name),
+    UNIQUE INDEX (database_id, role_id) STORING (settings),
 		FAMILY "primary" (
 			database_id,
-      role_name,
-      settings
+			role_name,
+			settings,
+			role_id
 		)
 );`
 
@@ -740,8 +744,11 @@ CREATE TABLE system.privileges (
 	path STRING NOT NULL,
 	privileges STRING[] NOT NULL,
 	grant_options STRING[] NOT NULL,
+	user_id OID,
 	CONSTRAINT "primary" PRIMARY KEY (username, path),
-	FAMILY "primary" (username, path, privileges, grant_options)
+	UNIQUE INDEX (path, user_id) STORING (privileges, grant_options),
+	UNIQUE INDEX (path, username) STORING (privileges, grant_options),
+	FAMILY "primary" (username, path, privileges, grant_options, user_id)
 );`
 
 	SystemExternalConnectionsTableSchema = `
@@ -1581,6 +1588,7 @@ var (
 				{Name: "revokedAt", ID: 6, Type: types.Timestamp, Nullable: true},
 				{Name: "lastUsedAt", ID: 7, Type: types.Timestamp, DefaultExpr: &nowString},
 				{Name: "auditInfo", ID: 8, Type: types.String, Nullable: true},
+				{Name: "user_id", ID: 9, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -1595,8 +1603,9 @@ var (
 						"revokedAt",
 						"lastUsedAt",
 						"auditInfo",
+						"user_id",
 					},
-					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
+					ColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9},
 				},
 			},
 			pk("id"),
@@ -2654,14 +2663,14 @@ var (
 				{Name: "database_id", ID: 1, Type: types.Oid, Nullable: false},
 				{Name: "role_name", ID: 2, Type: types.String, Nullable: false},
 				{Name: "settings", ID: 3, Type: types.StringArray, Nullable: false},
+				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
-					Name:            "primary",
-					ID:              0,
-					ColumnNames:     []string{"database_id", "role_name", "settings"},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3},
-					DefaultColumnID: 3,
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"database_id", "role_name", "settings", "role_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2673,6 +2682,18 @@ var (
 					catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
 				},
 				KeyColumnIDs: []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "database_role_settings_database_id_role_id_key",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"database_id", "role_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{1, 4},
+				KeySuffixColumnIDs:  []descpb.ColumnID{2},
+				StoreColumnNames:    []string{"settings"},
+				StoreColumnIDs:      []descpb.ColumnID{3},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		))
 
@@ -2908,13 +2929,14 @@ var (
 				{Name: "path", ID: 2, Type: types.String},
 				{Name: "privileges", ID: 3, Type: types.StringArray},
 				{Name: "grant_options", ID: 4, Type: types.StringArray},
+				{Name: "user_id", ID: 5, Type: types.Oid, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
 					ID:          0,
-					ColumnNames: []string{"username", "path", "privileges", "grant_options"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4},
+					ColumnNames: []string{"username", "path", "privileges", "grant_options", "user_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -2924,6 +2946,29 @@ var (
 				KeyColumnNames:      []string{"username", "path"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1, 2},
+			},
+			descpb.IndexDescriptor{
+				Name:                "privileges_path_user_id_key",
+				ID:                  2,
+				Unique:              true,
+				KeyColumnNames:      []string{"path", "user_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 5},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				StoreColumnNames:    []string{"privileges", "grant_options"},
+				StoreColumnIDs:      []descpb.ColumnID{3, 4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:                "privileges_path_username_key",
+				ID:                  3,
+				Unique:              true,
+				KeyColumnNames:      []string{"path", "username"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 1},
+				StoreColumnNames:    []string{"privileges", "grant_options"},
+				StoreColumnIDs:      []descpb.ColumnID{3, 4},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		),
 	)

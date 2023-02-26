@@ -13,33 +13,83 @@ package tenantcapabilitiesauthorizer
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
+	"github.com/cockroachdb/errors"
 )
 
 // Authorizer is a concrete implementation of the tenantcapabilities.Authorizer
 // interface. It's safe for concurrent use.
 type Authorizer struct {
 	capabilitiesReader tenantcapabilities.Reader
+	settings           *cluster.Settings
+
+	knobs tenantcapabilities.TestingKnobs
 }
 
 var _ tenantcapabilities.Authorizer = &Authorizer{}
 
 // New constructs a new tenantcapabilities.Authorizer.
-func New(reader tenantcapabilities.Reader) *Authorizer {
+func New(settings *cluster.Settings, knobs *tenantcapabilities.TestingKnobs) *Authorizer {
+	var testingKnobs tenantcapabilities.TestingKnobs
+	if knobs != nil {
+		testingKnobs = *knobs
+	}
 	a := &Authorizer{
-		capabilitiesReader: reader,
+		settings: settings,
+		knobs:    testingKnobs,
+		// capabilitiesReader is set post construction, using BindReader.
 	}
 	return a
 }
 
 // HasCapabilityForBatch implements the tenantcapabilities.Authorizer interface.
 func (a *Authorizer) HasCapabilityForBatch(
-	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest,
-) bool {
+	ctx context.Context, tenID roachpb.TenantID, ba *kvpb.BatchRequest,
+) error {
 	if tenID.IsSystem() {
-		return true // the system tenant is allowed to do as it pleases
+		return nil // the system tenant is allowed to do as it pleases
+	}
+	if a.capabilitiesReader == nil {
+		err := errors.AssertionFailedf("trying to perform capability check when no reader exists")
+		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
+		return err
+	}
+	cp, found := a.capabilitiesReader.GetCapabilities(tenID)
+	if !found {
+		log.VInfof(
+			ctx,
+			3,
+			"no capability information for tenant %s; requests that require capabilities may be denied",
+			tenID,
+		)
+	}
+
+	for _, ru := range ba.Requests {
+		switch ru.GetInner().(type) {
+		case *kvpb.AdminSplitRequest:
+			if !cp.CanAdminSplit && !a.knobs.AuthorizerSkipAdminSplitCapabilityChecks {
+				return errors.Newf("tenant %s does not have admin split capability", tenID)
+			}
+		default:
+			// No capability checks for any other type of request.
+		}
+	}
+	return nil
+}
+
+// BindReader implements the tenantcapabilities.Authorizer interface.
+func (a *Authorizer) BindReader(reader tenantcapabilities.Reader) {
+	a.capabilitiesReader = reader
+}
+
+func (a *Authorizer) HasNodeStatusCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if tenID.IsSystem() {
+		return nil // the system tenant is allowed to do as it pleases
 	}
 	cp, found := a.capabilitiesReader.GetCapabilities(tenID)
 	if !found {
@@ -49,16 +99,26 @@ func (a *Authorizer) HasCapabilityForBatch(
 			tenID,
 		)
 	}
-
-	for _, ru := range ba.Requests {
-		switch ru.GetInner().(type) {
-		case *roachpb.AdminSplitRequest:
-			if !cp.CanAdminSplit {
-				return false
-			}
-		default:
-			// No capability checks for other types of requests.
-		}
+	if !cp.CanViewNodeInfo {
+		return errors.Newf("tenant %s does not have capability to query cluster node metadata", tenID)
 	}
-	return true
+	return nil
+}
+
+func (a *Authorizer) HasTSDBQueryCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	if tenID.IsSystem() {
+		return nil // the system tenant is allowed to do as it pleases
+	}
+	cp, found := a.capabilitiesReader.GetCapabilities(tenID)
+	if !found {
+		log.Infof(
+			ctx,
+			"no capability information for tenant %s; requests that require capabilities may be denied",
+			tenID,
+		)
+	}
+	if !cp.CanViewTSDBMetrics {
+		return errors.Newf("tenant %s does not have capability to query timeseries data", tenID)
+	}
+	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
@@ -80,6 +81,12 @@ func getReplicationStatsAndStatus(
 		return nil, jobspb.ReplicationError.String(),
 			errors.Newf("job with id %d is not a stream ingestion job", job.ID())
 	}
+
+	details.StreamAddress, err = redactSourceURI(details.StreamAddress)
+	if err != nil {
+		return nil, jobspb.ReplicationError.String(), err
+	}
+
 	stats, err := replicationutils.GetStreamIngestionStatsNoHeartbeat(ctx, details, job.Progress())
 	if err != nil {
 		return nil, jobspb.ReplicationError.String(), err
@@ -112,11 +119,10 @@ func connectToActiveClient(
 		// topology it may have been changed to a new valid address via an ALTER
 		// statement
 	}
-
 	// Without a list of addresses from existing progress we use the stream
 	// address from the creation statement
 	streamAddress := streamingccl.StreamAddress(details.StreamAddress)
-	client, err := streamclient.NewStreamClient(ctx, streamAddress)
+	client, err := streamclient.NewStreamClient(ctx, streamAddress, ingestionJob.GetInternalDB())
 
 	return client, errors.Wrapf(err, "ingestion job %d failed to connect to stream address or existing topology for planning", ingestionJob.ID())
 }
@@ -497,7 +503,8 @@ func maybeRevertToCutoverTimestamp(
 
 	p := execCtx.(sql.JobExecContext)
 	db := p.ExecCfg().DB
-	j, err := p.ExecCfg().JobRegistry.LoadJob(ctx, ingestionJobID)
+	jobRegistry := p.ExecCfg().JobRegistry
+	j, err := jobRegistry.LoadJob(ctx, ingestionJobID)
 	if err != nil {
 		return false, err
 	}
@@ -542,6 +549,8 @@ func maybeRevertToCutoverTimestamp(
 		if err != nil {
 			return err
 		}
+		m := jobRegistry.MetricsStruct().StreamIngest.(*Metrics)
+		m.ReplicationCutoverProgress.Update(int64(nRanges))
 		if origNRanges == -1 {
 			origNRanges = nRanges
 		}
@@ -564,8 +573,8 @@ func maybeRevertToCutoverTimestamp(
 		}
 		var b kv.Batch
 		for _, span := range spans {
-			b.AddRawRequest(&roachpb.RevertRangeRequest{
-				RequestHeader: roachpb.RequestHeader{
+			b.AddRawRequest(&kvpb.RevertRangeRequest{
+				RequestHeader: kvpb.RequestHeader{
 					Key:    span.Key,
 					EndKey: span.EndKey,
 				},
@@ -612,11 +621,11 @@ func activateTenant(ctx context.Context, execCtx interface{}, newTenantID roachp
 }
 
 func (s *streamIngestionResumer) cancelProducerJob(
-	ctx context.Context, details jobspb.StreamIngestionDetails,
+	ctx context.Context, details jobspb.StreamIngestionDetails, db isql.DB,
 ) {
 	streamID := streampb.StreamID(details.StreamID)
 	addr := streamingccl.StreamAddress(details.StreamAddress)
-	client, err := streamclient.NewStreamClient(ctx, addr)
+	client, err := streamclient.NewStreamClient(ctx, addr, db)
 	if err != nil {
 		log.Warningf(ctx, "encountered error when creating the stream client: %v", err)
 		return
@@ -645,7 +654,7 @@ func (s *streamIngestionResumer) OnFailOrCancel(
 	// ingestion anymore.
 	jobExecCtx := execCtx.(sql.JobExecContext)
 	details := s.job.Details().(jobspb.StreamIngestionDetails)
-	s.cancelProducerJob(ctx, details)
+	s.cancelProducerJob(ctx, details, jobExecCtx.ExecCfg().InternalDB)
 
 	execCfg := jobExecCtx.ExecCfg()
 	return execCfg.InternalDB.Txn(ctx, func(

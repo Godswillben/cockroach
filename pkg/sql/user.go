@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -84,7 +85,7 @@ func GetUserSessionInitInfo(
 	pwRetrieveFn func(ctx context.Context) (expired bool, hashedPassword password.PasswordHash, err error),
 	err error,
 ) {
-	runFn := getUserInfoRunFn(execCfg, user, "get-user-timeout")
+	runFn := getUserInfoRunFn(execCfg, user, "get-user-session")
 
 	if user.IsRootUser() {
 		// As explained above, for root we report that the user exists
@@ -225,7 +226,7 @@ func retrieveSessionInitInfoWithCache(
 			retrieveAuthInfo,
 		)
 		if retErr != nil {
-			return retErr
+			return errors.Wrap(retErr, "get auth info error")
 		}
 		// Avoid looking up default settings for root and non-existent users.
 		if userName.IsRootUser() || !aInfo.UserExists {
@@ -239,7 +240,7 @@ func retrieveSessionInitInfoWithCache(
 			databaseName,
 			retrieveDefaultSettings,
 		)
-		return retErr
+		return errors.Wrap(retErr, "get default settings error")
 	}(); err != nil {
 		// Failed to retrieve the user account. Report in logs for later investigation.
 		log.Warningf(ctx, "user lookup for %q failed: %v", userName, err)
@@ -545,11 +546,7 @@ func (p *planner) setRole(ctx context.Context, local bool, s username.SQLUsernam
 			return err
 		}
 		if !exists {
-			return pgerror.Newf(
-				pgcode.InvalidParameterValue,
-				"role %s does not exist",
-				becomeUser.Normalized(),
-			)
+			return sqlerrors.NewUndefinedUserError(becomeUser)
 		}
 	}
 
@@ -572,8 +569,11 @@ func (p *planner) setRole(ctx context.Context, local bool, s username.SQLUsernam
 		ctx,
 		local,
 		func(m sessionDataMutator) error {
+			oldIsSuperuser := m.data.IsSuperuser
 			m.data.IsSuperuser = willBecomeAdmin
-			m.bufferParamStatusUpdate("is_superuser", updateStr)
+			if oldIsSuperuser != willBecomeAdmin {
+				m.bufferParamStatusUpdate("is_superuser", updateStr)
+			}
 
 			// The "none" user does resets the SessionUserProto in a SET ROLE.
 			if becomeUser.IsNoneRole() {
@@ -645,17 +645,18 @@ func (p *planner) checkCanBecomeUser(ctx context.Context, becomeUser username.SQ
 	return nil
 }
 
-// MaybeUpgradeStoredPasswordHash attempts to convert a stored hash
-// that was encoded using crdb-bcrypt, to the SCRAM-SHA-256 format.
+// MaybeConvertStoredPasswordHash attempts to convert a stored hash
+// to match the current server.user_login.password_encryption setting..
 //
 // This auto-conversion is a CockroachDB-specific feature, which
 // pushes clusters upgraded from a previous version into using
-// SCRAM-SHA-256.
+// SCRAM-SHA-256, and also allows easy downgrading from SCRAM-SHA-256
+// back to crdb-bcrypt.
 //
 // The caller is responsible for ensuring this function is only called
 // after a successful authentication, that is, the provided cleartext
 // password is known to match the previously-encoded prevHash.
-func MaybeUpgradeStoredPasswordHash(
+func MaybeConvertStoredPasswordHash(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
 	userName username.SQLUsername,
@@ -666,11 +667,16 @@ func MaybeUpgradeStoredPasswordHash(
 	// configuration.
 
 	autoUpgradePasswordHashesBool := security.AutoUpgradePasswordHashes.Get(&execCfg.Settings.SV)
+	autoDowngradePasswordHashesBool := security.AutoDowngradePasswordHashes.Get(&execCfg.Settings.SV)
 	hashMethod := security.GetConfiguredPasswordHashMethod(&execCfg.Settings.SV)
 
-	converted, prevHash, newHash, newMethod, err := password.MaybeUpgradePasswordHash(ctx,
-		autoUpgradePasswordHashesBool, hashMethod, cleartext, currentHash,
-		security.GetExpensiveHashComputeSem(ctx), log.Infof)
+	converted, prevHash, newHash, newMethod, err := password.MaybeConvertPasswordHash(
+		ctx,
+		autoUpgradePasswordHashesBool, autoDowngradePasswordHashesBool,
+		hashMethod, cleartext, currentHash,
+		security.GetExpensiveHashComputeSem(ctx),
+		log.Infof,
+	)
 	if err != nil {
 		// We're not returning an error: clients should not be refused a
 		// session just because a password conversion failed.
@@ -706,7 +712,7 @@ func updateUserPasswordHash(
 	userName username.SQLUsername,
 	prevHash, newHash []byte,
 ) error {
-	runFn := getUserInfoRunFn(execCfg, userName, "set-hash-timeout")
+	runFn := getUserInfoRunFn(execCfg, userName, "set-user-password-hash")
 
 	return runFn(ctx, func(ctx context.Context) error {
 		return DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, d *descs.Collection) error {

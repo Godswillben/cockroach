@@ -56,15 +56,21 @@ func (c *serverController) httpMux(w http.ResponseWriter, r *http.Request) {
 		case loginPath, DemoLoginPath:
 			c.attemptLoginToAllTenants().ServeHTTP(w, r)
 			return
-		case logoutPath:
-			c.attemptLogoutFromAllTenants().ServeHTTP(w, r)
-			return
 		}
+	}
+	// Since we do not support per-tenant logout until
+	// https://github.com/cockroachdb/cockroach/issues/92855
+	// is completed, we should always fanout a logout
+	// request in order to clear the multi-tenant session
+	// cookies properly.
+	if r.URL.Path == logoutPath {
+		c.attemptLogoutFromAllTenants().ServeHTTP(w, r)
+		return
 	}
 	s, err := c.getServer(ctx, tenantName)
 	if err != nil {
 		log.Warningf(ctx, "unable to find server for tenant %q: %v", tenantName, err)
-		// Clear session and tenant cookies after all logouts have completed.
+		// Clear session and tenant cookies since it appears they reference invalid state.
 		http.SetCookie(w, &http.Cookie{
 			Name:     MultitenantSessionCookieName,
 			Value:    "",
@@ -79,7 +85,19 @@ func (c *serverController) httpMux(w http.ResponseWriter, r *http.Request) {
 			HttpOnly: false,
 			Expires:  timeutil.Unix(0, 0),
 		})
-		w.WriteHeader(http.StatusInternalServerError)
+		// Fall back to serving requests from the default tenant. This helps us serve
+		// the root path along with static assets even when the browser contains invalid
+		// tenant names or sessions (common during development). Otherwise the user can
+		// get into a state where they cannot load DB Console assets at all due to invalid
+		// cookies.
+		defaultTenantName := roachpb.TenantName(defaultTenantSelect.Get(&c.st.SV))
+		s, err = c.getServer(ctx, defaultTenantName)
+		if err != nil {
+			log.Warningf(ctx, "unable to find server for default tenant %q: %v", defaultTenantName, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		s.getHTTPHandlerFn()(w, r)
 		return
 	}
 	s.getHTTPHandlerFn()(w, r)
@@ -273,6 +291,14 @@ func (c *serverController) attemptLogoutFromAllTenants() http.Handler {
 		http.SetCookie(w, &cookie)
 		cookie = http.Cookie{
 			Name:     TenantSelectCookieName,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: false,
+			Expires:  timeutil.Unix(0, 0),
+		}
+		http.SetCookie(w, &cookie)
+		cookie = http.Cookie{
+			Name:     SessionCookieName,
 			Value:    "",
 			Path:     "/",
 			HttpOnly: false,

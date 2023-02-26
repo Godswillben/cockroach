@@ -21,6 +21,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -336,7 +337,7 @@ func verifyLogSizeInSync(t *testing.T, r *Replica) {
 	r.mu.Lock()
 	raftLogSize := r.mu.raftLogSize
 	r.mu.Unlock()
-	actualRaftLogSize, err := ComputeRaftLogSize(context.Background(), r.RangeID, r.Engine(), r.SideloadedRaftMuLocked())
+	actualRaftLogSize, err := ComputeRaftLogSize(context.Background(), r.RangeID, r.store.TODOEngine(), r.SideloadedRaftMuLocked())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +421,7 @@ func TestNewTruncateDecisionMaxSize(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 
-	cfg := TestStoreConfig(hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Nanosecond) /* maxOffset */)
+	cfg := TestStoreConfig(hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123))))
 	const exp = 1881
 	cfg.RaftLogTruncationThreshold = exp
 	ctx := context.Background()
@@ -619,7 +620,7 @@ func TestProactiveRaftLogTruncate(t *testing.T) {
 			testutils.SucceedsSoon(t, func() error {
 				if looselyCoupled {
 					// Flush the engine to advance durability, which triggers truncation.
-					require.NoError(t, store.engine.Flush())
+					require.NoError(t, store.TODOEngine().Flush())
 				}
 				newFirstIndex := r.GetFirstIndex()
 				if newFirstIndex <= oldFirstIndex {
@@ -729,7 +730,7 @@ func TestTruncateLog(t *testing.T) {
 
 		// Discard the first half of the log.
 		truncateArgs := truncateLogArgs(indexes[5], rangeID)
-		if _, pErr := tc.SendWrappedWith(roachpb.Header{RangeID: 1}, &truncateArgs); pErr != nil {
+		if _, pErr := tc.SendWrappedWith(kvpb.Header{RangeID: 1}, &truncateArgs); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -871,8 +872,8 @@ func TestTruncateLogRecompute(t *testing.T) {
 	put := func() {
 		var v roachpb.Value
 		v.SetBytes(bytes.Repeat([]byte("x"), RaftLogQueueStaleSize*5))
-		put := roachpb.NewPut(key, v)
-		ba := &roachpb.BatchRequest{}
+		put := kvpb.NewPut(key, v)
+		ba := &kvpb.BatchRequest{}
 		ba.Add(put)
 		ba.RangeID = repl.RangeID
 
@@ -914,7 +915,7 @@ func waitForTruncationForTesting(
 	testutils.SucceedsSoon(t, func() error {
 		if looselyCoupled {
 			// Flush the engine to advance durability, which triggers truncation.
-			require.NoError(t, r.Engine().Flush())
+			require.NoError(t, r.store.TODOEngine().Flush())
 		}
 		// FirstIndex should have changed.
 		firstIndex := r.GetFirstIndex()

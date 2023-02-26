@@ -1047,14 +1047,14 @@ func (c *clusterImpl) StopCockroachGracefullyOnNode(
 	gracefulOpts.RoachprodOpts.Sig = 15 // SIGTERM
 	gracefulOpts.RoachprodOpts.Wait = true
 	gracefulOpts.RoachprodOpts.MaxWait = 60
-	c.Stop(ctx, l, gracefulOpts, c.Node(node))
-	// NB: we still call Stop to make sure the process is dead when we try
-	// to restart it (or we'll catch an error from the RocksDB dir being
-	// locked). This won't happen unless run with --local due to timing.
-	c.Stop(ctx, l, option.DefaultStopOpts(), c.Node(node))
-	// TODO(tschottdorf): should return an error. I doubt that we want to
-	//  call these *testing.T-style methods on goroutines.
-	return nil
+	if err := c.StopE(ctx, l, gracefulOpts, c.Node(node)); err != nil {
+		return err
+	}
+
+	// NB: we still call Stop to make sure the process is dead when we
+	// try to restart it (in case it takes longer than `MaxWait` for it
+	// to finish).
+	return c.StopE(ctx, l, option.DefaultStopOpts(), c.Node(node))
 }
 
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
@@ -1306,10 +1306,13 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger) error
 			//
 			// Ignore the files in the the log directory; we pull the logs separately anyway
 			// so this would only cause duplication.
-			si := strconv.Itoa(i)
-			cmd := []string{"./cockroach", "debug", "zip", "--exclude-files='*.log,*.txt,*.pprof'", "--url", "{pgurl:" + si + "}", zipName}
-			if err := c.RunE(ctx, c.All(), cmd...); err != nil {
-				l.Printf("./cockroach debug zip failed: %v", err)
+			excludeFiles := "*.log,*.txt,*.pprof"
+			cmd := fmt.Sprintf(
+				"./cockroach debug zip --exclude-files='%s' --url {pgurl:%d} %s",
+				excludeFiles, i, zipName,
+			)
+			if err := c.RunE(ctx, c.Node(i), cmd); err != nil {
+				l.Printf("./cockroach debug zip failed on node %d: %v", i, err)
 				if i < c.spec.NodeCount {
 					continue
 				}
@@ -1338,15 +1341,14 @@ func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
 	}
 }
 
-// FailOnReplicaDivergence fails the test if
-// crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
-// replicas are inconsistent with each other. It uses the first node that
-// is up to run the query.
-func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) {
+// ConnectToLiveNode returns a connection to a live node in the cluster. If no
+// live node is found, it returns nil and -1. If a live node is found it returns
+// a connection to it and the node's index.
+func (c *clusterImpl) ConnectToLiveNode(ctx context.Context, t *testImpl) (*gosql.DB, int) {
+	node := -1
 	if c.spec.NodeCount < 1 {
-		return // unit tests
+		return nil, node // unit tests
 	}
-
 	// Find a live node to run against, if one exists.
 	var db *gosql.DB
 	for i := 1; i <= c.spec.NodeCount; i++ {
@@ -1363,15 +1365,32 @@ func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, t *testImpl) 
 			db = nil
 			continue
 		}
-		t.L().Printf("running (fast) consistency checks on node %d", i)
+		node = i
 		break
 	}
 	if db == nil {
-		t.L().Printf("no live node found, skipping consistency check")
-		return
+		return nil, node
 	}
-	defer db.Close()
+	return db, node
+}
 
+// FailOnInvalidDescriptors fails the test if there exists any descriptors in
+// the crdb_internal.invalid_objects virtual table.
+func (c *clusterImpl) FailOnInvalidDescriptors(ctx context.Context, db *gosql.DB, t *testImpl) {
+	if err := contextutil.RunWithTimeout(
+		ctx, "invalid descriptors check", 5*time.Minute,
+		func(ctx context.Context) error {
+			return roachtestutil.CheckInvalidDescriptors(db)
+		},
+	); err != nil {
+		t.Errorf("invalid descriptors check failed: %v", err)
+	}
+}
+
+// FailOnReplicaDivergence fails the test if
+// crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
+// replicas are inconsistent with each other.
+func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, db *gosql.DB, t *testImpl) {
 	if err := contextutil.RunWithTimeout(
 		ctx, "consistency check", 5*time.Minute,
 		func(ctx context.Context) error {
@@ -1403,7 +1422,7 @@ func (c *clusterImpl) FetchDmesg(ctx context.Context, l *logger.Logger) error {
 		}
 
 		// Run dmesg on all nodes to redirect the kernel ring buffer content to a file.
-		cmd := []string{"/bin/bash", "-c", "'sudo dmesg > " + name + "'"}
+		cmd := []string{"/bin/bash", "-c", "'sudo dmesg -T > " + name + "'"}
 		var results []install.RunResultDetails
 		var combinedDmesgError error
 		if results, combinedDmesgError = c.RunWithDetails(ctx, nil, c.All(), cmd...); combinedDmesgError != nil {

@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -272,7 +273,7 @@ type DescIDGenerator interface {
 type RangeStatsFetcher interface {
 
 	// RangeStats fetches the stats for the ranges which contain the passed keys.
-	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*roachpb.RangeStatsResponse, error)
+	RangeStats(ctx context.Context, keys ...roachpb.Key) ([]*kvpb.RangeStatsResponse, error)
 }
 
 var _ tree.ParseContext = &Context{}
@@ -281,8 +282,8 @@ var _ tree.ParseContext = &Context{}
 // crdb_internal.check_consistency.
 type ConsistencyCheckRunner interface {
 	CheckConsistency(
-		ctx context.Context, from, to roachpb.Key, mode roachpb.ChecksumMode,
-	) (*roachpb.CheckConsistencyResponse, error)
+		ctx context.Context, from, to roachpb.Key, mode kvpb.ChecksumMode,
+	) (*kvpb.CheckConsistencyResponse, error)
 }
 
 // RangeProber is an interface embedded in eval.Context used by
@@ -446,15 +447,17 @@ func (ec *Context) Stop(c context.Context) {
 
 // FmtCtx creates a FmtCtx with the given options as well as the EvalContext's session data.
 func (ec *Context) FmtCtx(f tree.FmtFlags, opts ...tree.FmtCtxOption) *tree.FmtCtx {
+	applyOpts := make([]tree.FmtCtxOption, 0, 2+len(opts))
+	applyOpts = append(applyOpts, tree.FmtLocation(ec.GetLocation()))
 	if ec.SessionData() != nil {
-		opts = append(
-			[]tree.FmtCtxOption{tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig)},
-			opts...,
+		applyOpts = append(
+			applyOpts,
+			tree.FmtDataConversionConfig(ec.SessionData().DataConversionConfig),
 		)
 	}
 	return tree.NewFmtCtx(
 		f,
-		opts...,
+		append(applyOpts, opts...)...,
 	)
 }
 

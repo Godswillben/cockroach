@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/text/language"
@@ -381,13 +382,14 @@ func (node *CreateType) Format(ctx *FmtCtx) {
 		ctx.WriteString(")")
 	case Composite:
 		ctx.WriteString("AS (")
-		for i, elem := range node.CompositeTypeList {
+		for i := range node.CompositeTypeList {
+			elem := &node.CompositeTypeList[i]
 			if i != 0 {
 				ctx.WriteString(", ")
 			}
 			ctx.FormatNode(&elem.Label)
 			ctx.WriteString(" ")
-			ctx.WriteString(elem.Type.SQLString())
+			ctx.FormatTypeReference(elem.Type)
 		}
 		ctx.WriteString(")")
 	}
@@ -569,7 +571,7 @@ func NewColumnTableDef(
 			// In CRDB, collated strings are treated separately to string family types.
 			// To most behave like postgres, set the CollatedString type if a non-"default"
 			// collation is used.
-			if locale != DefaultCollationTag {
+			if locale != collatedstring.DefaultCollationTag {
 				_, err := language.Parse(locale)
 				if err != nil {
 					return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
@@ -745,7 +747,7 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	// TABLE ... AS query.
 	if node.Type != nil {
 		ctx.WriteByte(' ')
-		ctx.WriteString(node.columnTypeString())
+		node.formatColumnType(ctx)
 	}
 
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
@@ -878,7 +880,15 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	}
 }
 
-func (node *ColumnTableDef) columnTypeString() string {
+func (node *ColumnTableDef) formatColumnType(ctx *FmtCtx) {
+	if replaced, ok := node.replacedSerialTypeName(); ok {
+		ctx.WriteString(replaced)
+	} else {
+		ctx.FormatTypeReference(node.Type)
+	}
+}
+
+func (node *ColumnTableDef) replacedSerialTypeName() (string, bool) {
 	if node.IsSerial {
 		// Map INT types to SERIAL keyword.
 		// TODO (rohany): This should be pushed until type resolution occurs.
@@ -886,13 +896,14 @@ func (node *ColumnTableDef) columnTypeString() string {
 		//  so we handle those cases here.
 		switch MustBeStaticallyKnownType(node.Type).Width() {
 		case 16:
-			return "SERIAL2"
+			return "SERIAL2", true
 		case 32:
-			return "SERIAL4"
+			return "SERIAL4", true
+		default:
+			return "SERIAL8", true
 		}
-		return "SERIAL8"
 	}
-	return node.Type.SQLString()
+	return "", false
 }
 
 // String implements the fmt.Stringer interface.
@@ -2228,10 +2239,10 @@ func (node *SuperRegion) Format(ctx *FmtCtx) {
 	ctx.WriteString(" SUPER REGION ")
 	ctx.FormatNode(&node.Name)
 	ctx.WriteString(" VALUES ")
-	for i, region := range node.Regions {
+	for i := range node.Regions {
 		if i != 0 {
 			ctx.WriteString(",")
 		}
-		ctx.FormatNode(&region)
+		ctx.FormatNode(&node.Regions[i])
 	}
 }

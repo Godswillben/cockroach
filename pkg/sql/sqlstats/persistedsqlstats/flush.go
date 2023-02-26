@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -72,8 +71,62 @@ func (s *PersistedSQLStats) Flush(ctx context.Context) {
 
 	aggregatedTs := s.ComputeAggregatedTs()
 
-	s.flushStmtStats(ctx, aggregatedTs)
-	s.flushTxnStats(ctx, aggregatedTs)
+	if s.stmtsLimitSizeReached(ctx) || s.txnsLimitSizeReached(ctx) {
+		log.Infof(ctx, "unable to flush fingerprints because table limit was reached.")
+	} else {
+		s.flushStmtStats(ctx, aggregatedTs)
+		s.flushTxnStats(ctx, aggregatedTs)
+	}
+}
+
+func (s *PersistedSQLStats) stmtsLimitSizeReached(ctx context.Context) bool {
+	maxPersistedRows := float64(SQLStatsMaxPersistedRows.Get(&s.SQLStats.GetClusterSettings().SV))
+
+	readStmt := `
+SELECT
+    count(*)
+FROM
+    system.statement_statistics
+`
+
+	row, err := s.cfg.DB.Executor().QueryRowEx(
+		ctx,
+		"fetch-stmt-count",
+		nil,
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,
+	)
+
+	if err != nil {
+		return false
+	}
+	actualSize := float64(tree.MustBeDInt(row[0]))
+	return actualSize > (maxPersistedRows * 1.5)
+}
+
+func (s *PersistedSQLStats) txnsLimitSizeReached(ctx context.Context) bool {
+	maxPersistedRows := float64(SQLStatsMaxPersistedRows.Get(&s.SQLStats.GetClusterSettings().SV))
+
+	readStmt := `
+SELECT
+    count(*)
+FROM
+    system.transaction_statistics
+`
+
+	row, err := s.cfg.DB.Executor().QueryRowEx(
+		ctx,
+		"fetch-txn-count",
+		nil,
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,
+	)
+
+	if err != nil {
+		return false
+	}
+	actualSize := float64(tree.MustBeDInt(row[0]))
+	return actualSize > (maxPersistedRows * 1.5)
 }
 
 func (s *PersistedSQLStats) flushStmtStats(ctx context.Context, aggregatedTs time.Time) {
@@ -487,7 +540,14 @@ func (s *PersistedSQLStats) insertStatementStats(
 	plan := tree.NewDJSON(sqlstatsutil.ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription))
 	nodeID := s.GetEnabledSQLInstanceID()
 
-	values := "$1 ,$2, $3, $4, $5, $6, $7, $8, $9, $10"
+	indexRecommendations := tree.NewDArray(types.String)
+	for _, recommendation := range stats.Stats.IndexRecommendations {
+		if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+			return 0, err
+		}
+	}
+
+	values := "$1 ,$2, $3, $4, $5, $6, $7, $8, $9, $10, $11"
 	args := append(make([]interface{}, 0, 11),
 		aggregatedTs,                       // aggregated_ts
 		serializedFingerprintID,            // fingerprint_id
@@ -499,17 +559,8 @@ func (s *PersistedSQLStats) insertStatementStats(
 		metadata,                           // metadata
 		statistics,                         // statistics
 		plan,                               // plan
+		indexRecommendations,               // index_recommendations
 	)
-	if s.cfg.Settings.Version.IsActive(ctx, clusterversion.V22_2AlterSystemStatementStatisticsAddIndexRecommendations) {
-		values = values + ", $11"
-		indexRecommendations := tree.NewDArray(types.String)
-		for _, recommendation := range stats.Stats.IndexRecommendations {
-			if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
-				return 0, err
-			}
-		}
-		args = append(args, indexRecommendations)
-	}
 
 	insertStmt := fmt.Sprintf(`
 INSERT INTO system.statement_statistics

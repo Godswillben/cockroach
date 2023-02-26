@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -59,6 +61,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -219,8 +222,8 @@ func TestServerStartClock(t *testing.T) {
 	// Run a command so that we are sure to touch the timestamp cache. This is
 	// actually not needed because other commands run during server
 	// initialization, but we cannot guarantee that's going to stay that way.
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: roachpb.Key("a")},
 	}
 	if _, err := kv.SendWrapped(
 		context.Background(), s.DB().NonTransactionalSender(), get,
@@ -537,7 +540,7 @@ func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
 
 			const maxOffset = 500 * time.Millisecond
 			m := timeutil.NewManualTime(timeutil.Unix(0, test.clockStartTime))
-			c := hlc.NewClock(m, maxOffset /* maxOffset */)
+			c := hlc.NewClock(m, maxOffset, maxOffset)
 
 			sleepUntilFn := func(ctx context.Context, t hlc.Timestamp) error {
 				delta := t.GoTime().Sub(c.Now().GoTime())
@@ -613,7 +616,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
 			m := timeutil.NewManualTime(timeutil.Unix(0, 1))
-			c := hlc.NewClock(m, time.Nanosecond /* maxOffset */)
+			c := hlc.NewClockForTesting(m)
 
 			var persistErr error
 			var persistedUpperBound int64
@@ -1078,7 +1081,7 @@ func TestAssertEnginesEmpty(t *testing.T) {
 
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
-	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.StoreClusterVersionKey(),
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.DeprecatedStoreClusterVersionKey(),
 		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
@@ -1207,4 +1210,27 @@ func TestSocketAutoNumbering(t *testing.T) {
 	if socketPath := s.(*TestServer).Cfg.SocketFile; !strings.HasSuffix(socketPath, "."+expectedPort) {
 		t.Errorf("expected unix socket ending with port %q, got %q", expectedPort, socketPath)
 	}
+}
+
+// Test that connections using the internal SQL loopback listener work.
+func TestInternalSQL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	conf, err := pgx.ParseConfig("")
+	require.NoError(t, err)
+	conf.User = "root"
+	// Configure pgx to connect on the loopback listener.
+	conf.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return s.(*TestServer).Server.loopbackPgL.Connect(ctx)
+	}
+	conn, err := pgx.ConnectConfig(ctx, conf)
+	require.NoError(t, err)
+	// Run a random query to check that it all works.
+	r := conn.QueryRow(ctx, "SELECT count(*) FROM system.sqlliveness")
+	var count int
+	require.NoError(t, r.Scan(&count))
 }

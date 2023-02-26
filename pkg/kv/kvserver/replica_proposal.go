@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -114,7 +115,7 @@ type ProposalData struct {
 	// applies. Other than tests, we only need a few bits of the request
 	// here; this could be replaced with isLease and isChangeReplicas
 	// booleans.
-	Request *roachpb.BatchRequest
+	Request *kvpb.BatchRequest
 
 	// leaseStatus represents the lease under which the Request was evaluated and
 	// under which this proposal is being made. For lease requests, this is the
@@ -124,6 +125,20 @@ type ProposalData struct {
 	// tok identifies the request to the propBuf. Once the proposal is made, the
 	// token will be used to stop tracking this request.
 	tok TrackedRequestToken
+}
+
+// Supersedes takes the MaxLeaseIndex of a RaftCommand obtained from a log
+// entry. It returns true if the ProposalData tracks a different MaxIndex,
+// implying that the log entry has been reproposed under an updated
+// MaxLeaseIndex. This implies that the current log entry will have been
+// rejected and should not be reproposed.
+//
+// Note that some commands such as lease requests (but not transfers) don't use
+// MaxLeaseIndex. For these, false will be returned.
+//
+// See (*Replica).mu.proposals for a detailed explanation of reproposals.
+func (proposal *ProposalData) Supersedes(entryMaxLeaseIndex uint64) bool {
+	return proposal.command.MaxLeaseIndex != entryMaxLeaseIndex
 }
 
 // finishApplication is called when a command application has finished. The
@@ -351,10 +366,18 @@ func (r *Replica) leasePostApplyLocked(
 	requiresExpirationBasedLease := r.requiresExpiringLeaseRLocked()
 	hasExpirationBasedLease := newLease.Type() == roachpb.LeaseExpiration
 
+	now := r.store.Clock().NowAsClockTimestamp()
+
+	// NB: ProposedTS is non-nil in practice, but we never fully migrated it
+	// in so we need to assume that it can be nil.
+	const slowLeaseWarningEnabled = false // see https://github.com/cockroachdb/cockroach/issues/97209
+	if slowLeaseWarningEnabled && iAmTheLeaseHolder && leaseChangingHands && newLease.ProposedTS != nil {
+		maybeLogSlowLeaseApplyWarning(ctx, time.Duration(now.WallTime-newLease.ProposedTS.WallTime), prevLease, newLease)
+	}
+
 	// Gossip the first range whenever its lease is acquired. We check to make
 	// sure the lease is active so that a trailing replica won't process an old
 	// lease request and attempt to gossip the first range.
-	now := r.store.Clock().NowAsClockTimestamp()
 	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.ownsValidLeaseRLocked(ctx, now) {
 		r.gossipFirstRangeLocked(ctx)
 	}
@@ -441,6 +464,49 @@ func (r *Replica) leasePostApplyLocked(
 	// Mark the new lease in the replica's lease history.
 	if r.leaseHistory != nil {
 		r.leaseHistory.add(*newLease)
+	}
+}
+
+// maybeLogSlowLeaseApplyWarning is called when the lease changes hands on the
+// new leaseholder. It logs if either the new lease was proposed well before it
+// became visible on the leaseholder (indicating replication lag) or if the
+// previous lease looks like we transferred a lease to a behind/offline replica.
+func maybeLogSlowLeaseApplyWarning(
+	ctx context.Context, newLeaseAppDelay time.Duration, prevLease, newLease *roachpb.Lease,
+) {
+	const slowLeaseApplyWarnThreshold = 500 * time.Millisecond
+	if newLeaseAppDelay > slowLeaseApplyWarnThreshold {
+		// If we hold the lease now and the lease was proposed "earlier", there
+		// must have been replication lag, and possibly reads and/or writes were
+		// delayed.
+		//
+		// We see this most commonly with lease transfers targeting a behind replica,
+		// or, in the worst case, a snapshot. We are constantly improving our
+		// heuristics for avoiding that[^1] but if it does happen it's good to know
+		// from the logs.
+		//
+		// In the case of a lease transfer, the two timestamps compared below are from
+		// different clocks, so there could be skew. We just pretend this is not the
+		// case, which is good enough here.
+		//
+		// [^1]: https://github.com/cockroachdb/cockroach/pull/82758
+		log.Warningf(ctx,
+			"lease %v active after replication lag of ~%.2fs; foreground traffic may have been impacted [prev=%v]",
+			newLease, newLeaseAppDelay.Seconds(), prevLease,
+		)
+	} else if prevLease.Type() == roachpb.LeaseExpiration &&
+		newLease.Type() == roachpb.LeaseEpoch &&
+		newLease.AcquisitionType == roachpb.LeaseAcquisitionType_Request {
+		// If the previous lease is expiration-based, but the new lease is not and
+		// the acquisition was non-cooperative, it is likely that a lease transfer
+		// (which is expiration-based) went to a follower that then couldn't hold
+		// the lease alive (for example, didn't apply it in time for it to
+		// actually serve any traffic). The result was likely an outage which
+		// resolves right now, so log to point this out.
+		log.Warningf(ctx,
+			"lease %v expired before being followed by lease %s; foreground traffic may have been impacted",
+			prevLease, newLease,
+		)
 	}
 }
 
@@ -616,8 +682,8 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 // proposalResult indicates the result of a proposal. Exactly one of
 // Reply and Err is set, and it represents the result of the proposal.
 type proposalResult struct {
-	Reply              *roachpb.BatchResponse
-	Err                *roachpb.Error
+	Reply              *kvpb.BatchResponse
+	Err                *kvpb.Error
 	EncounteredIntents []roachpb.Intent
 	EndTxns            []result.EndTxnIntents
 }
@@ -638,13 +704,13 @@ type proposalResult struct {
 func (r *Replica) evaluateProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
-	ba *roachpb.BatchRequest,
+	ba *kvpb.BatchRequest,
 	g *concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
-) (*result.Result, bool, *roachpb.Error) {
+) (*result.Result, bool, *kvpb.Error) {
 	if ba.Timestamp.IsEmpty() {
-		return nil, false, roachpb.NewErrorf("can't propose Raft command with zero timestamp")
+		return nil, false, kvpb.NewErrorf("can't propose Raft command with zero timestamp")
 	}
 
 	// Evaluate the commands. If this returns without an error, the batch should
@@ -667,7 +733,7 @@ func (r *Replica) evaluateProposal(
 	}
 
 	if pErr != nil {
-		if _, ok := pErr.GetDetail().(*roachpb.ReplicaCorruptionError); ok {
+		if _, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
 			return &res, false /* needConsensus */, pErr
 		}
 
@@ -735,16 +801,16 @@ func (r *Replica) evaluateProposal(
 
 // requestToProposal converts a BatchRequest into a ProposalData, by
 // evaluating it. The returned ProposalData is partially valid even
-// on a non-nil *roachpb.Error and should be proposed through Raft
+// on a non-nil *kvpb.Error and should be proposed through Raft
 // if ProposalData.command is non-nil.
 func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
-	ba *roachpb.BatchRequest,
+	ba *kvpb.BatchRequest,
 	g *concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
-) (*ProposalData, *roachpb.Error) {
+) (*ProposalData, *kvpb.Error) {
 	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, g, st, ui)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.

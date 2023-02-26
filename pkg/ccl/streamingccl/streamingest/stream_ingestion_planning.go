@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -35,10 +36,25 @@ import (
 const defaultRetentionTTLSeconds = int32(25 * 60 * 60)
 
 func streamIngestionJobDescription(
-	p sql.PlanHookState, streamIngestion *tree.CreateTenantFromReplication,
+	p sql.PlanHookState, sourceAddr string, streamIngestion *tree.CreateTenantFromReplication,
 ) (string, error) {
+	redactedSourceAddr, err := redactSourceURI(sourceAddr)
+	if err != nil {
+		return "", err
+	}
+
+	redactedCreateStmt := &tree.CreateTenantFromReplication{
+		TenantSpec:                  streamIngestion.TenantSpec,
+		ReplicationSourceTenantName: streamIngestion.ReplicationSourceTenantName,
+		ReplicationSourceAddress:    tree.NewDString(redactedSourceAddr),
+		Options:                     streamIngestion.Options,
+	}
 	ann := p.ExtendedEvalContext().Annotations
-	return tree.AsStringWithFQNames(streamIngestion, ann), nil
+	return tree.AsStringWithFQNames(redactedCreateStmt, ann), nil
+}
+
+func redactSourceURI(addr string) (string, error) {
+	return cloud.SanitizeExternalStorageURI(addr, streamclient.RedactableURLParameters)
 }
 
 func ingestionTypeCheck(
@@ -68,17 +84,16 @@ func ingestionPlanHook(
 		return nil, nil, nil, false, nil
 	}
 
-	// Check if the experimental feature is enabled.
-	if !p.SessionData().EnableStreamReplication {
+	if !streamingccl.CrossClusterReplicationEnabled.Get(&p.ExecCfg().Settings.SV) {
 		return nil, nil, nil, false, errors.WithTelemetry(
 			pgerror.WithCandidateCode(
 				errors.WithHint(
-					errors.Newf("stream replication is only supported experimentally"),
-					"You can enable stream replication by running `SET enable_experimental_stream_replication = true`.",
+					errors.Newf("cross cluster replication is disabled"),
+					"You can enable cross cluster replication by running `SET CLUSTER SETTING cross_cluster_replication.enabled = true`.",
 				),
 				pgcode.ExperimentalFeature,
 			),
-			"replication.ingest.disabled",
+			"cross_cluster_replication.enabled",
 		)
 	}
 
@@ -179,7 +194,7 @@ func ingestionPlanHook(
 		}
 
 		// Create a new stream with stream client.
-		client, err := streamclient.NewStreamClient(ctx, streamAddress)
+		client, err := streamclient.NewStreamClient(ctx, streamAddress, p.ExecCfg().InternalDB)
 		if err != nil {
 			return err
 		}
@@ -206,7 +221,7 @@ func ingestionPlanHook(
 			ReplicationStartTime:  replicationProducerSpec.ReplicationStartTime,
 		}
 
-		jobDescription, err := streamIngestionJobDescription(p, ingestionStmt)
+		jobDescription, err := streamIngestionJobDescription(p, from, ingestionStmt)
 		if err != nil {
 			return err
 		}

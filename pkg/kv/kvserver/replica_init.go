@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
@@ -41,45 +42,43 @@ const (
 	mergeQueueThrottleDuration = 5 * time.Second
 )
 
-// newReplica constructs a new Replica. If the desc is initialized, the store
-// must be present in it and the corresponding replica descriptor must have
-// replicaID as its ReplicaID.
-func newReplica(
-	ctx context.Context, desc *roachpb.RangeDescriptor, store *Store, replicaID roachpb.ReplicaID,
+// loadInitializedReplicaForTesting loads and constructs an initialized Replica,
+// after checking its invariants.
+func loadInitializedReplicaForTesting(
+	ctx context.Context, store *Store, desc *roachpb.RangeDescriptor, replicaID roachpb.ReplicaID,
 ) (*Replica, error) {
-	repl := newUnloadedReplica(ctx, desc.RangeID, store, replicaID)
-	repl.raftMu.Lock()
-	defer repl.raftMu.Unlock()
-	repl.mu.Lock()
-	defer repl.mu.Unlock()
-
-	// TODO(pavelkalinnikov): this path is taken only in tests. Remove it and
-	// assert desc.IsInitialized().
 	if !desc.IsInitialized() {
-		repl.assertStateRaftMuLockedReplicaMuRLocked(ctx, store.Engine())
-		return repl, nil
+		return nil, errors.AssertionFailedf("can not load with uninitialized descriptor: %s", desc)
 	}
-
-	if err := repl.loadRaftMuLockedReplicaMuLocked(desc); err != nil {
+	state, err := kvstorage.LoadReplicaState(ctx, store.TODOEngine(), store.StoreID(), desc, replicaID)
+	if err != nil {
 		return nil, err
 	}
-	return repl, nil
+	return newInitializedReplica(store, state)
 }
 
-// newUnloadedReplica partially constructs a Replica. The returned replica is
-// assumed to be uninitialized, until Replica.loadRaftMuLockedReplicaMuLocked()
-// is called with the correct descriptor. The primary reason this function
-// exists separately from Replica.loadRaftMuLockedReplicaMuLocked() is to avoid
-// attempting to fully construct a Replica and load it from storage prior to
-// proving that it can exist during the delicate synchronization dance in
-// Store.tryGetOrCreateReplica(). A Replica returned from this function must not
-// be used in any way until the load method has been called.
-func newUnloadedReplica(
-	ctx context.Context, rangeID roachpb.RangeID, store *Store, replicaID roachpb.ReplicaID,
-) *Replica {
-	if replicaID == 0 {
-		log.Fatalf(ctx, "cannot construct a replica for range %d with a 0 replica ID", rangeID)
+// newInitializedReplica creates an initialized Replica from its loaded state.
+func newInitializedReplica(store *Store, loaded kvstorage.LoadedReplicaState) (*Replica, error) {
+	r := newUninitializedReplica(store, loaded.ReplState.Desc.RangeID, loaded.ReplicaID)
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initRaftMuLockedReplicaMuLocked(loaded); err != nil {
+		return nil, err
 	}
+	return r, nil
+}
+
+// newUninitializedReplica constructs an uninitialized Replica with the given
+// range/replica ID. The returned replica remains uninitialized until
+// Replica.loadRaftMuLockedReplicaMuLocked() is called.
+//
+// TODO(#94912): we actually have another initialization path which should be
+// refactored: Replica.initFromSnapshotLockedRaftMuLocked().
+func newUninitializedReplica(
+	store *Store, rangeID roachpb.RangeID, replicaID roachpb.ReplicaID,
+) *Replica {
 	uninitState := stateloader.UninitializedReplicaState(rangeID)
 	r := &Replica{
 		AmbientContext: store.cfg.AmbientCtx,
@@ -108,11 +107,7 @@ func newUnloadedReplica(
 	r.mu.stateLoader = stateloader.Make(rangeID)
 	r.mu.quiescent = true
 	r.mu.conf = store.cfg.DefaultSpanConfig
-	split.Init(&r.loadBasedSplitter, store.cfg.Settings, split.GlobalRandSource(), func() float64 {
-		return float64(SplitByLoadQPSThreshold.Get(&store.cfg.Settings.SV))
-	}, func() time.Duration {
-		return kvserverbase.SplitByLoadMergeDelay.Get(&store.cfg.Settings.SV)
-	}, store.metrics.LoadSplitterMetrics)
+
 	r.mu.proposals = map[kvserverbase.CmdIDKey]*ProposalData{}
 	r.mu.checksums = map[uuid.UUID]*replicaChecksum{}
 	r.mu.proposalBuf.Init((*replicaProposer)(r), tracker.NewLockfreeTracker(), r.Clock(), r.ClusterSettings())
@@ -123,8 +118,15 @@ func newUnloadedReplica(
 	if leaseHistoryMaxEntries > 0 {
 		r.leaseHistory = newLeaseHistory()
 	}
+
 	if store.cfg.StorePool != nil {
 		r.loadStats = load.NewReplicaLoad(store.Clock(), store.cfg.StorePool.GetNodeLocalityString)
+		split.Init(
+			&r.loadBasedSplitter,
+			newReplicaSplitConfig(store.ClusterSettings()),
+			store.metrics.LoadSplitterMetrics,
+			store.rebalanceObjManager.Objective().ToSplitObjective(),
+		)
 	}
 
 	// NB: the state will be loaded when the replica gets initialized.
@@ -141,9 +143,9 @@ func newUnloadedReplica(
 	r.raftMu.sideloaded = logstore.NewDiskSideloadStorage(
 		store.cfg.Settings,
 		rangeID,
-		store.engine.GetAuxiliaryDir(),
+		store.TODOEngine().GetAuxiliaryDir(),
 		store.limiters.BulkIOWriteRate,
-		store.engine,
+		store.TODOEngine(),
 	)
 
 	r.splitQueueThrottle = util.Every(splitQueueThrottleDuration)
@@ -177,26 +179,26 @@ func (r *Replica) setStartKeyLocked(startKey roachpb.RKey) {
 	r.startKey = startKey
 }
 
-// loadRaftMuLockedReplicaMuLocked loads the state of the initialized replica
-// from storage. After this method returns, Replica is initialized, and can not
-// be loaded again.
+// initRaftMuLockedReplicaMuLocked initializes the Replica using the state
+// loaded from storage. Must not be called more than once on a Replica.
 //
-// This method is called in two places:
-//
-//  1. newReplica - used when the store is initializing and during testing
-//  2. splitPostApply - this call initializes a previously uninitialized Replica.
-func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor) error {
-	ctx := r.AnnotateCtx(context.TODO())
+// This method is called in:
+// - loadInitializedReplicaForTesting, to finalize creating an initialized replica;
+// - splitPostApply, to initialize a previously uninitialized replica.
+func (r *Replica) initRaftMuLockedReplicaMuLocked(s kvstorage.LoadedReplicaState) error {
+	desc := s.ReplState.Desc
+	// Ensure that the loaded state corresponds to the same replica.
+	if desc.RangeID != r.RangeID || s.ReplicaID != r.replicaID {
+		return errors.AssertionFailedf(
+			"%s: trying to init with other replica's state r%d/%d", r, desc.RangeID, s.ReplicaID)
+	}
+	// Ensure that we transition to initialized replica, and do it only once.
 	if !desc.IsInitialized() {
-		return errors.AssertionFailedf("r%d: cannot load an uninitialized replica", desc.RangeID)
+		return errors.AssertionFailedf("%s: cannot init replica with uninitialized descriptor", r)
+	} else if r.IsInitialized() {
+		return errors.AssertionFailedf("%s: cannot reinitialize an initialized replica", r)
 	}
-	if r.IsInitialized() {
-		return errors.AssertionFailedf("r%d: cannot reinitialize an initialized replica", desc.RangeID)
-	} else if r.replicaID == 0 {
-		// NB: This is just a defensive check as r.mu.replicaID should never be 0.
-		return errors.AssertionFailedf("r%d: cannot initialize replica without a replicaID",
-			desc.RangeID)
-	}
+
 	r.setStartKeyLocked(desc.StartKey)
 
 	// Clear the internal raft group in case we're being reset. Since we're
@@ -204,31 +206,11 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 	// group.
 	r.mu.internalRaftGroup = nil
 
-	var err error
-	if r.mu.state, err = r.mu.stateLoader.Load(ctx, r.Engine(), desc); err != nil {
-		return err
-	}
-	r.mu.lastIndexNotDurable, err = r.mu.stateLoader.LoadLastIndex(ctx, r.Engine())
-	if err != nil {
-		return err
-	}
+	r.mu.state = s.ReplState
+	r.mu.lastIndexNotDurable = s.LastIndex
 	r.mu.lastTermNotDurable = invalidLastTerm
 
-	// Ensure that we're not trying to load a replica with a different ID than
-	// was used to construct this Replica.
-	var replicaID roachpb.ReplicaID
-	if replicaDesc, found := r.mu.state.Desc.GetReplicaDescriptor(r.StoreID()); found {
-		replicaID = replicaDesc.ReplicaID
-	} else {
-		return errors.AssertionFailedf("r%d: cannot initialize replica which is not in descriptor %v",
-			desc.RangeID, desc)
-	}
-	if r.replicaID != replicaID {
-		return errors.AssertionFailedf("attempting to initialize a replica which has ID %d with ID %d",
-			r.replicaID, replicaID)
-	}
-
-	r.setDescLockedRaftMuLocked(ctx, desc)
+	r.setDescLockedRaftMuLocked(r.AnnotateCtx(context.TODO()), desc)
 
 	// Only do this if there was a previous lease. This shouldn't be important
 	// to do but consider that the first lease which is obtained is back-dated
@@ -242,7 +224,47 @@ func (r *Replica) loadRaftMuLockedReplicaMuLocked(desc *roachpb.RangeDescriptor)
 		r.mu.minLeaseProposedTS = r.Clock().NowAsClockTimestamp()
 	}
 
-	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, r.store.Engine())
+	return nil
+}
+
+// initFromSnapshotLockedRaftMuLocked initializes a Replica when applying the
+// initial snapshot.
+func (r *Replica) initFromSnapshotLockedRaftMuLocked(
+	ctx context.Context, desc *roachpb.RangeDescriptor,
+) error {
+	if !desc.IsInitialized() {
+		return errors.AssertionFailedf("initializing replica with uninitialized desc: %s", desc)
+	}
+
+	r.setDescLockedRaftMuLocked(ctx, desc)
+	r.setStartKeyLocked(desc.StartKey)
+
+	// Unquiesce the replica. We don't allow uninitialized replicas to unquiesce,
+	// but now that the replica has been initialized, we unquiesce it as soon as
+	// possible. This replica was initialized in response to the reception of a
+	// snapshot from another replica. This means that the other replica is not
+	// quiesced, so we don't need to campaign or wake the leader. We just want
+	// to start ticking.
+	//
+	// NOTE: The fact that this replica is being initialized in response to the
+	// receipt of a snapshot means that its r.mu.internalRaftGroup must not be
+	// nil.
+	//
+	// NOTE: Unquiescing the replica here is not strictly necessary. As of the
+	// time of writing, this function is only ever called below handleRaftReady,
+	// which will always unquiesce any eligible replicas before completing. So in
+	// marking this replica as initialized, we have made it eligible to unquiesce.
+	// However, there is still a benefit to unquiecing here instead of letting
+	// handleRaftReady do it for us. The benefit is that handleRaftReady cannot
+	// make assumptions about the state of the other replicas in the range when it
+	// unquieces a replica, so when it does so, it also instructs the replica to
+	// campaign and to wake the leader (see maybeUnquiesceAndWakeLeaderLocked).
+	// We have more information here (see "This means that the other replica ..."
+	// above) and can make assumptions about the state of the other replicas in
+	// the range, so we can unquiesce without campaigning or waking the leader.
+	if !r.maybeUnquiesceWithOptionsLocked(false /* campaignOnWake */) {
+		return errors.AssertionFailedf("expected replica %s to unquiesce after initialization", desc)
+	}
 
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -198,6 +199,10 @@ var ResolvedBuiltinFuncDefs map[string]*ResolvedFunctionDefinition
 // package because of dependency issues: we can't use oidHasher from this file.
 var OidToBuiltinName map[oid.Oid]string
 
+// OidToQualifiedBuiltinOverload is a map from builtin function OID to an
+// qualified overload.
+var OidToQualifiedBuiltinOverload map[oid.Oid]QualifiedOverload
+
 // Format implements the NodeFormatter interface.
 func (fd *FunctionDefinition) Format(ctx *FmtCtx) {
 	ctx.WriteString(fd.Name)
@@ -208,6 +213,15 @@ func (fd *FunctionDefinition) String() string { return AsString(fd) }
 
 // Format implements the NodeFormatter interface.
 func (fd *ResolvedFunctionDefinition) Format(ctx *FmtCtx) {
+	// This is necessary when deserializing function expressions for SHOW CREATE
+	// statements. When deserializing a function expression with function OID
+	// references, it's guaranteed that there'll be always one overload resolved.
+	// There is no need to show prefix for builtin functions since we don't
+	// serialize them.
+	if len(fd.Overloads) == 1 && catid.IsOIDUserDefined(fd.Overloads[0].Oid) {
+		ctx.WriteString(fd.Overloads[0].Schema)
+		ctx.WriteString(".")
+	}
 	ctx.WriteString(fd.Name)
 }
 
@@ -244,6 +258,11 @@ func (fd *ResolvedFunctionDefinition) MatchOverload(
 	paramTypes []*types.T, explicitSchema string, searchPath SearchPath,
 ) (QualifiedOverload, error) {
 	matched := func(ol QualifiedOverload, schema string) bool {
+		if ol.IsUDF {
+			// TODO(mgartner/chengxiong-ruan): Differentiate between functions
+			// defined with `Body` and UDFs, now that we use `Body` for built-in functions.
+			return schema == ol.Schema && (paramTypes == nil || ol.params().MatchIdentical(paramTypes))
+		}
 		return schema == ol.Schema && (paramTypes == nil || ol.params().Match(paramTypes))
 	}
 	typeNames := func() string {
@@ -369,6 +388,19 @@ func GetBuiltinFuncDefinitionOrFail(
 		return nil, errors.Wrapf(ErrFunctionUndefined, "unknown function: %s()", ErrString(&forError))
 	}
 	return def, nil
+}
+
+// GetBuiltinFunctionByOIDOrFail retrieves a builtin function by OID.
+func GetBuiltinFunctionByOIDOrFail(oid oid.Oid) (*ResolvedFunctionDefinition, error) {
+	ol, ok := OidToQualifiedBuiltinOverload[oid]
+	if !ok {
+		return nil, errors.Wrapf(ErrFunctionUndefined, "function %d not found", oid)
+	}
+	fd := &ResolvedFunctionDefinition{
+		Name:      OidToBuiltinName[oid],
+		Overloads: []QualifiedOverload{ol},
+	}
+	return fd, nil
 }
 
 // GetBuiltinFuncDefinition search for a builtin function given a function name

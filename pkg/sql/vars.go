@@ -1308,6 +1308,15 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// See https://www.postgresql.org/docs/9.4/runtime-config-connection.html
+	`ssl`: {
+		Hidden: true,
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			insecure := evalCtx.ExecCfg.RPCContext.Config.Insecure || evalCtx.ExecCfg.RPCContext.Config.AcceptSQLWithoutTLS
+			return formatBoolAsPostgresSetting(!insecure), nil
+		},
+	},
+
 	// CockroachDB extension.
 	`crdb_version`: makeReadOnlyVarWithFn(func() string {
 		return build.GetInfo().Short()
@@ -1742,24 +1751,6 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return sessiondatapb.DescriptorValidationOn.String()
-		},
-	},
-
-	`enable_experimental_stream_replication`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_stream_replication`),
-		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`enable_experimental_stream_replication`, s)
-			if err != nil {
-				return err
-			}
-			m.SetStreamReplicationEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().EnableStreamReplication), nil
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(experimentalStreamReplicationEnabled.Get(sv))
 		},
 	},
 
@@ -2356,6 +2347,23 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().CopyFromRetriesEnabled), nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`declare_cursor_statement_timeout_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`declare_cursor_statement_timeout_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("declare_cursor_statement_timeout_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetDeclareCursorStatementTimeoutEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DeclareCursorStatementTimeoutEnabled), nil
+		},
+		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.

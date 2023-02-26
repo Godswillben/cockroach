@@ -33,7 +33,7 @@ import { INodeStatus, RollupStoreMetrics } from "src/util/proto";
 import * as protos from "src/js/protos";
 import Long from "long";
 
-const { generateStmtDetailsToID } = util;
+const { generateStmtDetailsToID, HexStringToInt64String } = util;
 
 const SessionsRequest = protos.cockroach.server.serverpb.ListSessionsRequest;
 
@@ -443,6 +443,21 @@ const txnInsightDetailsReducerObj = new KeyedCachedDataReducer(
 
 export const refreshTxnInsightDetails = txnInsightDetailsReducerObj.refresh;
 
+export const statementFingerprintInsightRequestKey = (
+  req: clusterUiApi.StmtInsightsReq,
+): string => `${HexStringToInt64String(req.stmtFingerprintId)}`;
+
+const statementFingerprintInsightsReducerObj = new KeyedCachedDataReducer(
+  clusterUiApi.getStmtInsightsApi,
+  "statementFingerprintInsights",
+  statementFingerprintInsightRequestKey,
+  null,
+  moment.duration(5, "m"),
+);
+
+export const refreshStatementFingerprintInsights =
+  statementFingerprintInsightsReducerObj.refresh;
+
 const schemaInsightsReducerObj = new CachedDataReducer(
   clusterUiApi.getSchemaInsights,
   "schemaInsights",
@@ -509,7 +524,9 @@ export const refreshRawTrace = rawTraceReducerObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
-  events: CachedDataReducerState<clusterUiApi.EventsResponse>;
+  events: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.EventsResponse>
+  >;
   health: HealthState;
   nodes: CachedDataReducerState<INodeStatus[]>;
   raft: CachedDataReducerState<api.RaftDebugResponseMessage>;
@@ -542,10 +559,21 @@ export interface APIReducersState {
   userSQLRoles: CachedDataReducerState<api.UserSQLRolesResponseMessage>;
   hotRanges: PaginatedCachedDataReducerState<api.HotRangesV2ResponseMessage>;
   clusterLocks: CachedDataReducerState<clusterUiApi.ClusterLocksResponse>;
-  stmtInsights: CachedDataReducerState<StmtInsightEvent[]>;
-  txnInsightDetails: KeyedCachedDataReducerState<clusterUiApi.TxnInsightDetailsResponse>;
-  txnInsights: CachedDataReducerState<TxnInsightEvent[]>;
-  schemaInsights: CachedDataReducerState<clusterUiApi.InsightRecommendation[]>;
+  stmtInsights: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<StmtInsightEvent[]>
+  >;
+  txnInsightDetails: KeyedCachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.TxnInsightDetailsResponse>
+  >;
+  txnInsights: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<TxnInsightEvent[]>
+  >;
+  schemaInsights: CachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.InsightRecommendation[]>
+  >;
+  statementFingerprintInsights: KeyedCachedDataReducerState<
+    clusterUiApi.SqlApiResponse<StmtInsightEvent[]>
+  >;
   schedules: KeyedCachedDataReducerState<clusterUiApi.Schedules>;
   schedule: KeyedCachedDataReducerState<clusterUiApi.Schedule>;
   snapshots: KeyedCachedDataReducerState<clusterUiApi.ListTracingSnapshotsResponse>;
@@ -602,6 +630,8 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [snapshotsReducerObj.actionNamespace]: snapshotsReducerObj.reducer,
   [snapshotReducerObj.actionNamespace]: snapshotReducerObj.reducer,
   [rawTraceReducerObj.actionNamespace]: rawTraceReducerObj.reducer,
+  [statementFingerprintInsightsReducerObj.actionNamespace]:
+    statementFingerprintInsightsReducerObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

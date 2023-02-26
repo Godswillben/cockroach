@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -395,12 +396,12 @@ func startTestFullServer(
 		DisableDefaultTestTenant: true,
 		UseDatabase:              `d`,
 		ExternalIODir:            options.externalIODir,
+		Settings:                 options.settings,
 	}
 
 	if options.argsFn != nil {
 		options.argsFn(&args)
 	}
-
 	resetRetry := testingUseFastRetry()
 	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
 	s, db, _ := serverutils.StartServer(t, args)
@@ -505,6 +506,7 @@ func startTestTenant(
 		UseDatabase:   `d`,
 		TestingKnobs:  knobs,
 		ExternalIODir: options.externalIODir,
+		Settings:      options.settings,
 	}
 
 	tenantServer, tenantDB := serverutils.StartTenant(t, systemServer, tenantArgs)
@@ -534,6 +536,7 @@ type feedTestOptions struct {
 	allowedSinkTypes             []string
 	disabledSinkTypes            []string
 	disableSyntheticTimestamps   bool
+	settings                     *cluster.Settings
 }
 
 type feedTestOption func(opts *feedTestOptions)
@@ -581,6 +584,14 @@ func (opts feedTestOptions) omitSinks(sinks ...string) feedTestOptions {
 // and not the sqlServer.
 func withArgsFn(fn updateArgsFn) feedTestOption {
 	return func(opts *feedTestOptions) { opts.argsFn = fn }
+}
+
+// withSettingsFn arranges for a feed option to set the settings for
+// both system and test tenant.
+func withSettings(st *cluster.Settings) feedTestOption {
+	return func(opts *feedTestOptions) {
+		opts.settings = st
+	}
 }
 
 // withKnobsFn is a feedTestOption that allows the caller to modify
@@ -1061,6 +1072,55 @@ func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []stri
 	})
 
 	return matchingEntries
+}
+
+func checkContinuousChangefeedLogs(t *testing.T, startTime int64) []eventpb.ChangefeedEmittedBytes {
+	logs := checkStructuredLogs(t, "changefeed_emitted_bytes", startTime)
+	matchingEntries := make([]eventpb.ChangefeedEmittedBytes, len(logs))
+
+	for i, m := range logs {
+		jsonPayload := []byte(m)
+		var event eventpb.ChangefeedEmittedBytes
+		if err := gojson.Unmarshal(jsonPayload, &event); err != nil {
+			t.Errorf("unmarshalling %q: %v", m, err)
+		}
+		matchingEntries[i] = event
+	}
+
+	return matchingEntries
+}
+
+// verifyLogsWithEmittedBytes fetches changefeed_emitted_bytes telemetry logs produced
+// after startTime for a particular job and asserts that at least one message has positive emitted bytes.
+// This function also asserts the LoggingInterval and Closing fields of
+// each message.
+func verifyLogsWithEmittedBytes(
+	t *testing.T, jobID jobspb.JobID, startTime int64, interval int64, closing bool,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		emittedBytesLogs := checkContinuousChangefeedLogs(t, startTime)
+		if len(emittedBytesLogs) == 0 {
+			return errors.New("no logs found")
+		}
+		emittedBytes := false
+		for _, msg := range emittedBytesLogs {
+			if msg.JobId != int64(jobID) {
+				continue
+			}
+
+			if msg.EmittedBytes > 0 {
+				emittedBytes = true
+			}
+			require.Equal(t, interval, msg.LoggingInterval)
+			if closing {
+				require.Equal(t, true, msg.Closing)
+			}
+		}
+		if !emittedBytes {
+			return errors.New("expected emitted bytes in log messages, but found 0")
+		}
+		return nil
+	})
 }
 
 func checkCreateChangefeedLogs(t *testing.T, startTime int64) []eventpb.CreateChangefeed {

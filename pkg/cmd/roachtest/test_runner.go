@@ -984,10 +984,9 @@ func (r *testRunner) runTest(
 		}
 		t.L().Printf("tearing down after %s; see teardown.log", s)
 	case <-time.After(timeout):
-		// NB: we're intentionally not failing the test if it hasn't
-		// already. This will be done at the very end of this method,
-		// after we've collected artifacts.
-		t.L().Printf("test timed out after %s; check __stacks.log and CRDB logs for goroutine dumps", timeout)
+		// NB: We're adding the timeout failure intentionally without cancelling the context
+		// to capture as much state as possible during artifact collection.
+		t.addFailure(0, "test timed out (%s)", timeout)
 		timedOut = true
 	}
 
@@ -1069,9 +1068,6 @@ func (r *testRunner) teardownTest(
 		// monitor).
 		c.assertNoDeadNode(ctx, t)
 
-		// Detect replica divergence (i.e. ranges in which replicas have arrived
-		// at the same log position with different states).
-		//
 		// We avoid trying to do this when t.Failed() (and in particular when there
 		// are dead nodes) because for reasons @tbg does not understand this gets
 		// stuck occasionally, which really ruins the roachtest run. The method
@@ -1080,7 +1076,17 @@ func (r *testRunner) teardownTest(
 		//
 		// TODO(testinfra): figure out why this can still get stuck despite the
 		// above.
-		c.FailOnReplicaDivergence(ctx, t)
+		db, node := c.ConnectToLiveNode(ctx, t)
+		if db != nil {
+			defer db.Close()
+			t.L().Printf("running validation checks on node %d (<10m)", node)
+			c.FailOnInvalidDescriptors(ctx, db, t)
+			// Detect replica divergence (i.e. ranges in which replicas have arrived
+			// at the same log position with different states).
+			c.FailOnReplicaDivergence(ctx, db, t)
+		} else {
+			t.L().Printf("no live node found, skipping validation checks")
+		}
 
 		if timedOut || t.Failed() {
 			r.collectClusterArtifacts(ctx, c, t.L())
@@ -1104,10 +1110,11 @@ func (r *testRunner) teardownTest(
 		// around so someone can poke at it.
 		_ = c.StopE(ctx, t.L(), option.DefaultStopOpts(), c.All())
 
-		// The hung test may, against all odds, still not have reported an error.
-		// We delayed it to improve artifacts collection, and now we ensure the test
-		// is marked as failing.
-		t.Errorf("test timed out (%s)", t.Spec().(*registry.TestSpec).Timeout)
+		// We previously added a timeout failure without cancellation, so we cancel here.
+		if t.mu.cancel != nil {
+			t.mu.cancel()
+		}
+		t.L().Printf("test timed out; check __stacks.log and CRDB logs for goroutine dumps")
 	}
 	return nil
 }
