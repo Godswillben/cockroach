@@ -162,11 +162,10 @@ func NewSeparateProcessTenantServer(
 	stopper *stop.Stopper,
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
-	parentRecorder *status.MetricsRecorder,
 	tenantNameContainer *roachpb.TenantNameContainer,
 ) (*SQLServerWrapper, error) {
 	instanceIDContainer := baseCfg.IDContainer.SwitchToSQLIDContainerForStandaloneSQLInstance()
-	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer, instanceIDContainer)
+	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, nil /* parentRecorder */, tenantNameContainer, instanceIDContainer)
 }
 
 // NewSeparateProcessTenantServer creates a tenant-specific, SQL-only
@@ -190,6 +189,9 @@ func NewSharedProcessTenantServer(
 	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, parentRecorder, tenantNameContainer, instanceIDContainer)
 }
 
+// newTenantServer constructs a SQLServerWrapper.
+//
+// The tenant's metrics registry is registered with parentRecorder, if not nil.
 func newTenantServer(
 	ctx context.Context,
 	stopper *stop.Stopper,
@@ -623,6 +625,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			s.stopper,
 			s.sqlServer.cfg.GoroutineDumpDirName,
 			s.sqlServer.cfg.HeapProfileDirName,
+			s.sqlServer.cfg.CPUProfileDirName,
 			s.runtime,
 			s.tenantStatus.sessionRegistry,
 		); err != nil {

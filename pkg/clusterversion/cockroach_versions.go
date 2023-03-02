@@ -360,9 +360,7 @@ const (
 
 	// V23_1EnsurePebbleFormatSSTableValueBlocks upgrades the Pebble format major
 	// version to FormatSSTableValueBlocks, which supports writing sstables in a
-	// new format containing value blocks (sstable.TableFormatPebblev3). As part
-	// of this upgrade, a preceding Pebble format major version
-	// (FormatPrePebblev1MarkedCompacted) upgrade also occurs.
+	// new format containing value blocks (sstable.TableFormatPebblev3).
 	//
 	// Only a Pebble version that has upgraded to FormatSSTableValueBlocks can
 	// read sstables with format sstable.TableFormatPebblev3 -- i.e., it is
@@ -443,6 +441,19 @@ const (
 	// the role_id column in the system.database_role_settings table has been
 	// backfilled.
 	V23_1DatabaseRoleSettingsRoleIDColumnBackfilled
+
+	// V23_1_MVCCRangeTombstonesUnconditionallyEnabled is a version gate at and
+	// after which Cockroach will always write MVCC Range Tombstones, regardless
+	// of the value of the storage.mvcc.range_tombstones.enabled cluster setting.
+	// Prior to this version, it was possible for a cluster to be writing MVCC
+	// Range Tombstones, but only if the cluster had been opted in manually, under
+	// a specific set of circumstances (i.e. appropriate 22.2.x version, Cockroach
+	// Cloud cluster, etc.).
+	V23_1_MVCCRangeTombstonesUnconditionallyEnabled
+
+	// V23_1TenantCapabilities is the version where tenant capabilities can be
+	// set.
+	V23_1TenantCapabilities
 
 	// *************************************************
 	// Step (1): Add new versions here.
@@ -768,6 +779,14 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1DatabaseRoleSettingsRoleIDColumnBackfilled,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 56},
+	},
+	{
+		Key:     V23_1_MVCCRangeTombstonesUnconditionallyEnabled,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 58},
+	},
+	{
+		Key:     V23_1TenantCapabilities,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 60},
 	},
 
 	// *************************************************

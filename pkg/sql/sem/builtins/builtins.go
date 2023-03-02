@@ -983,24 +983,6 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 	),
 
-	"text": makeBuiltin(defProps(),
-		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "val", Typ: types.INet}},
-			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				dIPAddr := tree.MustBeDIPAddr(args[0])
-				s := dIPAddr.IPAddr.String()
-				// Ensure the string has a "/mask" suffix.
-				if strings.IndexByte(s, '/') == -1 {
-					s += "/" + strconv.Itoa(int(dIPAddr.Mask))
-				}
-				return tree.NewDString(s), nil
-			},
-			Info:       "Converts the IP address and prefix length to text.",
-			Volatility: volatility.Immutable,
-		},
-	),
-
 	"inet_same_family": makeBuiltin(defProps(),
 		tree.Overload{
 			Types: tree.ParamTypes{
@@ -1050,22 +1032,6 @@ var regularBuiltins = map[string]builtinDefinition{
 			},
 			Info: "Test for subnet inclusion or equality, using only the network parts of the addresses. " +
 				"The host part of the addresses is ignored.",
-			Volatility: volatility.Immutable,
-		},
-	),
-
-	"inet": makeBuiltin(defProps(),
-		tree.Overload{
-			Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
-			ReturnType: tree.FixedReturnType(types.INet),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				inet, err := eval.PerformCast(ctx, evalCtx, args[0], types.INet)
-				if err != nil {
-					return nil, pgerror.WithCandidateCode(err, pgcode.InvalidTextRepresentation)
-				}
-				return inet, nil
-			},
-			Info:       "If possible, converts input to that of type inet.",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -3791,13 +3757,9 @@ value if you rely on the HLC for accuracy.`,
 	"array_to_tsvector":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"get_current_ts_config":          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"numnode":                        makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"plainto_tsquery":                makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"phraseto_tsquery":               makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"querytree":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"setweight":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"strip":                          makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"to_tsquery":                     makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"to_tsvector":                    makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"json_to_tsvector":               makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"jsonb_to_tsvector":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_delete":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
@@ -7698,7 +7660,7 @@ expires until the statement bundle is collected`,
 				}
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
-			Volatility: volatility.Immutable,
+			Volatility: volatility.Stable,
 		},
 	),
 	"crdb_internal.hide_sql_constants": makeBuiltin(tree.FunctionProperties{
@@ -7746,11 +7708,10 @@ expires until the statement bundle is collected`,
 
 					if len(sql) != 0 {
 						parsed, err := parser.ParseOne(sql)
-						if err != nil {
-							return tree.NewDString(sqlNoConstants), nil //nolint:returnerrcheck
+						// Leave result as empty string on parsing error.
+						if err == nil {
+							sqlNoConstants = tree.AsStringWithFlags(parsed.AST, tree.FmtHideConstants)
 						}
-
-						sqlNoConstants = tree.AsStringWithFlags(parsed.AST, tree.FmtHideConstants)
 					}
 
 					if err := result.Append(tree.NewDString(sqlNoConstants)); err != nil {
@@ -7763,6 +7724,24 @@ expires until the statement bundle is collected`,
 			Info: "Hide constants for each element in an array of SQL statements." +
 				"Note that maximum 1 statement is permitted per string element.",
 			Volatility: volatility.Immutable,
+		},
+	),
+	"crdb_internal.humanize_bytes": makeBuiltin(tree.FunctionProperties{
+		Category:     builtinconstants.CategoryString,
+		Undocumented: true,
+	},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "val", Typ: types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, nil
+				}
+				b := tree.MustBeDInt(args[0])
+				return tree.NewDString(string(humanizeutil.IBytes(int64(b)))), nil
+			},
+			Info:       "Converts integer size (in bytes) into the human-readable form.",
+			Volatility: volatility.Leakproof,
 		},
 	),
 }
