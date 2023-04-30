@@ -51,6 +51,7 @@ func TestDataDriven(t *testing.T) {
 		}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestTenantProbabilistic,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs:   jobs.NewTestingKnobsWithShortIntervals(), // speeds up test
 					ExternalConnection: ecTestingKnobs,
@@ -123,7 +124,11 @@ func TestDataDriven(t *testing.T) {
 
 			case "inspect-system-table":
 				rows := tenant.Query(`
-SELECT connection_name, connection_type, crdb_internal.pb_to_json('cockroach.cloud.externalconn.connectionpb.ConnectionDetails', connection_details), owner
+SELECT connection_name,
+       connection_type,
+       crdb_internal.pb_to_json('cockroach.cloud.externalconn.connectionpb.ConnectionDetails', connection_details),
+       owner,
+       owner_id
 FROM system.external_connections;
 `)
 				output, err := sqlutils.RowsToDataDrivenOutput(rows)

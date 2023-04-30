@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -109,6 +108,7 @@ type txnSpanRefresher struct {
 	knobs   *ClientTestingKnobs
 	riGen   rangeIteratorFactory
 	wrapped lockedSender
+	metrics *TxnMetrics
 
 	// refreshFootprint contains key spans which were read during the
 	// transaction. In case the transaction's timestamp needs to be pushed, we can
@@ -129,12 +129,6 @@ type txnSpanRefresher struct {
 
 	// canAutoRetry is set if the txnSpanRefresher is allowed to auto-retry.
 	canAutoRetry bool
-
-	refreshSuccess                *metric.Counter
-	refreshFail                   *metric.Counter
-	refreshFailWithCondensedSpans *metric.Counter
-	refreshMemoryLimitExceeded    *metric.Counter
-	refreshAutoRetries            *metric.Counter
 }
 
 // SendLocked implements the lockedSender interface.
@@ -145,7 +139,7 @@ func (sr *txnSpanRefresher) SendLocked(
 	ba.CanForwardReadTimestamp = sr.canForwardReadTimestampWithoutRefresh(ba.Txn)
 
 	// Attempt a refresh before sending the batch.
-	ba, pErr := sr.maybeRefreshPreemptivelyLocked(ctx, ba, false)
+	ba, pErr := sr.maybeRefreshPreemptively(ctx, ba)
 	if pErr != nil {
 		return nil, pErr
 	}
@@ -206,7 +200,7 @@ func (sr *txnSpanRefresher) maybeCondenseRefreshSpans(
 			sr.refreshFootprint.clear()
 		}
 		if sr.refreshFootprint.condensed && !condensedBefore {
-			sr.refreshMemoryLimitExceeded.Inc(1)
+			sr.metrics.ClientRefreshMemoryLimitExceeded.Inc(1)
 		}
 	}
 }
@@ -230,6 +224,11 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 	// ignore it.
 	if pErr != nil && pErr.GetTxn() != nil {
 		pErr.GetTxn().WriteTooOld = false
+	}
+
+	// Check for server-side refresh.
+	if err := sr.forwardRefreshTimestampOnResponse(ba, br, pErr); err != nil {
+		return nil, kvpb.NewError(err)
 	}
 
 	if pErr == nil && br.Txn.WriteTooOld {
@@ -270,9 +269,6 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 			log.VEventf(ctx, 2, "not checking error for refresh; refresh attempts exhausted")
 		}
 	}
-	if err := sr.forwardRefreshTimestampOnResponse(ba, br, pErr); err != nil {
-		return nil, kvpb.NewError(err)
-	}
 	return br, pErr
 }
 
@@ -311,7 +307,7 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 	log.Eventf(ctx, "refresh succeeded; retrying original request")
 	ba = ba.ShallowCopy()
 	ba.UpdateTxn(refreshToTxn)
-	sr.refreshAutoRetries.Inc(1)
+	sr.metrics.ClientRefreshAutoRetries.Inc(1)
 
 	// To prevent starvation of batches that are trying to commit, split off the
 	// EndTxn request into its own batch on auto-retries. This avoids starvation
@@ -372,21 +368,19 @@ func (sr *txnSpanRefresher) splitEndTxnAndRetrySend(
 	// Combine the responses.
 	br := brPrefix
 	br.Responses = append(br.Responses, kvpb.ResponseUnion{})
-	if err := br.Combine(brSuffix, []int{etIdx}); err != nil {
+	if err := br.Combine(ctx, brSuffix, []int{etIdx}, ba); err != nil {
 		return nil, kvpb.NewError(err)
 	}
 	return br, nil
 }
 
-// maybeRefreshPreemptivelyLocked attempts to refresh a transaction's read timestamp
+// maybeRefreshPreemptively attempts to refresh a transaction's read timestamp
 // eagerly. Doing so can take advantage of opportunities where the refresh is
 // free or can avoid wasting work issuing a batch containing an EndTxn that will
 // necessarily throw a serializable error. The method returns a batch with an
 // updated transaction if the refresh is successful, or a retry error if not.
-// If the force flag is true, the refresh will be attempted even if a refresh
-// is not inevitable.
-func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
-	ctx context.Context, ba *kvpb.BatchRequest, force bool,
+func (sr *txnSpanRefresher) maybeRefreshPreemptively(
+	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchRequest, *kvpb.Error) {
 	// If we know that the transaction will need a refresh at some point because
 	// its write timestamp has diverged from its read timestamp, consider doing
@@ -432,6 +426,15 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 		return ba, nil
 	}
 
+	// If the transaction can tolerate write skew, no preemptive refresh is
+	// necessary, even if its write timestamp has been bumped. Transactions run at
+	// weak isolation levels may refresh in response to WriteTooOld errors or
+	// ReadWithinUncertaintyInterval errors returned by requests, but they do not
+	// need to refresh preemptively ahead of an EndTxn request.
+	if ba.Txn.IsoLevel.ToleratesWriteSkew() {
+		return ba, nil
+	}
+
 	// If true, tryRefreshTxnSpans will trivially succeed.
 	refreshFree := ba.CanForwardReadTimestamp
 
@@ -440,7 +443,7 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 	refreshInevitable := hasET && args.(*kvpb.EndTxnRequest).Commit
 
 	// If neither condition is true, defer the refresh.
-	if !refreshFree && !refreshInevitable && !force {
+	if !refreshFree && !refreshInevitable {
 		return ba, nil
 	}
 
@@ -501,11 +504,11 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 	// Track the result of the refresh in metrics.
 	defer func() {
 		if err == nil {
-			sr.refreshSuccess.Inc(1)
+			sr.metrics.ClientRefreshSuccess.Inc(1)
 		} else {
-			sr.refreshFail.Inc(1)
+			sr.metrics.ClientRefreshFail.Inc(1)
 			if sr.refreshFootprint.condensed {
-				sr.refreshFailWithCondensedSpans.Inc(1)
+				sr.metrics.ClientRefreshFailWithCondensedSpans.Inc(1)
 			}
 		}
 	}()
@@ -630,7 +633,12 @@ func (sr *txnSpanRefresher) forwardRefreshTimestampOnResponse(
 		return nil
 	}
 	if baTxn.ReadTimestamp.Less(brTxn.ReadTimestamp) {
+		if !ba.CanForwardReadTimestamp {
+			return errors.AssertionFailedf("unexpected server-side refresh without "+
+				"CanForwardReadTimestamp set. ba: %s, ba.Txn: %s, br.Txn: %s", ba.Summary(), baTxn, brTxn)
+		}
 		sr.refreshedTimestamp.Forward(brTxn.ReadTimestamp)
+		sr.metrics.ServerRefreshSuccess.Inc(1)
 	} else if brTxn.ReadTimestamp.Less(baTxn.ReadTimestamp) {
 		return errors.AssertionFailedf("received transaction in response with "+
 			"earlier read timestamp than in the request. ba.Txn: %s, br.Txn: %s", baTxn, brTxn)
@@ -686,9 +694,9 @@ func (sr *txnSpanRefresher) populateLeafFinalState(tfs *roachpb.LeafTxnFinalStat
 // importLeafFinalState is part of the txnInterceptor interface.
 func (sr *txnSpanRefresher) importLeafFinalState(
 	ctx context.Context, tfs *roachpb.LeafTxnFinalState,
-) {
+) error {
 	if err := sr.assertRefreshSpansAtInvalidTimestamp(tfs.Txn.ReadTimestamp); err != nil {
-		log.Fatalf(ctx, "%s", err)
+		return err
 	}
 	if tfs.RefreshInvalid {
 		sr.refreshInvalid = true
@@ -698,6 +706,7 @@ func (sr *txnSpanRefresher) importLeafFinalState(
 		// Check whether we should condense the refresh spans.
 		sr.maybeCondenseRefreshSpans(ctx, &tfs.Txn)
 	}
+	return nil
 }
 
 // epochBumpedLocked implements the txnInterceptor interface.

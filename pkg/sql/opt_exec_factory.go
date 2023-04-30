@@ -19,7 +19,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -106,12 +105,24 @@ func (ef *execFactory) ConstructLiteralValues(
 	if rows.NumRows() == 0 {
 		return &zeroNode{columns: cols}, nil
 	}
-	return &valuesNode{
-		columns:                  cols,
-		specifiedInQuery:         true,
-		externallyOwnedContainer: true,
-		valuesRun:                valuesRun{rows: rows.(*rowcontainer.RowContainer)},
-	}, nil
+	switch t := rows.(type) {
+	case *rowcontainer.RowContainer:
+		return &valuesNode{
+			columns:                  cols,
+			specifiedInQuery:         true,
+			externallyOwnedContainer: true,
+			valuesRun:                valuesRun{rows: t},
+		}, nil
+	case *tree.VectorRows:
+		return &valuesNode{
+			columns:                  cols,
+			specifiedInQuery:         true,
+			externallyOwnedContainer: true,
+			coldataBatch:             t.Batch,
+		}, nil
+	default:
+		return nil, errors.AssertionFailedf("unexpected rows type %T in ConstructLiteralValues", rows)
+	}
 }
 
 // ConstructScan is part of the exec.Factory interface.
@@ -766,7 +777,7 @@ func (ef *execFactory) constructVirtualTableLookupJoin(
 	onCond tree.TypedExpr,
 ) (exec.Node, error) {
 	tn := &table.(*optVirtualTable).name
-	virtual, err := ef.planner.getVirtualTabler().getVirtualTableEntry(tn)
+	virtual, err := ef.planner.getVirtualTabler().getVirtualTableEntry(tn, ef.planner)
 	if err != nil {
 		return nil, err
 	}
@@ -1234,7 +1245,9 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 	// statements for tables referenced via FKs in these tables.
 	for i := range envOpts.Tables {
 		out.writef("")
-		if err := c.PrintCreateTable(&out.buf, &envOpts.Tables[i]); err != nil {
+		if err := c.PrintCreateTable(
+			&out.buf, &envOpts.Tables[i], false, /* redactValues */
+		); err != nil {
 			return nil, err
 		}
 		out.writef("")
@@ -1253,7 +1266,7 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 
 	for i := range envOpts.Views {
 		out.writef("")
-		if err := c.PrintCreateView(&out.buf, &envOpts.Views[i]); err != nil {
+		if err := c.PrintCreateView(&out.buf, &envOpts.Views[i], false /* redactValues */); err != nil {
 			return nil, err
 		}
 	}
@@ -1359,6 +1372,8 @@ func (ef *execFactory) ConstructInsert(
 		},
 	}
 
+	ins.run.regionLocalInfo.setupEnforceHomeRegion(ef.planner, table, cols, ins.run.ti.ri.InsertColIDtoRowIndex)
+
 	// If rows are not needed, no columns are returned.
 	if rowsNeeded {
 		returnCols := makeColList(table, returnColOrdSet)
@@ -1429,6 +1444,8 @@ func (ef *execFactory) ConstructInsertFastPath(
 			},
 		},
 	}
+
+	ins.run.regionLocalInfo.setupEnforceHomeRegion(ef.planner, table, cols, ins.run.ti.ri.InsertColIDtoRowIndex)
 
 	if len(fkChecks) > 0 {
 		ins.run.fkChecks = make([]insertFastPathFKCheck, len(fkChecks))
@@ -1544,6 +1561,9 @@ func (ef *execFactory) ConstructUpdate(
 			numPassthrough: len(passthrough),
 		},
 	}
+
+	upd.run.regionLocalInfo.setupEnforceHomeRegion(ef.planner, table, ru.UpdateCols,
+		upd.run.tu.ru.UpdateColIDtoRowIndex)
 
 	// If rows are not needed, no columns are returned.
 	if rowsNeeded {
@@ -1713,9 +1733,8 @@ func (ef *execFactory) ConstructDelete(
 	*del = deleteNode{
 		source: input.(planNode),
 		run: deleteRun{
-			td:                        tableDeleter{rd: rd, alloc: ef.getDatumAlloc()},
-			partialIndexDelValsOffset: len(rd.FetchCols) + len(passthrough),
-			numPassthrough:            len(passthrough),
+			td:             tableDeleter{rd: rd, alloc: ef.getDatumAlloc()},
+			numPassthrough: len(passthrough),
 		},
 	}
 
@@ -1759,15 +1778,9 @@ func (ef *execFactory) ConstructDeleteRange(
 	var sb span.Builder
 	sb.Init(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, tabDesc.GetPrimaryIndex())
 
-	splitter := span.NoopSplitter()
-	canUsePointDelete := ef.planner.ExecCfg().Settings.Version.IsActive(
-		ef.ctx, clusterversion.TODODelete_V22_2DeleteRequestReturnKey,
+	splitter := span.MakeSplitterForDelete(
+		tabDesc, tabDesc.GetPrimaryIndex(), needed, true, /* forDelete */
 	)
-	if canUsePointDelete {
-		splitter = span.MakeSplitterForDelete(
-			tabDesc, tabDesc.GetPrimaryIndex(), needed, true, /* forDelete */
-		)
-	}
 	spans, err := sb.SpansFromConstraint(indexConstraint, splitter)
 	if err != nil {
 		return nil, err
@@ -1992,20 +2005,13 @@ func (ef *execFactory) ConstructAlterTableSplit(
 func (ef *execFactory) ConstructAlterTableUnsplit(
 	index cat.Index, input exec.Node,
 ) (exec.Node, error) {
-
-	execCfg := ef.planner.ExecCfg()
 	if err := checkSchemaChangeEnabled(
 		ef.ctx,
-		execCfg,
+		ef.planner.ExecCfg(),
 		"ALTER TABLE/INDEX UNSPLIT AT",
 	); err != nil {
 		return nil, err
 	}
-
-	if err := execCfg.RequireSystemTenant(); err != nil {
-		return nil, err
-	}
-
 	return &unsplitNode{
 		tableDesc: index.Table().(*optTable).desc,
 		index:     index.(*optIndex).idx,
@@ -2015,15 +2021,11 @@ func (ef *execFactory) ConstructAlterTableUnsplit(
 
 // ConstructAlterTableUnsplitAll is part of the exec.Factory interface.
 func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node, error) {
-	execCfg := ef.planner.ExecCfg()
 	if err := checkSchemaChangeEnabled(
 		ef.ctx,
-		execCfg,
+		ef.planner.ExecCfg(),
 		"ALTER TABLE/INDEX UNSPLIT ALL",
 	); err != nil {
-		return nil, err
-	}
-	if err := execCfg.RequireSystemTenant(); err != nil {
 		return nil, err
 	}
 	return &unsplitAllNode{
@@ -2036,11 +2038,6 @@ func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node
 func (ef *execFactory) ConstructAlterTableRelocate(
 	index cat.Index, input exec.Node, relocateSubject tree.RelocateSubject,
 ) (exec.Node, error) {
-
-	if err := ef.planner.ExecCfg().RequireSystemTenant(); err != nil {
-		return nil, err
-	}
-
 	return &relocateNode{
 		subjectReplicas: relocateSubject,
 		tableDesc:       index.Table().(*optTable).desc,
@@ -2056,9 +2053,6 @@ func (ef *execFactory) ConstructAlterRangeRelocate(
 	toStoreID tree.TypedExpr,
 	fromStoreID tree.TypedExpr,
 ) (exec.Node, error) {
-	if err := ef.planner.ExecCfg().RequireSystemTenant(); err != nil {
-		return nil, err
-	}
 	return &relocateRange{
 		rows:            input.(planNode),
 		subjectReplicas: relocateSubject,

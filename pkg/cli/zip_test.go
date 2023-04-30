@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
@@ -97,8 +96,14 @@ table_name NOT IN (
   'table_spans',
 	'tables',
 	'cluster_statement_statistics',
+  'statement_activity',
+	'statement_statistics_persisted',
+	'statement_statistics_persisted_v22_2',
 	'cluster_transaction_statistics',
 	'statement_statistics',
+  'transaction_activity',
+	'transaction_statistics_persisted',
+	'transaction_statistics_persisted_v22_2',
 	'transaction_statistics',
 	'tenant_usage_details',
   'pg_catalog_table_is_implemented'
@@ -255,7 +260,6 @@ create table defaultdb."../system"(x int);
 // need the SSL certs dir to run a CLI test securely.
 func TestUnavailableZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 53306, "flaky test")
 
 	skip.UnderShort(t)
 	// Race builds make the servers so slow that they report spurious
@@ -321,11 +325,7 @@ func TestUnavailableZip(t *testing.T) {
 
 	// Strip any non-deterministic messages.
 	out = eraseNonDeterministicZipOutput(out)
-
-	// In order to avoid non-determinism here, we erase the output of
-	// the range retrieval.
-	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
-	out = re.ReplaceAllString(out, ``)
+	out = eraseNonDeterministicErrors(out)
 
 	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "unavailable"),
 		func(t *testing.T, td *datadriven.TestData) string {
@@ -362,8 +362,24 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] writing dump.*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving goroutine_dump.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
 
-	//out = strings.ReplaceAll(out, "\n\n", "\n")
+	return out
+}
+
+func eraseNonDeterministicErrors(out string) string {
+	// In order to avoid non-determinism here, we erase the output of
+	// the range retrieval.
+	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	re = regexp.MustCompile(`(?m)^\[cluster\] requesting data for debug\/settings.*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	// In order to avoid non-determinism here, we truncate error messages.
+	re = regexp.MustCompile(`(?m)last request failed: .*$`)
+	out = re.ReplaceAllString(out, `last request failed: ...`)
 	return out
 }
 
@@ -436,7 +452,7 @@ func TestPartialZip(t *testing.T) {
 	// we're decommissioning a node in a 3-node cluster, so there's no node to
 	// up-replicate the under-replicated ranges to.
 	{
-		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --wait=none %d", 2))
+		_, err := c.RunWithCapture(fmt.Sprintf("node decommission --checks=skip --wait=none %d", 2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -588,13 +604,9 @@ func TestToHex(t *testing.T) {
 	}
 	// Stores index and type of marshaled messages in the table row.
 	// Negative indices work from the end - this is needed because parsing the
-	// fields is not alway s precise as there can be spaces in the fields but the
+	// fields is not always precise as there can be spaces in the fields but the
 	// hex fields are always in the end of the row and they don't contain spaces.
 	hexFiles := map[string][]hexField{
-		"debug/system.jobs.txt": {
-			{idx: -2, msg: &jobspb.Payload{}},
-			{idx: -1, msg: &jobspb.Progress{}},
-		},
 		"debug/system.descriptor.txt": {
 			{idx: 2, msg: &descpb.Descriptor{}},
 		},

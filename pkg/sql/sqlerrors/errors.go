@@ -30,6 +30,21 @@ const (
 		"until end of transaction block"
 )
 
+// EnforceHomeRegionFurtherInfo is the suffix to append to every error returned
+// due to turning on the enforce_home_region session setting, and provides some
+// information for users or app developers.
+const EnforceHomeRegionFurtherInfo = "For more information, see https://www.cockroachlabs.com/docs/stable/cost-based-optimizer.html#control-whether-queries-are-limited-to-a-single-region"
+
+// NewSchemaChangeOnLockedTableErr creates an error signaling schema
+// change statement is attempted on a table with locked schema.
+func NewSchemaChangeOnLockedTableErr(tableName string) error {
+	return errors.WithHintf(pgerror.Newf(pgcode.OperatorIntervention,
+		`schema changes are disallowed on table %q because it is locked`, tableName),
+		"To unlock the table, try \"ALTER TABLE %v SET (schema_locked = false);\" "+
+			"\nAfter schema change completes, we recommend setting it back to true with "+
+			"\"ALTER TABLE %v SET (schema_locked = true);\"", tableName, tableName)
+}
+
 // NewTransactionAbortedError creates an error for trying to run a command in
 // the context of transaction that's in the aborted state. Any statement other
 // than ROLLBACK TO SAVEPOINT will return this error.
@@ -339,7 +354,7 @@ func NewInvalidVolatilityError(err error) error {
 var QueryTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
 
-// TxnTimeoutError is an error representing a query timeout.
+// TxnTimeoutError is an error representing a transasction timeout.
 var TxnTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to transaction timeout")
 
@@ -371,6 +386,21 @@ func IsUndefinedDatabaseError(err error) bool {
 // IsUndefinedSchemaError checks whether this is an undefined schema error.
 func IsUndefinedSchemaError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedSchema)
+}
+
+// IsMissingDescriptorError checks whether the error has any indication
+// that it corresponds to a missing descriptor of any kind.
+//
+// Note that this does not deal with the lower-level
+// catalog.ErrDescriptorNotFound error. That error should be transformed
+// by this package for all uses in the SQL layer and coming out of
+// descs.Collection functions.
+func IsMissingDescriptorError(err error) bool {
+	return IsUndefinedRelationError(err) ||
+		IsUndefinedSchemaError(err) ||
+		IsUndefinedDatabaseError(err) ||
+		errHasCode(err, pgcode.UndefinedObject) ||
+		errHasCode(err, pgcode.UndefinedFunction)
 }
 
 func errHasCode(err error, code ...pgcode.Code) bool {

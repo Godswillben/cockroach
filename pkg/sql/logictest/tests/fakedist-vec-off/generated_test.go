@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 5
+const configIdx = 4
 
 var logicTestDir string
 
@@ -401,6 +401,13 @@ func TestLogic_collatedstring_uniqueindex2(
 	runLogicTest(t, "collatedstring_uniqueindex2")
 }
 
+func TestLogic_comment_on(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "comment_on")
+}
+
 func TestLogic_composite_types(
 	t *testing.T,
 ) {
@@ -744,6 +751,13 @@ func TestLogic_explain_analyze(
 	runLogicTest(t, "explain_analyze")
 }
 
+func TestLogic_export(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "export")
+}
+
 func TestLogic_expression_index(
 	t *testing.T,
 ) {
@@ -1050,6 +1064,13 @@ func TestLogic_json_builtins(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "json_builtins")
+}
+
+func TestLogic_json_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "json_index")
 }
 
 func TestLogic_kv_builtin_functions(
@@ -1472,6 +1493,13 @@ func TestLogic_save_table(
 	runLogicTest(t, "save_table")
 }
 
+func TestLogic_savepoints(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "savepoints")
+}
+
 func TestLogic_scale(
 	t *testing.T,
 ) {
@@ -1512,6 +1540,13 @@ func TestLogic_schema_change_retry(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "schema_change_retry")
+}
+
+func TestLogic_schema_locked(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "schema_locked")
 }
 
 func TestLogic_schema_repair(
@@ -1694,6 +1729,13 @@ func TestLogic_show_create_all_types(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "show_create_all_types")
+}
+
+func TestLogic_show_create_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_redact")
 }
 
 func TestLogic_show_default_privileges(
@@ -1948,6 +1990,13 @@ func TestLogic_truncate(
 	runLogicTest(t, "truncate")
 }
 
+func TestLogic_truncate_with_concurrent_mutation(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "truncate_with_concurrent_mutation")
+}
+
 func TestLogic_tsvector(
 	t *testing.T,
 ) {
@@ -2093,6 +2142,13 @@ func TestLogic_upsert(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "upsert")
+}
+
+func TestLogic_upsert_non_metamorphic(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "upsert_non_metamorphic")
 }
 
 func TestLogic_uuid(

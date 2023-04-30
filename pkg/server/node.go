@@ -17,6 +17,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -52,13 +53,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -165,6 +167,13 @@ var (
 		"controls if server side traces are redacted for tenant operations",
 		true,
 	).WithPublic()
+
+	slowRequestHistoricalStackThreshold = settings.RegisterDurationSetting(
+		settings.SystemOnly,
+		"kv.trace.slow_request_stacks.threshold",
+		`duration spent in processing above any available stack history is appended to its trace, if automatic trace snapshots are enabled`,
+		time.Second*30,
+	)
 )
 
 type nodeMetrics struct {
@@ -340,8 +349,33 @@ func bootstrapCluster(
 		// not create the range, just its data. Only do this if this is the
 		// first store.
 		if i == 0 {
-			schema := GetBootstrapSchema(&initCfg.defaultZoneConfig, &initCfg.defaultSystemZoneConfig)
-			initialValues, tableSplits := schema.GetInitialValues()
+			initialValuesOpts := bootstrap.InitialValuesOpts{
+				DefaultZoneConfig:       &initCfg.defaultZoneConfig,
+				DefaultSystemZoneConfig: &initCfg.defaultSystemZoneConfig,
+				Codec:                   keys.SystemSQLCodec,
+			}
+			if initCfg.testingKnobs.Server != nil {
+				knobs := initCfg.testingKnobs.Server.(*TestingKnobs)
+				// If BinaryVersionOverride is set, and our `binaryMinSupportedVersion`
+				// is at its default value, we must populate the cluster with initial
+				// data from the `binaryMinSupportedVersion`. This cluster will then run
+				// the necessary upgrades until `BinaryVersionOverride` before being
+				// ready to use in the test.
+				if knobs.BinaryVersionOverride != (roachpb.Version{}) {
+					if initCfg.binaryMinSupportedVersion.Equal(
+						clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)) {
+						initialValuesOpts.OverrideKey = clusterversion.BinaryMinSupportedVersionKey
+					}
+				}
+				if knobs.BootstrapVersionKeyOverride != 0 {
+					initialValuesOpts.OverrideKey = initCfg.testingKnobs.Server.(*TestingKnobs).BootstrapVersionKeyOverride
+				}
+			}
+			initialValues, tableSplits, err := initialValuesOpts.GetInitialValuesCheckForOverrides()
+			if err != nil {
+				return nil, err
+			}
+
 			splits := append(config.StaticSplits(), tableSplits...)
 			sort.Slice(splits, func(i, j int) bool {
 				return splits[i].Less(splits[j])
@@ -907,7 +941,7 @@ func (n *Node) GetPebbleMetrics() []admission.StoreMetrics {
 			diskStats = s
 		}
 		metrics = append(metrics, admission.StoreMetrics{
-			StoreID:         int32(store.StoreID()),
+			StoreID:         store.StoreID(),
 			Metrics:         m.Metrics,
 			WriteStallCount: m.WriteStallCount,
 			DiskStats:       diskStats})
@@ -977,35 +1011,40 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 	// Immediately record summaries once on server startup. The update loop below
 	// will only update the key if it exists, to avoid race conditions during
 	// node decommissioning, so we have to error out if we can't create it.
-	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */, false /* mustExist */); err != nil {
+	if err := startup.RunIdempotentWithRetry(ctx,
+		n.stopper.ShouldQuiesce(),
+		"kv write node status", func(ctx context.Context) error {
+			return n.writeNodeStatus(ctx, 0 /* alertTTL */, false /* mustExist */)
+		}); err != nil {
 		return errors.Wrap(err, "error recording initial status summaries")
 	}
-	return n.stopper.RunAsyncTask(ctx, "write-node-status", func(ctx context.Context) {
-		// Write a status summary immediately; this helps the UI remain
-		// responsive when new nodes are added.
-		ticker := time.NewTicker(frequency)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Use an alertTTL of twice the ticker frequency. This makes sure that
-				// alerts don't disappear and reappear spuriously while at the same
-				// time ensuring that an alert doesn't linger for too long after having
-				// resolved.
-				//
-				// The status key must already exist, to avoid race conditions
-				// during decommissioning of this node. Decommissioning may be
-				// carried out by a different node, so this avoids resurrecting
-				// the status entry after the decommissioner has removed it.
-				// See Server.Decommission().
-				if err := n.writeNodeStatus(ctx, 2*frequency, true /* mustExist */); err != nil {
-					log.Warningf(ctx, "error recording status summaries: %s", err)
+	return n.stopper.RunAsyncTask(ctx, "write-node-status",
+		func(ctx context.Context) {
+			// Write a status summary immediately; this helps the UI remain
+			// responsive when new nodes are added.
+			ticker := time.NewTicker(frequency)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Use an alertTTL of twice the ticker frequency. This makes sure that
+					// alerts don't disappear and reappear spuriously while at the same
+					// time ensuring that an alert doesn't linger for too long after having
+					// resolved.
+					//
+					// The status key must already exist, to avoid race conditions
+					// during decommissioning of this node. Decommissioning may be
+					// carried out by a different node, so this avoids resurrecting
+					// the status entry after the decommissioner has removed it.
+					// See Server.Decommission().
+					if err := n.writeNodeStatus(ctx, 2*frequency, true /* mustExist */); err != nil {
+						log.Warningf(ctx, "error recording status summaries: %s", err)
+					}
+				case <-n.stopper.ShouldQuiesce():
+					return
 				}
-			case <-n.stopper.ShouldQuiesce():
-				return
 			}
-		}
-	})
+		})
 }
 
 // writeNodeStatus retrieves status summaries from the supplied
@@ -1175,6 +1214,10 @@ func (n *Node) batchInternal(
 	if br.Error != nil {
 		panic(kvpb.ErrorUnexpectedlySet(n.stores, br))
 	}
+	if timeutil.Since(tStart) > slowRequestHistoricalStackThreshold.Get(&n.storeCfg.Settings.SV) {
+		tracing.SpanFromContext(ctx).MaybeRecordStackHistory(tStart)
+	}
+
 	n.metrics.callComplete(timeutil.Since(tStart), pErr)
 	br.Error = pErr
 
@@ -1205,7 +1248,17 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 		tenantID = roachpb.SystemTenantID
 	} else {
 		// We had this tag before the ResetAndAnnotateCtx() call above.
-		ctx = logtags.AddTag(ctx, "tenant", tenantID.String())
+		ctx = logtags.AddTag(ctx, "tenant", tenantID)
+	}
+
+	// If the node is collecting a CPU profile with labels, and the sender has set
+	// pprof labels in the BatchRequest, then we apply them to the context that is
+	// going to execute the BatchRequest. These labels will help correlate server
+	// side CPU profile samples to the sender.
+	if len(args.ProfileLabels) != 0 && n.execCfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
+		var undo func()
+		ctx, undo = pprofutil.SetProfilerLabels(ctx, args.ProfileLabels...)
+		defer undo()
 	}
 
 	// Requests from tenants don't have gateway node id set but are required for
@@ -1408,20 +1461,24 @@ func (n *Node) RangeLookup(
 	return resp, nil
 }
 
-// RangeFeed implements the kvpb.InternalServer interface.
+// RangeFeed implements the roachpb.InternalServer interface.
 func (n *Node) RangeFeed(args *kvpb.RangeFeedRequest, stream kvpb.Internal_RangeFeedServer) error {
-	return n.singleRangeFeed(args, stream)
-}
+	ctx := n.AnnotateCtx(stream.Context())
+	ctx = logtags.AddTag(ctx, "r", args.RangeID)
+	ctx = logtags.AddTag(ctx, "s", args.Replica.StoreID)
+	_, restore := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+	defer restore()
 
-func (n *Node) singleRangeFeed(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) error {
-	pErr := n.stores.RangeFeed(args, stream)
-	if pErr != nil {
+	if err := errors.CombineErrors(future.Wait(ctx, n.stores.RangeFeed(args, stream))); err != nil {
+		// Got stream context error, probably won't be able to propagate it to the stream,
+		// but give it a try anyway.
 		var event kvpb.RangeFeedEvent
 		event.SetValue(&kvpb.RangeFeedError{
-			Error: *pErr,
+			Error: *kvpb.NewError(err),
 		})
 		return stream.Send(&event)
 	}
+
 	return nil
 }
 
@@ -1468,36 +1525,132 @@ func (s *lockedMuxStream) Send(e *kvpb.MuxRangeFeedEvent) error {
 	return s.wrapped.Send(e)
 }
 
-// MuxRangeFeed implements the kvpb.InternalServer interface.
-func (n *Node) MuxRangeFeed(stream kvpb.Internal_MuxRangeFeedServer) error {
-	ctx, cancelFeeds := n.stopper.WithCancelOnQuiesce(stream.Context())
-	defer cancelFeeds()
-	rfGrp := ctxgroup.WithContext(ctx)
+// newMuxRangeFeedCompletionWatcher returns 2 functions: one to forward mux
+// rangefeed completion events to the sender, and a cleanup function. Mux
+// rangefeed completion events can be triggered at any point, and we would like
+// to avoid blocking on IO (sender.Send) during potentially critical areas.
+// Thus, the forwarding should happen on a dedicated goroutine.
+func newMuxRangeFeedCompletionWatcher(
+	ctx context.Context, stopper *stop.Stopper, sender *lockedMuxStream,
+) (doneFn func(event *kvpb.MuxRangeFeedEvent), cleanup func(), _ error) {
+	// structure to help coordination of event forwarding and shutdown.
+	var fin = struct {
+		syncutil.Mutex
+		completed []*kvpb.MuxRangeFeedEvent
+		signalC   chan struct{}
+	}{
+		// NB: a buffer of 1 ensures we can always send a signal when rangefeed completes.
+		signalC: make(chan struct{}, 1),
+	}
 
+	// forwardCompletion listens to completion notifications and forwards
+	// them to the sender.
+	forwardCompletion := func(ctx context.Context) {
+		for {
+			select {
+			case <-fin.signalC:
+				var toSend []*kvpb.MuxRangeFeedEvent
+				fin.Lock()
+				toSend, fin.completed = fin.completed, nil
+				fin.Unlock()
+				for _, e := range toSend {
+					if err := sender.Send(e); err != nil {
+						// If we failed to send, there is nothing else we can do.
+						// The stream is broken anyway.
+						return
+					}
+				}
+			case <-sender.wrapped.Context().Done():
+				return
+			case <-ctx.Done():
+				return
+			case <-stopper.ShouldQuiesce():
+				// There is nothing we can do here; stream cancellation is usually
+				// triggered by the client.  We don't have access to stream cancellation
+				// function; so, just let things proceed until the server shuts down.
+				return
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	if err := stopper.RunAsyncTask(ctx, "mux-term-forwarder", func(ctx context.Context) {
+		defer wg.Done()
+		forwardCompletion(ctx)
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	addCompleted := func(event *kvpb.MuxRangeFeedEvent) {
+		fin.Lock()
+		fin.completed = append(fin.completed, event)
+		fin.Unlock()
+		select {
+		case fin.signalC <- struct{}{}:
+		default:
+		}
+	}
+	return addCompleted, wg.Wait, nil
+}
+
+// MuxRangeFeed implements the roachpb.InternalServer interface.
+func (n *Node) MuxRangeFeed(stream kvpb.Internal_MuxRangeFeedServer) error {
 	muxStream := &lockedMuxStream{wrapped: stream}
+
+	rangefeedCompleted, cleanup, err := newMuxRangeFeedCompletionWatcher(stream.Context(), n.stopper, muxStream)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	for {
 		req, err := stream.Recv()
 		if err != nil {
-			cancelFeeds()
-			return errors.CombineErrors(err, rfGrp.Wait())
+			return err
 		}
 
-		rfGrp.GoCtx(func(ctx context.Context) error {
-			ctx = n.AnnotateCtx(ctx)
-			ctx = logtags.AddTag(ctx, "r", req.RangeID)
-			ctx = logtags.AddTag(ctx, "s", req.Replica.StoreID)
-			ctx, restore := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
-			defer restore()
-			ctx, span := tracing.ForkSpan(ctx, "mux-rf")
-			defer span.Finish()
+		streamCtx := n.AnnotateCtx(stream.Context())
+		streamCtx = logtags.AddTag(streamCtx, "r", req.RangeID)
+		streamCtx = logtags.AddTag(streamCtx, "s", req.Replica.StoreID)
 
-			sink := setRangeIDEventSink{
-				ctx:      ctx,
-				rangeID:  req.RangeID,
-				streamID: req.StreamID,
-				wrapped:  muxStream,
+		sink := setRangeIDEventSink{
+			ctx:      streamCtx,
+			rangeID:  req.RangeID,
+			streamID: req.StreamID,
+			wrapped:  muxStream,
+		}
+
+		// TODO(yevgeniy): Add observability into actively running rangefeeds.
+		f := n.stores.RangeFeed(req, &sink)
+		f.WhenReady(func(err error) {
+			if err == nil {
+				// RangeFeed usually finishes with an error.  However, if future
+				// completes with nil error (which could happen e.g. during processor
+				// shutdown), treat it as a normal stream termination so that the caller
+				// restarts.
+				// TODO(101330): Add an explicit retry reason instead of REPLICA_REMOVED.
+				err = kvpb.NewRangeFeedRetryError(kvpb.RangeFeedRetryError_REASON_REPLICA_REMOVED)
 			}
-			return n.singleRangeFeed(req, &sink)
+
+			e := &kvpb.MuxRangeFeedEvent{
+				RangeID:  req.RangeID,
+				StreamID: req.StreamID,
+			}
+
+			e.SetValue(&kvpb.RangeFeedError{
+				Error: *kvpb.NewError(err),
+			})
+
+			// When rangefeed completes, we must notify the client about that.
+			//
+			// NB: even though calling sink.Send() to send notification might seem
+			// correct, it is also unsafe.  This future may be completed at any point,
+			// including during critical section when some important lock (such as
+			// raftMu in processor) may be held. Issuing potentially blocking IO
+			// during that time is not a good idea. Thus, we shunt the notification to
+			// a dedicated goroutine.
+			rangefeedCompleted(e)
 		})
 	}
 }

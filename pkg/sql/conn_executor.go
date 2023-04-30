@@ -16,7 +16,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,10 +39,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry/schematelemetrycontroller"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention/txnidcache"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -323,7 +324,8 @@ type Server struct {
 
 	mu struct {
 		syncutil.Mutex
-		connectionCount int64
+		connectionCount     int64
+		rootConnectionCount int64
 	}
 }
 
@@ -680,7 +682,7 @@ func (s *Server) getScrubbedStmtStats(
 	var scrubbedStats []appstatspb.CollectedStatementStatistics
 	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		// Scrub the statement itself.
-		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query)
+		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query, nil)
 
 		// We don't want to report this stats if scrubbing has failed. We also don't
 		// wish to abort here because we want to try our best to report all the
@@ -755,7 +757,7 @@ func (s *Server) SetupConn(
 	sds := sessiondata.NewStack(sd)
 	// Set the SessionData from args.SessionDefaults. This also validates the
 	// respective values.
-	sdMutIterator := s.makeSessionDataMutatorIterator(sds, args.SessionDefaults)
+	sdMutIterator := makeSessionDataMutatorIterator(sds, args.SessionDefaults, s.cfg.Settings)
 	sdMutIterator.onDefaultIntSizeChange = onDefaultIntSizeChange
 	if err := sdMutIterator.applyOnEachMutatorError(func(m sessionDataMutator) error {
 		for varName, v := range varGen {
@@ -789,6 +791,14 @@ func (s *Server) IncrementConnectionCount() {
 	s.mu.connectionCount++
 }
 
+// IncrementRootConnectionCount increases both connectionCount and rootConnectionCount by 1.
+func (s *Server) IncrementRootConnectionCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.connectionCount++
+	s.mu.rootConnectionCount++
+}
+
 // DecrementConnectionCount decreases connectionCount by 1.
 func (s *Server) DecrementConnectionCount() {
 	s.mu.Lock()
@@ -796,7 +806,15 @@ func (s *Server) DecrementConnectionCount() {
 	s.mu.connectionCount--
 }
 
-// IncrementConnectionCountIfLessThan increases connectionCount by and returns true if allowedConnectionCount < max,
+// DecrementRootConnectionCount decreases both connectionCount and rootConnectionCount by 1.
+func (s *Server) DecrementRootConnectionCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.connectionCount--
+	s.mu.rootConnectionCount--
+}
+
+// IncrementConnectionCountIfLessThan increases connectionCount by 1 and returns true if connectionCount < max,
 // otherwise it does nothing and returns false.
 func (s *Server) IncrementConnectionCountIfLessThan(max int64) bool {
 	s.mu.Lock()
@@ -813,6 +831,13 @@ func (s *Server) GetConnectionCount() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mu.connectionCount
+}
+
+// GetNonRootConnectionCount returns the current number of non root connections.
+func (s *Server) GetNonRootConnectionCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.connectionCount - s.mu.rootConnectionCount
 }
 
 // ConnectionHandler is the interface between the result of SetupConn
@@ -880,6 +905,7 @@ func newSessionData(args SessionArgs) *sessiondata.SessionData {
 		},
 		LocalUnmigratableSessionData: sessiondata.LocalUnmigratableSessionData{
 			RemoteAddr: args.RemoteAddr,
+			IsSSL:      args.IsSSL,
 		},
 		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
 			ResultsBufferSize:   args.ConnResultsBufferSize,
@@ -895,19 +921,6 @@ func newSessionData(args SessionArgs) *sessiondata.SessionData {
 	}
 	populateMinimalSessionData(sd)
 	return sd
-}
-
-func (s *Server) makeSessionDataMutatorIterator(
-	sds *sessiondata.Stack, defaults SessionDefaults,
-) *sessionDataMutatorIterator {
-	return &sessionDataMutatorIterator{
-		sds: sds,
-		sessionDataMutatorBase: sessionDataMutatorBase{
-			defaults: defaults,
-			settings: s.cfg.Settings,
-		},
-		sessionDataMutatorCallbacks: sessionDataMutatorCallbacks{},
-	}
 }
 
 // populateMinimalSessionData populates sd with some minimal values needed for
@@ -964,7 +977,7 @@ func (s *Server) newConnExecutor(
 		mon.MemoryResource,
 		memMetrics.SessionPreparedCurBytesCount,
 		memMetrics.SessionPreparedMaxBytesHist,
-		-1 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
+		1024 /* increment */, noteworthyMemoryUsageBytes, s.cfg.Settings,
 	)
 	// The txn monitor is started in txnState.resetForNewSQLTxn().
 	txnMon := mon.NewMonitor(
@@ -1045,12 +1058,14 @@ func (s *Server) newConnExecutor(
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionInit, timeutil.Now())
 
 	ex.extraTxnState.prepStmtsNamespace = prepStmtNamespace{
-		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]PreparedPortal),
+		prepStmts:    make(map[string]*PreparedStatement),
+		prepStmtsLRU: make(map[string]struct{ prev, next string }),
+		portals:      make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos = prepStmtNamespace{
-		prepStmts: make(map[string]*PreparedStatement),
-		portals:   make(map[string]PreparedPortal),
+		prepStmts:    make(map[string]*PreparedStatement),
+		prepStmtsLRU: make(map[string]struct{ prev, next string }),
+		portals:      make(map[string]PreparedPortal),
 	}
 	ex.extraTxnState.prepStmtsNamespaceMemAcc = ex.sessionMon.MakeBoundAccount()
 	dsdp := catsessiondata.NewDescriptorSessionDataStackProvider(sdMutIterator.sds)
@@ -1060,7 +1075,8 @@ func (s *Server) newConnExecutor(
 	ex.extraTxnState.jobs = newTxnJobsCollection()
 	ex.extraTxnState.txnRewindPos = -1
 	ex.extraTxnState.schemaChangerState = &SchemaChangerState{
-		mode: ex.sessionData().NewSchemaChangerMode,
+		mode:   ex.sessionData().NewSchemaChangerMode,
+		memAcc: ex.sessionMon.MakeBoundAccount(),
 	}
 	ex.queryCancelKey = pgwirecancel.MakeBackendKeyData(ex.rng, ex.server.cfg.NodeInfo.NodeID.SQLInstanceID())
 	ex.mu.ActiveQueries = make(map[clusterunique.ID]*queryMeta)
@@ -1107,7 +1123,7 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
 			vt := ex.planner.extendedEvalCtx.VirtualSchemas
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt)
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt, nil)
 		}
 
 		// Report the panic to telemetry in any case.
@@ -1134,6 +1150,14 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	if _, noTxn := ex.machine.CurState().(stateNoTxn); !noTxn {
 		txnEvType = txnRollback
 	}
+
+	// Close all portals, otherwise there will be leftover bytes.
+	ex.extraTxnState.prepStmtsNamespace.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
+	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 
 	if closeType == normalClose {
 		// We'll cleanup the SQL txn by creating a non-retriable (commit:true) event.
@@ -1428,6 +1452,8 @@ type connExecutor struct {
 		// statements.
 		transactionStatementsHash util.FNV64
 
+		// schemaChangerState captures the state of the ongoing declarative schema
+		// in the transaction.
 		schemaChangerState *SchemaChangerState
 
 		// shouldCollectTxnExecutionStats specifies whether the statements in
@@ -1645,6 +1671,18 @@ type prepStmtNamespace struct {
 	// prepStmts contains the prepared statements currently available on the
 	// session.
 	prepStmts map[string]*PreparedStatement
+	// prepStmtsLRU is a circular doubly-linked list containing the prepared
+	// statement names ordered by most recent access (needed to determine
+	// evictions when prepared_statements_cache_size is set). There is a special
+	// entry for the empty string which is both the head and tail of the
+	// list. (Consequently, if it exists, the actual prepared statement for the
+	// empty string does not have an entry in this list and cannot be evicted.)
+	prepStmtsLRU map[string]struct{ prev, next string }
+	// prepStmtsLRUAlloc is the total amount of memory allocated for prepared
+	// statements in prepStmtsLRU. This will sometimes be less than
+	// ex.sessionPreparedMon.AllocBytes() because refcounting causes us to hold
+	// onto more PreparedStatements than are currently in the LRU list.
+	prepStmtsLRUAlloc int64
 	// portals contains the portals currently available on the session. Note
 	// that PreparedPortal.accountForCopy needs to be called if a copy of a
 	// PreparedPortal is retained.
@@ -1652,20 +1690,128 @@ type prepStmtNamespace struct {
 }
 
 // HasActivePortals returns true if there are portals in the session.
-func (ns prepStmtNamespace) HasActivePortals() bool {
+func (ns *prepStmtNamespace) HasActivePortals() bool {
 	return len(ns.portals) > 0
 }
 
 // HasPortal returns true if there exists a given named portal in the session.
-func (ns prepStmtNamespace) HasPortal(s string) bool {
+func (ns *prepStmtNamespace) HasPortal(s string) bool {
 	_, ok := ns.portals[s]
 	return ok
 }
 
+const prepStmtsLRUHead = ""
+const prepStmtsLRUTail = ""
+
+// addLRUEntry adds a new prepared statement name to the LRU list. It is an
+// error to re-add an existing name to the LRU list.
+func (ns *prepStmtNamespace) addLRUEntry(name string, alloc int64) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	if _, ok := ns.prepStmtsLRU[name]; ok {
+		// Assert that we're not re-adding an existing name to the LRU list.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU unexpected existing entry (%s): %v", name, ns.prepStmtsLRU,
+		))
+	}
+	var this struct{ prev, next string }
+	this.prev = prepStmtsLRUHead
+	// Note: must do this serially in case head and next are the same entry.
+	head := ns.prepStmtsLRU[this.prev]
+	this.next = head.next
+	head.next = name
+	ns.prepStmtsLRU[prepStmtsLRUHead] = head
+	next, ok := ns.prepStmtsLRU[this.next]
+	if !ok || next.prev != prepStmtsLRUHead {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU head entry not correct (%s): %v", this.next, ns.prepStmtsLRU,
+		))
+	}
+	next.prev = name
+	ns.prepStmtsLRU[this.next] = next
+	ns.prepStmtsLRU[name] = this
+	ns.prepStmtsLRUAlloc += alloc
+}
+
+// delLRUEntry removes a prepared statement name from the LRU list. (It is not an
+// error to remove a non-existent prepared statement.)
+func (ns *prepStmtNamespace) delLRUEntry(name string, alloc int64) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	this, ok := ns.prepStmtsLRU[name]
+	if !ok {
+		// Not an error to remove a non-existent prepared statement.
+		return
+	}
+	// Note: must do this serially in case prev and next are the same entry.
+	prev, ok := ns.prepStmtsLRU[this.prev]
+	if !ok || prev.next != name {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU prev entry not correct (%s): %v", this.prev, ns.prepStmtsLRU,
+		))
+	}
+	prev.next = this.next
+	ns.prepStmtsLRU[this.prev] = prev
+	next, ok := ns.prepStmtsLRU[this.next]
+	if !ok || next.prev != name {
+		// Assert that the chain isn't broken before we modify it.
+		panic(errors.AssertionFailedf(
+			"prepStmtsLRU next entry not correct (%s): %v", this.next, ns.prepStmtsLRU,
+		))
+	}
+	next.prev = this.prev
+	ns.prepStmtsLRU[this.next] = next
+	delete(ns.prepStmtsLRU, name)
+	ns.prepStmtsLRUAlloc -= alloc
+}
+
+// touchLRUEntry moves an existing prepared statement to the front of the LRU
+// list.
+func (ns *prepStmtNamespace) touchLRUEntry(name string) {
+	if name == prepStmtsLRUHead {
+		return
+	}
+	if ns.prepStmtsLRU[prepStmtsLRUHead].next == name {
+		// Already at the front of the list.
+		return
+	}
+	ns.delLRUEntry(name, 0)
+	ns.addLRUEntry(name, 0)
+}
+
+func (ns *prepStmtNamespace) closeAllPortals(
+	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+) {
+	for name, p := range ns.portals {
+		p.close(ctx, prepStmtsNamespaceMemAcc, name)
+		delete(ns.portals, name)
+	}
+}
+
+func (ns *prepStmtNamespace) closeAllPausablePortals(
+	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+) {
+	for name, p := range ns.portals {
+		if p.pauseInfo != nil {
+			p.close(ctx, prepStmtsNamespaceMemAcc, name)
+			delete(ns.portals, name)
+		}
+	}
+}
+
 // MigratablePreparedStatements returns a mapping of all prepared statements.
-func (ns prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.MigratableSession_PreparedStatement {
+func (ns *prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.MigratableSession_PreparedStatement {
 	ret := make([]sessiondatapb.MigratableSession_PreparedStatement, 0, len(ns.prepStmts))
-	for name, stmt := range ns.prepStmts {
+
+	// Serialize prepared statements from least-recently used to most-recently
+	// used, so that we build the LRU list correctly when deserializing.
+	for e, ok := ns.prepStmtsLRU[prepStmtsLRUTail]; ok && e.prev != prepStmtsLRUHead; e, ok = ns.prepStmtsLRU[e.prev] {
+		name := e.prev
+		stmt := ns.prepStmts[name]
 		ret = append(
 			ret,
 			sessiondatapb.MigratableSession_PreparedStatement{
@@ -1675,15 +1821,32 @@ func (ns prepStmtNamespace) MigratablePreparedStatements() []sessiondatapb.Migra
 			},
 		)
 	}
+	// Finally, serialize the anonymous prepared statement (if it exists).
+	if stmt, ok := ns.prepStmts[""]; ok {
+		ret = append(
+			ret,
+			sessiondatapb.MigratableSession_PreparedStatement{
+				Name:                 "",
+				PlaceholderTypeHints: stmt.InferredTypes,
+				SQL:                  stmt.SQL,
+			},
+		)
+	}
+
 	return ret
 }
 
-func (ns prepStmtNamespace) String() string {
+func (ns *prepStmtNamespace) String() string {
 	var sb strings.Builder
 	sb.WriteString("Prep stmts: ")
-	for name := range ns.prepStmts {
-		sb.WriteString(name + " ")
+	// Put the anonymous prepared statement first (if it exists).
+	if _, ok := ns.prepStmts[""]; ok {
+		sb.WriteString("\"\" ")
 	}
+	for e, ok := ns.prepStmtsLRU[prepStmtsLRUHead]; ok && e.next != prepStmtsLRUTail; e, ok = ns.prepStmtsLRU[e.next] {
+		sb.WriteString(e.next + " ")
+	}
+	fmt.Fprintf(&sb, "LRU alloc: %d ", ns.prepStmtsLRUAlloc)
 	sb.WriteString("Portals: ")
 	for name := range ns.portals {
 		sb.WriteString(name + " ")
@@ -1696,7 +1859,7 @@ func (ns *prepStmtNamespace) resetToEmpty(
 	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount,
 ) {
 	// No errors could occur since we're releasing the resources.
-	_ = ns.resetTo(ctx, prepStmtNamespace{}, prepStmtsNamespaceMemAcc)
+	_ = ns.resetTo(ctx, &prepStmtNamespace{}, prepStmtsNamespaceMemAcc)
 }
 
 // resetTo resets a namespace to equate another one (`to`). All the receiver's
@@ -1707,21 +1870,25 @@ func (ns *prepStmtNamespace) resetToEmpty(
 // It can only return an error if we've reached the memory limit and had to make
 // a copy of portals.
 func (ns *prepStmtNamespace) resetTo(
-	ctx context.Context, to prepStmtNamespace, prepStmtsNamespaceMemAcc *mon.BoundAccount,
+	ctx context.Context, to *prepStmtNamespace, prepStmtsNamespaceMemAcc *mon.BoundAccount,
 ) error {
 	for name, p := range ns.prepStmts {
 		p.decRef(ctx)
 		delete(ns.prepStmts, name)
 	}
-	for name, p := range ns.portals {
-		p.close(ctx, prepStmtsNamespaceMemAcc, name)
-		delete(ns.portals, name)
+	for name := range ns.prepStmtsLRU {
+		delete(ns.prepStmtsLRU, name)
 	}
+	ns.closeAllPortals(ctx, prepStmtsNamespaceMemAcc)
 
 	for name, ps := range to.prepStmts {
 		ps.incRef(ctx)
 		ns.prepStmts[name] = ps
 	}
+	for name, entry := range to.prepStmtsLRU {
+		ns.prepStmtsLRU[name] = entry
+	}
+	ns.prepStmtsLRUAlloc = to.prepStmtsLRUAlloc
 	for name, p := range to.portals {
 		if err := p.accountForCopy(ctx, prepStmtsNamespaceMemAcc, name); err != nil {
 			return err
@@ -1747,16 +1914,17 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 	} else {
 		ex.extraTxnState.descCollection.ReleaseAll(ctx)
 		ex.extraTxnState.jobs.reset()
+		ex.extraTxnState.schemaChangerState.memAcc.Clear(ctx)
 		ex.extraTxnState.schemaChangerState = &SchemaChangerState{
-			mode: ex.sessionData().NewSchemaChangerMode,
+			mode:   ex.sessionData().NewSchemaChangerMode,
+			memAcc: ex.sessionMon.MakeBoundAccount(),
 		}
 	}
 
 	// Close all portals.
-	for name, p := range ex.extraTxnState.prepStmtsNamespace.portals {
-		p.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
-		delete(ex.extraTxnState.prepStmtsNamespace.portals, name)
-	}
+	ex.extraTxnState.prepStmtsNamespace.closeAllPortals(
+		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+	)
 
 	// Close all cursors.
 	if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
@@ -1767,10 +1935,9 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 
 	switch ev.eventType {
 	case txnCommit, txnRollback:
-		for name, p := range ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.portals {
-			p.close(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
-			delete(ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.portals, name)
-		}
+		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+			ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
 		ex.extraTxnState.savepoints.clear()
 		ex.onTxnFinish(ctx, ev)
 	case txnRestart:
@@ -1910,13 +2077,13 @@ func (ex *connExecutor) run(
 
 		var err error
 		if err = ex.execCmd(); err != nil {
+			// Both of these errors are normal ways for the connExecutor to exit.
 			if errors.IsAny(err, io.EOF, errDrainingComplete) {
 				return nil
 			}
 			return err
 		}
 	}
-
 }
 
 // errDrainingComplete is returned by execCmd when the connExecutor previously got
@@ -1933,7 +2100,7 @@ var errDrainingComplete = fmt.Errorf("draining done. this is a good time to fini
 // Returns drainingComplete if the session should finish because draining is
 // complete (i.e. we received a DrainRequest - possibly previously - and the
 // connection is found to be idle).
-func (ex *connExecutor) execCmd() error {
+func (ex *connExecutor) execCmd() (retErr error) {
 	ctx := ex.Ctx()
 	cmd, pos, err := ex.stmtBuf.CurCmd()
 	if err != nil {
@@ -1973,6 +2140,7 @@ func (ex *connExecutor) execCmd() error {
 				0,  /* limit */
 				"", /* portalName */
 				ex.implicitTxn(),
+				PortalPausabilityDisabled, /* portalPausability */
 			)
 			res = stmtRes
 
@@ -1987,7 +2155,7 @@ func (ex *connExecutor) execCmd() error {
 				(tcmd.LastInBatchBeforeShowCommitTimestamp ||
 					tcmd.LastInBatch || !implicitTxnForBatch)
 			ev, payload, err = ex.execStmt(
-				ctx, tcmd.Statement, nil /* prepared */, nil /* pinfo */, stmtRes, canAutoCommit,
+				ctx, tcmd.Statement, nil /* portal */, nil /* pinfo */, stmtRes, canAutoCommit,
 			)
 
 			return err
@@ -2035,6 +2203,22 @@ func (ex *connExecutor) execCmd() error {
 				log.VEventf(ctx, 2, "portal resolved to: %s", portal.Stmt.AST.String())
 			}
 			ex.curStmtAST = portal.Stmt.AST
+			if copyTo, ok := ex.curStmtAST.(*tree.CopyTo); ok {
+				// The execution uses the same logic as if it were a simple query. This
+				// is because we no-op preparing of a COPY statement, in order to match
+				// Postgres behavior. Since there is no plan, we use the connExecutor
+				// to execute a prepared COPY.
+				copyCmd := CopyOut{
+					ParsedStmt:   portal.Stmt.Statement,
+					Stmt:         copyTo,
+					TimeReceived: tcmd.TimeReceived,
+				}
+				copyRes := ex.clientComm.CreateCopyOutResult(copyCmd, pos)
+				res = copyRes
+				stmtCtx := withStatement(ctx, copyTo)
+				ev, payload = ex.execCopyOut(stmtCtx, copyCmd, copyRes)
+				return nil
+			}
 
 			pinfo := &tree.PlaceholderInfo{
 				PlaceholderTypesInfo: tree.PlaceholderTypesInfo{
@@ -2042,6 +2226,12 @@ func (ex *connExecutor) execCmd() error {
 					Types:     portal.Stmt.Types,
 				},
 				Values: portal.Qargs,
+			}
+
+			// If this is the first-time execution of a portal without a limit set,
+			// it means all rows will be exhausted, so no need to pause this portal.
+			if tcmd.Limit == 0 && portal.pauseInfo != nil && portal.pauseInfo.curRes == nil {
+				portal.pauseInfo = nil
 			}
 
 			stmtRes := ex.clientComm.CreateStatementResult(
@@ -2055,7 +2245,11 @@ func (ex *connExecutor) execCmd() error {
 				tcmd.Limit,
 				portalName,
 				ex.implicitTxn(),
+				portal.portalPausablity,
 			)
+			if portal.pauseInfo != nil {
+				portal.pauseInfo.curRes = stmtRes
+			}
 			res = stmtRes
 
 			// In the extended protocol, autocommit is not always allowed. The postgres
@@ -2074,6 +2268,8 @@ func (ex *connExecutor) execCmd() error {
 		// - ex.statsCollector merely contains a copy of the times, that
 		//   was created when the statement started executing (via the
 		//   reset() method).
+		// TODO(sql-sessions): fix the phase time for pausable portals.
+		// https://github.com/cockroachdb/cockroach/issues/99410
 		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.SessionQueryServiced, timeutil.Now())
 		if err != nil {
 			return err
@@ -2120,25 +2316,26 @@ func (ex *connExecutor) execCmd() error {
 		// Note that the Sync result will flush results to the network connection.
 		res = ex.clientComm.CreateSyncResult(pos)
 		if ex.draining {
-			// If we're draining, check whether this is a good time to finish the
+			// If we're draining, then after handing the Sync connExecutor state
+			// transition, check whether this is a good time to finish the
 			// connection. If we're not inside a transaction, we stop processing
 			// now. If we are inside a transaction, we'll check again the next time
 			// a Sync is processed.
-			if ex.idleConn() {
-				// If we're about to close the connection, close res in order to flush
-				// now, as we won't have an opportunity to do it later.
-				res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
-				return errDrainingComplete
-			}
+			defer func() {
+				if ex.idleConn() {
+					retErr = errDrainingComplete
+				}
+			}()
 		}
 	case CopyIn:
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
 
-		res = ex.clientComm.CreateCopyInResult(pos)
+		copyRes := ex.clientComm.CreateCopyInResult(tcmd, pos)
+		res = copyRes
 		stmtCtx := withStatement(ctx, tcmd.Stmt)
-		ev, payload = ex.execCopyIn(stmtCtx, tcmd)
+		ev, payload = ex.execCopyIn(stmtCtx, tcmd, copyRes)
 
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
@@ -2151,9 +2348,10 @@ func (ex *connExecutor) execCmd() error {
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-		res = ex.clientComm.CreateCopyOutResult(pos)
+		copyRes := ex.clientComm.CreateCopyOutResult(tcmd, pos)
+		res = copyRes
 		stmtCtx := withStatement(ctx, tcmd.Stmt)
-		ev, payload = ex.execCopyOut(stmtCtx, tcmd)
+		ev, payload = ex.execCopyOut(stmtCtx, tcmd, copyRes)
 
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
@@ -2181,9 +2379,26 @@ func (ex *connExecutor) execCmd() error {
 
 	var advInfo advanceInfo
 
+	// We close all pausable portals when we encounter err payload, otherwise
+	// there will be leftover bytes.
+	shouldClosePausablePortals := func(payload fsm.EventPayload) bool {
+		switch payload.(type) {
+		case eventNonRetriableErrPayload, eventRetriableErrPayload:
+			return true
+		default:
+			return false
+		}
+	}
+
 	// If an event was generated, feed it to the state machine.
 	if ev != nil {
 		var err error
+		if shouldClosePausablePortals(payload) {
+			// We need this as otherwise, there'll be leftover bytes when
+			// txnState.finishSQLTxn() is being called, as the underlying resources of
+			// pausable portals hasn't been cleared yet.
+			ex.extraTxnState.prepStmtsNamespace.closeAllPausablePortals(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc)
+		}
 		advInfo, err = ex.txnStateTransitionsApplyWrapper(ev, payload, res, pos)
 		if err != nil {
 			return err
@@ -2232,6 +2447,16 @@ func (ex *connExecutor) execCmd() error {
 			ex.sessionEventf(ctx, "execution error: %s", pe.errorCause())
 			if resErr == nil {
 				res.SetError(pe.errorCause())
+			}
+		}
+		// For a pausable portal, we don't log the affected rows until we close the
+		// portal. However, we update the result for each execution. Thus, we need
+		// to accumulate the number of affected rows before closing the result.
+		if tcmd, ok := cmd.(*ExecPortal); ok {
+			if portal, ok := ex.extraTxnState.prepStmtsNamespace.portals[tcmd.Name]; ok {
+				if portal.pauseInfo != nil {
+					portal.pauseInfo.dispatchToExecutionEngine.rowsAffected += res.(RestrictedCommandResult).RowsAffected()
+				}
 			}
 		}
 		res.Close(ctx, stateToTxnStatusIndicator(ex.machine.CurState()))
@@ -2456,7 +2681,7 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 }
 
 func (ex *connExecutor) execCopyOut(
-	ctx context.Context, cmd CopyOut,
+	ctx context.Context, cmd CopyOut, res CopyOutResult,
 ) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	// First handle connExecutor state transitions.
 	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
@@ -2644,16 +2869,11 @@ func (ex *connExecutor) execCopyOut(
 		// above.
 		txn := ex.planner.Txn()
 		var err error
-		if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd); err != nil {
+		if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd, res); err != nil {
 			return err
 		}
 
-		// Finalize execution by sending the statement tag and number of rows read.
-		dummy := tree.CopyTo{}
-		tag := []byte(dummy.StatementTag())
-		tag = append(tag, ' ')
-		tag = strconv.AppendInt(tag, int64(numOutputRows), 10 /* base */)
-		return cmd.Conn.SendCommandComplete(tag)
+		return nil
 	}); copyErr != nil {
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
 		payload := eventNonRetriableErrPayload{err: copyErr}
@@ -2662,7 +2882,7 @@ func (ex *connExecutor) execCopyOut(
 	return nil, nil
 }
 
-func (ex *connExecutor) setCopyLoggingFields(stmt parser.Statement) {
+func (ex *connExecutor) setCopyLoggingFields(stmt statements.Statement[tree.Statement]) {
 	// These fields need to be set for logging purposes.
 	ex.planner.stmt = Statement{
 		Statement: stmt,
@@ -2679,7 +2899,7 @@ func (ex *connExecutor) setCopyLoggingFields(stmt parser.Statement) {
 // connection any more until this returns. The copyMachine will do the reading
 // and writing up to the CommandComplete message.
 func (ex *connExecutor) execCopyIn(
-	ctx context.Context, cmd CopyIn,
+	ctx context.Context, cmd CopyIn, res CopyInResult,
 ) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	// First handle connExecutor state transitions.
 	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
@@ -2724,12 +2944,6 @@ func (ex *connExecutor) execCopyIn(
 			ex.resetPlanner(ctx, p, txn, stmtTS)
 		},
 	}
-	// If COPY is not atomic, then each batch must manage the txn state.
-	if ex.implicitTxn() && !ex.sessionData().CopyFromAtomicEnabled {
-		txnOpt.resetExtraTxnState = func(ctx context.Context) {
-			ex.resetExtraTxnState(ctx, txnEvent{eventType: noEvent})
-		}
-	}
 
 	ex.setCopyLoggingFields(cmd.ParsedStmt)
 
@@ -2743,6 +2957,7 @@ func (ex *connExecutor) execCopyIn(
 		var numInsertedRows int
 		if cm != nil {
 			numInsertedRows = cm.numInsertedRows()
+			res.SetRowsAffected(ctx, numInsertedRows)
 		}
 		// These fields are not available in COPY, so use the empty value.
 		f := tree.NewFmtCtx(tree.FmtHideConstants)
@@ -2767,6 +2982,7 @@ func (ex *connExecutor) execCopyIn(
 			ctx, cmd.Conn, cmd.Stmt, &p, txnOpt, ex.state.mon, ex.implicitTxn(),
 			// execInsertPlan
 			func(ctx context.Context, p *planner, res RestrictedCommandResult) error {
+				defer p.curPlan.close(ctx)
 				_, err := ex.execWithDistSQLEngine(ctx, p, tree.RowsAffected, res, DistributionTypeNone, nil /* progressAtomic */)
 				return err
 			},
@@ -2934,7 +3150,7 @@ func (ex *connExecutor) generateID() clusterunique.ID {
 // prepStmtsNamespaceAtTxnRewindPos that's not part of prepStmtsNamespace.
 func (ex *connExecutor) commitPrepStmtNamespace(ctx context.Context) error {
 	return ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespace, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		ctx, &ex.extraTxnState.prepStmtsNamespace, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
 }
 
@@ -2942,7 +3158,7 @@ func (ex *connExecutor) commitPrepStmtNamespace(ctx context.Context) error {
 // not part of prepStmtsNamespaceAtTxnRewindPos.
 func (ex *connExecutor) rewindPrepStmtNamespace(ctx context.Context) error {
 	return ex.extraTxnState.prepStmtsNamespace.resetTo(
-		ctx, ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		ctx, &ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
 }
 
@@ -2977,10 +3193,14 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 	"retriable MinTimestampBoundUnsatisfiableError",
 )
 
+// errIsRetriable is true if the error is a client-visible retry error
+// or the error is a special error that is handled internally and retried.
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) ||
-		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
+	return errors.HasInterface(err, (*pgerror.ClientVisibleRetryError)(nil)) ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
+		// Note that this error is not handled internally and can make it to the
+		// client in implicit transactions. This is not great; it should
+		// be marked as a client visible retry error.
 		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
 		descs.IsTwoVersionInvariantViolationError(err)
 }
@@ -3016,6 +3236,14 @@ func (ex *connExecutor) makeErrEvent(err error, stmt tree.Statement) (fsm.Event,
 	}
 
 	retriable := errIsRetriable(err)
+	if retriable && execinfra.IsDynamicQueryHasNoHomeRegionError(err) {
+		// Retry only # of remote regions times if the retry is due to the
+		// enforce_home_region setting.
+		retriable = int(ex.state.mu.autoRetryCounter) < len(ex.planner.EvalContext().RemoteRegions)
+		if !retriable {
+			err = execinfra.MaybeGetNonRetryableDynamicQueryHasNoHomeRegionError(err)
+		}
+	}
 	if retriable {
 		var rc rewindCapability
 		var canAutoRetry bool
@@ -3173,6 +3401,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			QueryCancelKey:                 ex.queryCancelKey,
 			DescIDGenerator:                ex.getDescIDGenerator(),
 			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
+			JobsProfiler:                   p,
 		},
 		Tracing:           &ex.sessionTracing,
 		MemMetrics:        &ex.memMetrics,
@@ -3269,6 +3498,7 @@ func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
 	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon)
+	autoRetryReason := ex.state.mu.autoRetryReason
 	// If we are retrying due to an unsatisfiable timestamp bound which is
 	// retriable, it means we were unable to serve the previous minimum timestamp
 	// as there was a schema update in between. When retrying, we want to keep the
@@ -3276,9 +3506,22 @@ func (ex *connExecutor) resetPlanner(
 	// to the point just before our failed read to ensure we don't try to read
 	// data which may be after the schema change when we retry.
 	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
-	if err := ex.state.mu.autoRetryReason; err != nil && errors.As(err, &minTSErr) {
+	// Make sure the default locality specifies the actual gateway region at the
+	// start of query compilation. It could have been overridden to a remote
+	// region when the enforce_home_region session setting is true.
+	p.EvalContext().Locality = p.EvalContext().OriginalLocality
+	if err := autoRetryReason; err != nil && errors.As(err, &minTSErr) {
 		nextMax := minTSErr.MinTimestampBound
 		ex.extraTxnState.descCollection.SetMaxTimestampBound(nextMax)
+	} else if execinfra.IsDynamicQueryHasNoHomeRegionError(autoRetryReason) {
+		if int(ex.state.mu.autoRetryCounter) <= len(p.EvalContext().RemoteRegions) {
+			// Set a fake gateway region for use by the optimizer to inform its
+			// decision on which region to access first in locality-optimized scan
+			// and join operations. This setting does not affect the distsql planner,
+			// and local plans will continue to be run from the actual gateway region.
+			p.EvalContext().Locality =
+				p.EvalContext().Locality.CopyReplaceKeyValue("region", string(p.EvalContext().RemoteRegions[ex.state.mu.autoRetryCounter-1]))
+		}
 	} else if newTxn := txn == nil || p.extendedEvalCtx.Txn != txn; newTxn {
 		// Otherwise, only change the historical timestamps if this is a new txn.
 		// This is because resetPlanner can be called multiple times for the same
@@ -3369,18 +3612,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		// Session is considered active when executing a transaction.
 		ex.totalActiveTimeStopWatch.Start()
 
-		if !ex.server.cfg.Codec.ForSystemTenant() {
-			// Update the leased descriptor collection with the current sqlliveness.Session.
-			// This is required in the multi-tenant environment to update the transaction
-			// deadline to either the session expiry or the leased descriptor deadline,
-			// whichever is sooner. We need this to ensure that transactions initiated
-			// by ephemeral SQL pods in multi-tenant environments are committed before the
-			// session expires.
-			session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
-			if err != nil {
-				return advanceInfo{}, err
-			}
-			ex.extraTxnState.descCollection.SetSession(session)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
 		}
 	case txnCommit:
 		if res.Err() != nil {
@@ -3457,13 +3690,43 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		}
 
 		fallthrough
-	case txnRestart, txnRollback:
+	case txnRollback:
 		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+		// Since we're doing a complete rollback, there's no need to keep the
+		// prepared stmts for a txn rewind.
+		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
+			ex.Ctx(), &ex.extraTxnState.prepStmtsNamespaceMemAcc,
+		)
+	case txnRestart:
+		// In addition to resetting the extraTxnState, the restart event may
+		// also need to reset the sqlliveness.Session.
+		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
+		}
 	default:
 		return advanceInfo{}, errors.AssertionFailedf(
 			"unexpected event: %v", errors.Safe(advInfo.txnEvent))
 	}
 	return advInfo, nil
+}
+
+func (ex *connExecutor) maybeSetSQLLivenessSession() error {
+	if !ex.server.cfg.Codec.ForSystemTenant() ||
+		ex.server.cfg.TestingKnobs.ForceSQLLivenessSession {
+		// Update the leased descriptor collection with the current sqlliveness.Session.
+		// This is required in the multi-tenant environment to update the transaction
+		// deadline to either the session expiry or the leased descriptor deadline,
+		// whichever is sooner. We need this to ensure that transactions initiated
+		// by ephemeral SQL pods in multi-tenant environments are committed before the
+		// session expires.
+		session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
+		if err != nil {
+			return err
+		}
+		ex.extraTxnState.descCollection.SetSession(session)
+	}
+	return nil
 }
 
 func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
@@ -3998,14 +4261,17 @@ func (ps connExPrepStmtsAccessor) List() map[string]*PreparedStatement {
 }
 
 // Get is part of the preparedStatementsAccessor interface.
-func (ps connExPrepStmtsAccessor) Get(name string) (*PreparedStatement, bool) {
+func (ps connExPrepStmtsAccessor) Get(name string, touchLRU bool) (*PreparedStatement, bool) {
 	s, ok := ps.ex.extraTxnState.prepStmtsNamespace.prepStmts[name]
+	if ok && touchLRU {
+		ps.ex.extraTxnState.prepStmtsNamespace.touchLRUEntry(name)
+	}
 	return s, ok
 }
 
 // Delete is part of the preparedStatementsAccessor interface.
 func (ps connExPrepStmtsAccessor) Delete(ctx context.Context, name string) bool {
-	_, ok := ps.Get(name)
+	_, ok := ps.Get(name, false /* touchLRU */)
 	if !ok {
 		return false
 	}
@@ -4066,7 +4332,7 @@ func init() {
 			return ""
 		}
 		// Anonymize the statement for reporting.
-		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */)
+		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */, nil /* ClientNoticeSender */)
 	})
 	logcrash.RegisterTagFn("gist", func(ctx context.Context) string {
 		return planGistFromCtx(ctx)

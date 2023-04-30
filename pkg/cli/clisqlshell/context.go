@@ -106,6 +106,9 @@ type internalContext struct {
 	// hook to run once, then clear, after running the next batch of statements.
 	afterRun func()
 
+	// file where the history is saved.
+	histFile string
+
 	statementWrappers []statementWrapper
 
 	// state about the current query.
@@ -134,7 +137,7 @@ func (c *internalContext) addStatementWrapper(w statementWrapper) {
 func (c *internalContext) maybeWrapStatement(
 	ctx context.Context, statement string, state *cliState,
 ) (err error) {
-	var s scanner.Scanner
+	var s scanner.SQLScanner
 	for _, sw := range c.statementWrappers {
 		s.Init(statement)
 		if sw.Pattern.matches(s) {

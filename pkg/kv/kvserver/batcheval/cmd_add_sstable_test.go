@@ -11,6 +11,7 @@
 package batcheval_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"regexp"
@@ -63,6 +64,7 @@ func TestEvalAddSSTable(t *testing.T) {
 		noShadowBelow  int64 // DisallowShadowingBelow
 		requireReqTS   bool  // AddSSTableRequireAtRequestTimestamp
 		expect         kvs
+		ignoreExpect   bool
 		expectErr      interface{} // error type, substring, substring slice, or true (any)
 		expectErrRace  interface{}
 		expectStatsEst bool // expect MVCCStats.ContainsEstimates, don't check stats
@@ -807,6 +809,70 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:        kvs{rangeKV("a", "b", 8, ""), pointKV("a", 7, "a8")},
 			expect:     kvs{rangeKV("a", "b", 8, ""), pointKV("a", 7, "a8"), pointKV("a", 6, "d")},
 		},
+		"DisallowConflicts allows sst range keys 2": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{pointKV("a", 6, "d"), pointKV("bbb", 6, ""), pointKV("c", 6, "d"), pointKV("d", 6, "d"), pointKV("dd", 6, "")},
+			sst:        kvs{pointKV("aa", 9, ""), pointKV("b", 9, "dee"), rangeKV("bb", "e", 9, ""), pointKV("cc", 10, "")},
+			expect:     kvs{pointKV("a", 6, "d"), pointKV("aa", 9, ""), pointKV("b", 9, "dee"), rangeKV("bb", "e", 9, ""), pointKV("bbb", 6, ""), pointKV("c", 6, "d"), pointKV("cc", 10, ""), pointKV("d", 6, "d"), pointKV("dd", 6, "")},
+		},
+		"DisallowConflicts does not skip sst range keys ahead of first one": {
+			noConflict: true,
+			reqTS:      10,
+			toReqTS:    8,
+			data:       kvs{pointKV("a", 6, "d"), pointKV("e", 5, "d")},
+			sst:        kvs{rangeKV("b", "c", 8, ""), rangeKV("cc", "f", 8, "")},
+			expect:     kvs{pointKV("a", 6, "d"), rangeKV("b", "c", 10, ""), rangeKV("cc", "f", 10, ""), pointKV("e", 5, "d")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("b", "c", 7, ""), rangeKV("b", "c", 6, ""), rangeKV("c", "f", 6, ""), rangeKV("f", "g", 7, ""), rangeKV("f", "g", 6, "")},
+			sst:        kvs{rangeKV("a", "d", 8, ""), rangeKV("e", "g", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 8, ""), rangeKV("b", "c", 8, ""), rangeKV("b", "c", 7, ""), rangeKV("b", "c", 6, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "e", 6, ""), rangeKV("e", "f", 8, ""), rangeKV("e", "f", 6, ""), rangeKV("f", "g", 8, ""), rangeKV("f", "g", 7, ""), rangeKV("f", "g", 6, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 2": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("a", "g", 6, ""), pointKV("bb", 5, "bar")},
+			sst:        kvs{rangeKV("b", "c", 8, ""), pointKV("cc", 8, "foo"), rangeKV("e", "f", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 6, ""), rangeKV("b", "c", 8, ""), rangeKV("b", "c", 6, ""), pointKV("bb", 5, "bar"), rangeKV("c", "e", 6, ""), pointKV("cc", 8, "foo"), rangeKV("e", "f", 8, ""), rangeKV("e", "f", 6, ""), rangeKV("f", "g", 6, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 3": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("c", "d", 6, ""), pointKV("e", 6, ""), pointKV("e", 5, "foo"), pointKV("f", 6, ""), pointKV("f", 5, ""), pointKV("g", 6, ""), rangeKV("j", "k", 5, "")},
+			sst:        kvs{rangeKV("a", "l", 8, "")},
+			expect:     kvs{rangeKV("a", "c", 8, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "j", 8, ""), pointKV("e", 6, ""), pointKV("e", 5, "foo"), pointKV("f", 6, ""), pointKV("f", 5, ""), pointKV("g", 6, ""), rangeKV("j", "k", 8, ""), rangeKV("j", "k", 5, ""), rangeKV("k", "l", 8, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 4": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("c", "d", 6, ""), rangeKV("j", "k", 5, "")},
+			sst:        kvs{rangeKV("a", "l", 8, "")},
+			expect:     kvs{rangeKV("a", "c", 8, ""), rangeKV("c", "d", 8, ""), rangeKV("c", "d", 6, ""), rangeKV("d", "j", 8, ""), rangeKV("j", "k", 8, ""), rangeKV("j", "k", 5, ""), rangeKV("k", "l", 8, "")},
+		},
+		"DisallowConflicts correctly accounts for complex fragment cases 5": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{pointKV("cc", 7, ""), pointKV("cc", 6, ""), pointKV("cc", 5, "foo"), pointKV("cc", 4, ""), pointKV("cc", 3, "bar"), pointKV("cc", 2, "barfoo"), rangeKV("ab", "g", 1, "")},
+			sst:        kvs{pointKV("aa", 8, "foo"), pointKV("aaa", 8, ""), pointKV("ac", 8, "foo"), rangeKV("b", "c", 8, ""), pointKV("ca", 8, "foo"), pointKV("cb", 8, "foo"), pointKV("cc", 8, "foo"), rangeKV("d", "e", 8, ""), pointKV("e", 8, "foobar")},
+			expect:     kvs{pointKV("aa", 8, "foo"), pointKV("aaa", 8, ""), rangeKV("ab", "b", 1, ""), pointKV("ac", 8, "foo"), rangeKV("b", "c", 8, ""), rangeKV("b", "c", 1, ""), rangeKV("c", "d", 1, ""), pointKV("ca", 8, "foo"), pointKV("cb", 8, "foo"), pointKV("cc", 8, "foo"), pointKV("cc", 7, ""), pointKV("cc", 6, ""), pointKV("cc", 5, "foo"), pointKV("cc", 4, ""), pointKV("cc", 3, "bar"), pointKV("cc", 2, "barfoo"), rangeKV("d", "e", 8, ""), rangeKV("d", "e", 1, ""), rangeKV("e", "g", 1, ""), pointKV("e", 8, "foobar")},
+		},
+		"DisallowConflicts handles existing point key above existing range tombstone": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{pointKV("c", 7, ""), rangeKV("a", "g", 6, ""), pointKV("h", 7, "")},
+			sst:        kvs{rangeKV("b", "d", 8, ""), rangeKV("f", "j", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 6, ""), rangeKV("b", "d", 8, ""), rangeKV("b", "d", 6, ""), pointKV("c", 7, ""), rangeKV("d", "f", 6, ""), rangeKV("f", "g", 8, ""), rangeKV("f", "g", 6, ""), rangeKV("g", "j", 8, ""), pointKV("h", 7, "")},
+		},
+		"DisallowConflicts accounts for point key already deleted in engine": {
+			noConflict: true,
+			reqTS:      10,
+			data:       kvs{rangeKV("b", "d", 6, ""), pointKV("c", 5, "foo")},
+			sst:        kvs{rangeKV("a", "d", 8, "")},
+			expect:     kvs{rangeKV("a", "b", 8, ""), rangeKV("b", "d", 8, ""), rangeKV("b", "d", 6, ""), pointKV("c", 5, "foo")},
+		},
 		"DisallowConflicts allows fragmented sst range keys": {
 			noConflict: true,
 			data:       kvs{pointKV("a", 6, "d")},
@@ -973,7 +1039,79 @@ func TestEvalAddSSTable(t *testing.T) {
 			noConflict: true,
 			data:       kvs{rangeKV("a", "b", 7, "")},
 			sst:        kvs{rangeKV("a", "b", 7, "")},
-			expectErr:  "ingested range key collides with an existing one",
+			expectErr:  &kvpb.WriteTooOldError{},
+		},
+		"DisallowConflict allows overlapping sst range tombstones": {
+			noConflict:   true,
+			data:         kvs{pointKV("ib", 6, "foo"), pointKV("if", 6, "foo"), pointKV("it", 6, "foo"), rangeKV("i", "j", 5, "")},
+			sst:          kvs{rangeKV("ia", "irc", 8, ""), rangeKV("ie", "iu", 9, ""), pointKV("ic", 7, "foo"), pointKV("iq", 8, "foo")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not miss deleted ext keys": {
+			noConflict:   true,
+			data:         kvs{pointKV("c", 6, "foo"), pointKV("d", 6, "foo"), pointKV("e", 6, "foo"), rangeKV("bb", "j", 5, "")},
+			sst:          kvs{rangeKV("b", "k", 8, ""), pointKV("cc", 9, "foo"), pointKV("dd", 7, "foo"), pointKV("ee", 7, "foo")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not miss deleted ext keys 2": {
+			noConflict:   true,
+			data:         kvs{pointKV("kr", 7, "foo"), pointKV("krj", 7, "foo"), pointKV("ksq", 7, "foo"), pointKV("ku", 6, "foo")},
+			sst:          kvs{rangeKV("ke", "l", 11, ""), pointKV("kr", 8, "bar"), pointKV("ksxk", 9, "bar")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not miss deleted ext keys 3": {
+			noConflict:   true,
+			data:         kvs{pointKV("xe", 5, "foo"), pointKV("xg", 6, "foo"), pointKV("xh", 7, "foo"), rangeKV("xf", "xk", 5, "")},
+			sst:          kvs{pointKV("xeqn", 10, "foo"), pointKV("xh", 12, "foo"), rangeKV("x", "xp", 11, "")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not miss deleted ext keys 4": {
+			noConflict:   true,
+			data:         kvs{pointKV("xh", 7, "foo")},
+			sst:          kvs{pointKV("xh", 12, "foo"), rangeKV("x", "xp", 11, "")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not repeatedly count ext value deleted by ext range": {
+			noConflict:   true,
+			data:         kvs{rangeKV("bf", "bjs", 7, ""), pointKV("bbeg", 6, "foo"), pointKV("bf", 6, "foo"), pointKV("bl", 6, "foo")},
+			sst:          kvs{pointKV("bbtq", 11, "foo"), pointKV("bbw", 11, "foo"), pointKV("bc", 11, "foo"), pointKV("bl", 12, "foo")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not miss sst range keys after overlapping point": {
+			noConflict:   true,
+			data:         kvs{pointKV("oe", 8, "foo"), pointKV("oi", 8, "foo"), rangeKV("o", "omk", 7, ""), pointKV("od", 6, "foo")},
+			sst:          kvs{pointKV("oe", 11, "foo"), pointKV("oih", 12, "foo"), rangeKV("ods", "ogvh", 10, ""), rangeKV("ogvh", "ohl", 10, ""), rangeKV("ogvh", "ohl", 9, "")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict maintains ext iter ahead of sst iter": {
+			noConflict:   true,
+			data:         kvs{pointKV("c", 6, "foo"), rangeKV("c", "e", 5, "")},
+			sst:          kvs{rangeKV("a", "b", 10, ""), pointKV("d", 9, "foo")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not double count deleted ext key": {
+			noConflict:   true,
+			data:         kvs{pointKV("e", 6, "foo"), rangeKV("e", "g", 5, "")},
+			sst:          kvs{rangeKV("a", "j", 10, ""), pointKV("b", 11, "bar"), pointKV("c", 11, "foo"), pointKV("d", 11, "foo"), pointKV("f", 11, "foo")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict does not double count deleted ext key 2": {
+			noConflict:   true,
+			data:         kvs{pointKV("b", 7, "foo"), pointKV("d", 6, "foo"), rangeKV("d", "e", 5, "")},
+			sst:          kvs{rangeKV("a", "j", 10, ""), pointKV("c", 11, "foo"), pointKV("d", 12, "bar")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict handles complex range key cases": {
+			noConflict:   true,
+			data:         kvs{pointKV("cb", 6, "foo"), pointKV("cm", 6, "foo"), pointKV("cn", 6, ""), pointKV("co", 6, "foo"), rangeKV("c", "co", 5, "")},
+			sst:          kvs{rangeKV("cd", "cnr", 9, ""), pointKV("cn", 8, "bar"), rangeKV("cnr", "d", 10, ""), pointKV("co", 8, "bar")},
+			ignoreExpect: true,
+		},
+		"DisallowConflict handles complex range key cases 2": {
+			noConflict:   true,
+			data:         kvs{pointKV("cb", 6, "foo"), pointKV("cm", 6, "foo"), pointKV("cn", 6, ""), pointKV("cx", 6, "foo"), rangeKV("c", "co", 5, "")},
+			sst:          kvs{rangeKV("cd", "cnr", 9, ""), pointKV("cn", 8, "bar"), rangeKV("cnr", "d", 10, ""), pointKV("co", 8, "bar")},
+			ignoreExpect: true,
 		},
 	}
 	testutils.RunTrueAndFalse(t, "IngestAsWrites", func(t *testing.T, ingestAsWrites bool) {
@@ -991,7 +1129,7 @@ func TestEvalAddSSTable(t *testing.T) {
 						defer engine.Close()
 
 						// Write initial data.
-						intentTxn := roachpb.MakeTransaction("intentTxn", nil, 0, hlc.Timestamp{WallTime: intentTS * 1e9}, 0, 1)
+						intentTxn := roachpb.MakeTransaction("intentTxn", nil, 0, 0, hlc.Timestamp{WallTime: intentTS * 1e9}, 0, 1)
 						b := engine.NewBatch()
 						defer b.Close()
 						for i := len(tc.data) - 1; i >= 0; i-- { // reverse, older timestamps first
@@ -1133,7 +1271,9 @@ func TestEvalAddSSTable(t *testing.T) {
 						}
 
 						// Scan resulting data from engine.
-						require.Equal(t, expect, storageutils.ScanEngine(t, engine))
+						if !tc.ignoreExpect {
+							require.Equal(t, expect, storageutils.ScanEngine(t, engine))
+						}
 
 						// Check that stats were updated correctly.
 						if tc.expectStatsEst {
@@ -1421,14 +1561,14 @@ func runTestDBAddSSTable(
 		value := roachpb.MakeValueFromString("1")
 		value.InitChecksum([]byte("foo"))
 
-		sstFile := &storage.MemFile{}
-		w := storage.MakeBackupSSTWriter(ctx, cs, sstFile)
+		var sstFile bytes.Buffer
+		w := storage.MakeBackupSSTWriter(ctx, cs, &sstFile)
 		defer w.Close()
 		require.NoError(t, w.Put(key, value.RawBytes))
 		require.NoError(t, w.Finish())
 
 		_, _, err := db.AddSSTable(
-			ctx, "b", "c", sstFile.Data(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
+			ctx, "b", "c", sstFile.Bytes(), allowConflicts, allowShadowing, allowShadowingBelow, nilStats, ingestAsSST, noTS)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "invalid checksum")
 	}

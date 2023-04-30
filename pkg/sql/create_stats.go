@@ -66,9 +66,9 @@ const nonIndexColHistogramBuckets = 2
 // StubTableStats generates "stub" statistics for a table which are missing
 // histograms and have 0 for all values.
 func StubTableStats(
-	desc catalog.TableDescriptor, name string, multiColEnabled bool,
+	desc catalog.TableDescriptor, name string, multiColEnabled bool, defaultHistogramBuckets uint32,
 ) ([]*stats.TableStatisticProto, error) {
-	colStats, err := createStatsDefaultColumns(desc, multiColEnabled)
+	colStats, err := createStatsDefaultColumns(desc, multiColEnabled, defaultHistogramBuckets)
 	if err != nil {
 		return nil, err
 	}
@@ -104,22 +104,19 @@ type createStatsNode struct {
 // createStatsRun contains the run-time state of createStatsNode during local
 // execution.
 type createStatsRun struct {
-	resultsCh chan tree.Datums
-	errCh     chan error
+	errCh chan error
 }
 
 func (n *createStatsNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("stats"))
-	n.run.resultsCh = make(chan tree.Datums)
 	n.run.errCh = make(chan error)
 	go func() {
-		err := n.startJob(params.ctx, n.run.resultsCh)
+		err := n.startJob(params.ctx)
 		select {
 		case <-params.ctx.Done():
 		case n.run.errCh <- err:
 		}
 		close(n.run.errCh)
-		close(n.run.resultsCh)
 	}()
 	return nil
 }
@@ -130,8 +127,6 @@ func (n *createStatsNode) Next(params runParams) (bool, error) {
 		return false, params.ctx.Err()
 	case err := <-n.run.errCh:
 		return false, err
-	case <-n.run.resultsCh:
-		return true, nil
 	}
 }
 
@@ -139,7 +134,7 @@ func (*createStatsNode) Close(context.Context) {}
 func (*createStatsNode) Values() tree.Datums   { return nil }
 
 // startJob starts a CreateStats job to plan and execute statistics creation.
-func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Datums) error {
+func (n *createStatsNode) startJob(ctx context.Context) error {
 	record, err := n.makeJobRecord(ctx)
 	if err != nil {
 		return err
@@ -250,6 +245,18 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		)
 	}
 
+	if n.Options.UsingExtremes && !n.p.SessionData().EnableCreateStatsUsingExtremes {
+		return nil, pgerror.New(pgcode.FeatureNotSupported,
+			"creating partial statistics at extremes is not yet supported",
+		)
+	}
+
+	if n.Options.Where != nil {
+		return nil, pgerror.New(pgcode.FeatureNotSupported,
+			"creating partial statistics with a WHERE clause is not yet supported",
+		)
+	}
+
 	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
 		return nil, err
 	}
@@ -265,7 +272,10 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 			multiColEnabled = stats.MultiColumnStatisticsClusterMode.Get(&n.p.ExecCfg().Settings.SV)
 			deleteOtherStats = true
 		}
-		if colStats, err = createStatsDefaultColumns(tableDesc, multiColEnabled); err != nil {
+		defaultHistogramBuckets := stats.GetDefaultHistogramBuckets(n.p.ExecCfg().SV(), tableDesc)
+		if colStats, err = createStatsDefaultColumns(
+			tableDesc, multiColEnabled, defaultHistogramBuckets,
+		); err != nil {
 			return nil, err
 		}
 	} else {
@@ -293,12 +303,13 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		// STATISTICS or other SQL on table_statistics.
 		_ = stats.MakeSortedColStatKey(columnIDs)
 		isInvIndex := colinfo.ColumnTypeIsOnlyInvertedIndexable(col.GetType())
+		defaultHistogramBuckets := stats.GetDefaultHistogramBuckets(n.p.ExecCfg().SV(), tableDesc)
 		colStats = []jobspb.CreateStatsDetails_ColStat{{
 			ColumnIDs: columnIDs,
 			// By default, create histograms on all explicitly requested column stats
 			// with a single column that doesn't use an inverted index.
 			HasHistogram:        len(columnIDs) == 1 && !isInvIndex,
-			HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}}
 		// Make histograms for inverted index column types.
 		if len(columnIDs) == 1 && isInvIndex {
@@ -306,7 +317,7 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 				ColumnIDs:           columnIDs,
 				HasHistogram:        true,
 				Inverted:            true,
-				HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+				HistogramMaxBuckets: defaultHistogramBuckets,
 			})
 		}
 	}
@@ -375,7 +386,7 @@ const maxNonIndexCols = 100
 // other columns from the table. We only collect histograms for index columns,
 // plus any other boolean or enum columns (where the "histogram" is tiny).
 func createStatsDefaultColumns(
-	desc catalog.TableDescriptor, multiColEnabled bool,
+	desc catalog.TableDescriptor, multiColEnabled bool, defaultHistogramBuckets uint32,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
 	colStats := make([]jobspb.CreateStatsDetails_ColStat, 0, len(desc.ActiveIndexes()))
 
@@ -421,7 +432,7 @@ func createStatsDefaultColumns(
 		colStat := jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colIDs,
 			HasHistogram:        !isInverted,
-			HistogramMaxBuckets: stats.DefaultHistogramBuckets,
+			HistogramMaxBuckets: defaultHistogramBuckets,
 		}
 		colStats = append(colStats, colStat)
 
@@ -563,7 +574,7 @@ func createStatsDefaultColumns(
 		// for those types, up to DefaultHistogramBuckets.
 		maxHistBuckets := uint32(nonIndexColHistogramBuckets)
 		if col.GetType().Family() == types.BoolFamily || col.GetType().Family() == types.EnumFamily {
-			maxHistBuckets = stats.DefaultHistogramBuckets
+			maxHistBuckets = defaultHistogramBuckets
 		}
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colIDs,
@@ -696,9 +707,9 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p JobExecContext) erro
 	}
 	var exists bool
 	if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
-		exists, err = jobs.RunningJobExists(ctx, jobID, txn, func(payload *jobspb.Payload) bool {
-			return payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats
-		})
+		exists, err = jobs.RunningJobExists(ctx, jobID, txn, p.ExecCfg().Settings.Version,
+			jobspb.TypeCreateStats, jobspb.TypeAutoCreateStats,
+		)
 		return err
 	}); err != nil {
 		return err

@@ -12,9 +12,9 @@ package kvserver
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"time"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"golang.org/x/time/rate"
@@ -125,20 +126,6 @@ type ProposalData struct {
 	// tok identifies the request to the propBuf. Once the proposal is made, the
 	// token will be used to stop tracking this request.
 	tok TrackedRequestToken
-}
-
-// Supersedes takes the MaxLeaseIndex of a RaftCommand obtained from a log
-// entry. It returns true if the ProposalData tracks a different MaxIndex,
-// implying that the log entry has been reproposed under an updated
-// MaxLeaseIndex. This implies that the current log entry will have been
-// rejected and should not be reproposed.
-//
-// Note that some commands such as lease requests (but not transfers) don't use
-// MaxLeaseIndex. For these, false will be returned.
-//
-// See (*Replica).mu.proposals for a detailed explanation of reproposals.
-func (proposal *ProposalData) Supersedes(entryMaxLeaseIndex uint64) bool {
-	return proposal.command.MaxLeaseIndex != entryMaxLeaseIndex
 }
 
 // finishApplication is called when a command application has finished. The
@@ -363,8 +350,6 @@ func (r *Replica) leasePostApplyLocked(
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
 	r.mu.state.Lease = newLease
-	requiresExpirationBasedLease := r.requiresExpiringLeaseRLocked()
-	hasExpirationBasedLease := newLease.Type() == roachpb.LeaseExpiration
 
 	now := r.store.Clock().NowAsClockTimestamp()
 
@@ -382,32 +367,22 @@ func (r *Replica) leasePostApplyLocked(
 		r.gossipFirstRangeLocked(ctx)
 	}
 
-	if leaseChangingHands && iAmTheLeaseHolder && hasExpirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
-		if requiresExpirationBasedLease {
-			// Whenever we first acquire an expiration-based lease for a range that
-			// requires it, notify the lease renewer worker that we want it to keep
-			// proactively renewing the lease before it expires.
-			r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
-			select {
-			case r.store.renewableLeasesSignal <- struct{}{}:
-			default:
-			}
-		} else {
-			// We received an expiration lease for a range that doesn't require it,
-			// i.e. comes after the liveness keyspan. We've also applied it before
-			// it has expired. Upgrade this lease to the more efficient epoch-based
-			// one.
-			if log.V(1) {
-				log.VEventf(ctx, 1, "upgrading expiration lease %s to an epoch-based one", newLease)
-			}
-
-			if r.store.TestingKnobs().LeaseUpgradeInterceptor != nil {
-				r.store.TestingKnobs().LeaseUpgradeInterceptor(newLease)
-			}
-			st := r.leaseStatusForRequestRLocked(ctx, now, hlc.Timestamp{})
-			// Ignore the returned handle as we won't block on it.
-			_ = r.requestLeaseLocked(ctx, st)
+	if leaseChangingHands && newLease.Type() == roachpb.LeaseExpiration &&
+		r.ownsValidLeaseRLocked(ctx, now) && !r.shouldUseExpirationLeaseRLocked() {
+		// We've received and applied an expiration lease for a range that shouldn't
+		// keep using it, most likely as part of a lease transfer (which is always
+		// expiration-based). The lease is also still valid. Upgrade this lease to
+		// the more efficient epoch-based one.
+		if log.V(1) {
+			log.VEventf(ctx, 1, "upgrading expiration lease %s to an epoch-based one", newLease)
 		}
+
+		if r.store.TestingKnobs().LeaseUpgradeInterceptor != nil {
+			r.store.TestingKnobs().LeaseUpgradeInterceptor(newLease)
+		}
+		st := r.leaseStatusForRequestRLocked(ctx, now, hlc.Timestamp{})
+		// Ignore the returned handle as we won't block on it.
+		_ = r.requestLeaseLocked(ctx, st)
 	}
 
 	// If we're the current raft leader, may want to transfer the leadership to
@@ -520,7 +495,8 @@ func addSSTablePreApply(
 	st *cluster.Settings,
 	eng storage.Engine,
 	sideloaded logstore.SideloadStorage,
-	term, index uint64,
+	term kvpb.RaftTerm,
+	index kvpb.RaftIndex,
 	sst kvserverpb.ReplicatedEvalResult_AddSSTable,
 	limiter *rate.Limiter,
 ) bool {
@@ -540,41 +516,60 @@ func addSSTablePreApply(
 	}
 
 	tBegin := timeutil.Now()
-	var tEndDelayed time.Time
 	defer func() {
 		if dur := timeutil.Since(tBegin); dur > addSSTPreApplyWarn.threshold && addSSTPreApplyWarn.ShouldLog() {
 			log.Infof(ctx,
-				"ingesting SST of size %s at index %d took %.2fs (%.2fs on which in PreIngestDelay)",
-				humanizeutil.IBytes(int64(len(sst.Data))), index, dur.Seconds(), tEndDelayed.Sub(tBegin).Seconds(),
+				"ingesting SST of size %s at index %d took %.2fs",
+				humanizeutil.IBytes(int64(len(sst.Data))), index, dur.Seconds(),
 			)
 		}
 	}()
 
-	eng.PreIngestDelay(ctx)
-	tEndDelayed = timeutil.Now()
-
 	ingestPath := path + ".ingested"
 
-	// The SST may already be on disk, thanks to the sideloading mechanism.  If
+	// The SST may already be on disk, thanks to the sideloading mechanism. If
 	// so we can try to add that file directly, via a new hardlink if the
-	// filesystem supports it, rather than writing a new copy of it.  We cannot
+	// filesystem supports it, rather than writing a new copy of it. We cannot
 	// pass it the path in the sideload store as the engine deletes the passed
 	// path on success.
-	if linkErr := eng.Link(path, ingestPath); linkErr == nil {
-		ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
-		if ingestErr != nil {
-			log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
+	if linkErr := eng.Link(path, ingestPath); linkErr != nil {
+		// We're on a weird file system that doesn't support Link. This is unlikely
+		// to happen in any "normal" deployment but we have a fallback path anyway.
+		log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, ingestPath)
+		if err := ingestViaCopy(ctx, st, eng, ingestPath, term, index, sst, limiter); err != nil {
+			log.Fatalf(ctx, "%v", err)
 		}
-		// Adding without modification succeeded, no copy necessary.
-		log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
-		return false /* copied */
+		return true /* copied */
 	}
 
-	log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, ingestPath)
+	// Regular path - we made a hard link, so we can ingest the hard link now.
+	ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
+	if ingestErr != nil {
+		log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
+	}
+	// Adding without modification succeeded, no copy necessary.
+	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
 
+	return false /* copied */
+}
+
+// ingestViaCopy writes the SST to ingestPath (with rate limiting) and then ingests it
+// into the Engine.
+//
+// This is not normally called, as we prefer to make a hard-link and ingest that instead.
+func ingestViaCopy(
+	ctx context.Context,
+	st *cluster.Settings,
+	eng storage.Engine,
+	ingestPath string,
+	term kvpb.RaftTerm,
+	index kvpb.RaftIndex,
+	sst kvserverpb.ReplicatedEvalResult_AddSSTable,
+	limiter *rate.Limiter,
+) error {
 	// TODO(tschottdorf): remove this once sideloaded storage guarantees its
 	// existence.
-	if err := eng.MkdirAll(filepath.Dir(ingestPath)); err != nil {
+	if err := eng.MkdirAll(filepath.Dir(ingestPath), os.ModePerm); err != nil {
 		panic(err)
 	}
 	if _, err := eng.Stat(ingestPath); err == nil {
@@ -583,17 +578,17 @@ func addSSTablePreApply(
 		// command as committed). Just unlink the file (the storage engine
 		// created a hard link); after that we're free to write it again.
 		if err := eng.Remove(ingestPath); err != nil {
-			log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", ingestPath, err)
+			return errors.Wrapf(err, "while removing existing file during ingestion of %s", ingestPath)
 		}
 	}
 	if err := kvserverbase.WriteFileSyncing(ctx, ingestPath, sst.Data, eng, 0600, st, limiter); err != nil {
-		log.Fatalf(ctx, "while ingesting %s: %+v", ingestPath, err)
+		return errors.Wrapf(err, "while ingesting %s", ingestPath)
 	}
 	if err := eng.IngestExternalFiles(ctx, []string{ingestPath}); err != nil {
-		log.Fatalf(ctx, "while ingesting %s: %+v", ingestPath, err)
+		return errors.Wrapf(err, "while ingesting %s", ingestPath)
 	}
 	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
-	return true /* copied */
+	return nil
 }
 
 func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult result.LocalResult) {

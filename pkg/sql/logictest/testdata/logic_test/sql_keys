@@ -1,6 +1,5 @@
 # LogicTest: local 3node-tenant
 # tenant-cluster-setting-override-opt: sql.split_at.allow_for_secondary_tenant.enabled=true
-# cluster-opt: can-admin-split
 
 # This test depends on table ID's being stable, so add new tests at the bottom
 # of the file.
@@ -65,6 +64,23 @@ SELECT crdb_internal.pretty_key(key, 0) FROM crdb_internal.scan(crdb_internal.ta
 ----
 /10/Table/106/1/1/0
 /10/Table/106/1/2/0
+
+# Regression test for a panic when the end key was equal to the Next() key of the last key returned.
+statement ok
+SELECT
+	crdb_internal.pretty_key(key, 0)
+FROM
+	crdb_internal.scan(
+		ARRAY[
+			crdb_internal.table_span($tableid)[1],
+			(
+				SELECT key || '\x00'::BYTES
+				FROM crdb_internal.scan(crdb_internal.table_span($tableid))
+				ORDER BY key DESC
+				LIMIT 1
+			)
+		]
+	)
 
 # An error should be returned when an invalid range ID is specified.
 statement error pq: range with ID 1000000 not found

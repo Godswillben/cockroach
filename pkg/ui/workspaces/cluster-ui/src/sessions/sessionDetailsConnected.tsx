@@ -33,7 +33,7 @@ export const SessionDetailsPageConnected = withRouter(
         ? {}
         : nodeDisplayNameByIDSelector(state),
       session: selectSession(state, props),
-      sessionError: state.adminUI.sessions.lastError,
+      sessionError: state.adminUI?.sessions.lastError,
       uiConfig: selectSessionDetailsUiConfig(state),
       isTenant: selectIsTenant(state),
     }),
@@ -44,8 +44,7 @@ export const SessionDetailsPageConnected = withRouter(
       refreshNodes: nodesActions.refresh,
       refreshNodesLiveness: nodesLivenessActions.refresh,
       setTimeScale: (ts: TimeScale) =>
-        localStorageActions.update({
-          key: "timeScale/SQLActivity",
+        localStorageActions.updateTimeScale({
           value: ts,
         }),
       onTerminateSessionClick: () =>

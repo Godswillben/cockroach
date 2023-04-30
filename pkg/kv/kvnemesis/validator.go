@@ -356,17 +356,7 @@ func transferLeaseResultIsIgnorable(res Result) bool {
 		return false
 	}
 	return kvserver.IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err) ||
-		// Only VOTER (_FULL, _INCOMING, sometimes _OUTGOING) replicas can
-		// hold a range lease. Attempts to transfer to lease to any other
-		// replica type are rejected. See CheckCanReceiveLease.
-		resultIsErrorStr(res, `replica cannot hold lease`) ||
-		// Only replicas that are part of the range can be given
-		// the lease. This case is hit if a TransferLease op races
-		// with a ChangeReplicas op.
-		resultIsErrorStr(res, `replica not found in RangeDescriptor`) ||
-		// A lease transfer that races with a replica removal may find that
-		// the store it was targeting is no longer part of the range.
-		resultIsErrorStr(res, `unable to find store \d+ in range`) ||
+		kvserver.IsLeaseTransferRejectedBecauseTargetCannotReceiveLease(err) ||
 		// A lease transfer is not permitted while a range merge is in its
 		// critical phase.
 		resultIsErrorStr(res, `cannot transfer lease while merge in progress`) ||
@@ -574,9 +564,8 @@ func (v *validator) processOp(op Operation) {
 			break
 		}
 		err := func() error {
-			// TODO(erikgrinaker): This should handle range tombstones too.
 			iter, err := storage.NewMemSSTIterator(t.Data, false /* verify */, storage.IterOptions{
-				KeyTypes:   storage.IterKeyTypePointsOnly,
+				KeyTypes:   storage.IterKeyTypePointsAndRanges,
 				LowerBound: keys.MinKey,
 				UpperBound: keys.MaxKey,
 			})
@@ -588,7 +577,51 @@ func (v *validator) processOp(op Operation) {
 				if ok, err := iter.Valid(); !ok {
 					return err
 				}
-				key := iter.Key().Key
+				if iter.RangeKeyChanged() {
+					hasPoint, hasRange := iter.HasPointAndRange()
+					if hasRange {
+						rangeKeys := iter.RangeKeys().Clone()
+						// AddSSTable can only write at a single timestamp, so there
+						// can't be overlapping range keys. Assert this.
+						if rangeKeys.Len() != 1 {
+							return errors.AssertionFailedf("got AddSSTable with overlapping range keys: %s",
+								rangeKeys)
+						}
+						rangeKey := rangeKeys.AsRangeKey(rangeKeys.Versions[0])
+						mvccValue, err := storage.DecodeMVCCValue(rangeKeys.Versions[0].Value)
+						if err != nil {
+							return err
+						}
+						seq := mvccValue.KVNemesisSeq.Get()
+						svs, _ := v.tryConsumeRangedWrite(seq, rangeKey.StartKey, rangeKey.EndKey)
+						var unobserved roachpb.SpanGroup
+						unobserved.Add(roachpb.Span{Key: rangeKey.StartKey, EndKey: rangeKey.EndKey})
+						for _, sv := range svs {
+							unobserved.Sub(sv.Span)
+							write := &observedWrite{
+								Key:       sv.Key,
+								EndKey:    sv.EndKey,
+								Seq:       seq,
+								Timestamp: sv.Timestamp,
+							}
+							v.curObservations = append(v.curObservations, write)
+						}
+						// Add unmaterialized versions of the write for any gaps.
+						for _, sp := range unobserved.Slice() {
+							write := &observedWrite{
+								Key:    sp.Key,
+								EndKey: sp.EndKey,
+								Seq:    t.Seq,
+							}
+							v.curObservations = append(v.curObservations, write)
+						}
+					}
+					if !hasPoint { // can only happen at range key start bounds
+						continue
+					}
+				}
+
+				key := iter.UnsafeKey().Clone().Key
 				rawValue, err := iter.Value()
 				if err != nil {
 					return err
@@ -730,7 +763,6 @@ func (v *validator) processOp(op Operation) {
 			ignore = kvserver.IsRetriableReplicationChangeError(err) ||
 				kvserver.IsIllegalReplicationChangeError(err) ||
 				kvserver.IsReplicationChangeInProgressError(err) ||
-				errors.Is(err, roachpb.ErrReplicaCannotHoldLease) ||
 				transferLeaseResultIsIgnorable(t.Result) // replication changes can transfer leases
 		}
 		if !ignore {

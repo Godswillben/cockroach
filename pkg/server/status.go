@@ -375,7 +375,6 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
 				Timestamp: f.Timestamp,
-				Status:    serverpb.DistSQLRemoteFlows_RUNNING,
 				Stmt:      f.StatementSQL,
 			}},
 		})
@@ -395,7 +394,15 @@ func (b *baseStatusServer) localExecutionInsights(
 
 	reader := b.sqlServer.pgServer.SQLServer.GetInsightsReader()
 	reader.IterateInsights(ctx, func(ctx context.Context, insight *insights.Insight) {
-		response.Insights = append(response.Insights, *insight)
+		if insight == nil {
+			return
+		}
+
+		// Versions <=22.2.6 expects that Statement is not null when building the exec insights virtual table.
+		insightWithStmt := *insight
+		insightWithStmt.Statement = &insights.Statement{}
+
+		response.Insights = append(response.Insights, insightWithStmt)
 	})
 
 	return &response, nil
@@ -503,6 +510,7 @@ type systemStatusServer struct {
 	spanConfigReporter spanconfig.Reporter
 	distSender         *kvcoord.DistSender
 	rangeStatsFetcher  *rangestats.Fetcher
+	node               *Node
 }
 
 // StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
@@ -612,6 +620,7 @@ func newSystemStatusServer(
 	clock *hlc.Clock,
 	distSender *kvcoord.DistSender,
 	rangeStatsFetcher *rangestats.Fetcher,
+	node *Node,
 ) *systemStatusServer {
 	server := newStatusServer(
 		ambient,
@@ -639,6 +648,7 @@ func newSystemStatusServer(
 		spanConfigReporter: spanConfigReporter,
 		distSender:         distSender,
 		rangeStatsFetcher:  rangeStatsFetcher,
+		node:               node,
 	}
 }
 
@@ -848,6 +858,53 @@ func recordedSpansToTraceEvents(spans []tracingpb.RecordedSpan) []*serverpb.Trac
 		}
 	}
 	return output
+}
+
+// CriticalNodes retrieves nodes that are considered critical. A critical node
+// is one whose unexpected termination could result in data loss. A node is
+// considered critical if any of its replicas are unavailable or
+// under-replicated. The response includes a list of node descriptors that are
+// considered critical, and the corresponding SpanConfigConformanceReport that
+// includes details of non-conforming ranges contributing to the criticality.
+func (s *systemStatusServer) CriticalNodes(
+	ctx context.Context, req *serverpb.CriticalNodesRequest,
+) (*serverpb.CriticalNodesResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+	if _, err := s.privilegeChecker.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+	conformance, err := s.node.SpanConfigConformance(
+		ctx, &roachpb.SpanConfigConformanceRequest{
+			Spans: []roachpb.Span{keys.EverythingSpan},
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	critical := make(map[roachpb.NodeID]bool)
+	for _, r := range conformance.Report.UnderReplicated {
+		for _, desc := range r.RangeDescriptor.Replicas().Descriptors() {
+			critical[desc.NodeID] = true
+		}
+	}
+	for _, r := range conformance.Report.Unavailable {
+		for _, desc := range r.RangeDescriptor.Replicas().Descriptors() {
+			critical[desc.NodeID] = true
+		}
+	}
+
+	res := &serverpb.CriticalNodesResponse{
+		CriticalNodes: nil,
+		Report:        conformance.Report,
+	}
+	for nodeID := range critical {
+		ns, err := s.nodeStatus(ctx, &serverpb.NodeRequest{NodeId: nodeID.String()})
+		if err != nil {
+			return nil, err
+		}
+		res.CriticalNodes = append(res.CriticalNodes, ns.Desc)
+	}
+	return res, nil
 }
 
 // AllocatorRange returns simulated allocator info for the requested range.
@@ -1181,7 +1238,7 @@ func (s *statusServer) LogFilesList(
 		}
 		return status.LogFilesList(ctx, req)
 	}
-	log.Flush()
+	log.FlushFileSinks()
 	logFiles, err := log.ListLogFiles()
 	if err != nil {
 		return nil, serverError(ctx, err)
@@ -1221,7 +1278,7 @@ func (s *statusServer) LogFile(
 	inputEditMode := log.SelectEditMode(req.Redact, log.KeepRedactable)
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFileSinks()
 
 	// Read the logs.
 	reader, err := log.GetLogReader(req.File)
@@ -1351,7 +1408,7 @@ func (s *statusServer) Logs(
 	}
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFileSinks()
 
 	// Read the logs.
 	entries, err := log.FetchEntriesFromFiles(
@@ -1505,44 +1562,6 @@ func (s *statusServer) NodesList(
 		return nil, err
 	}
 	return s.serverIterator.nodesList(ctx)
-}
-
-// Nodes returns a limited subset of the full NodesResponse.
-//
-// Its existence is a stop-gap measure to support running much of our UI code
-// on multiregion tenant clusters. Longer-term, we will need to reconsider
-// the overall architecture (e.g. store node ids in sqlstats, map node id ->
-// region at UI display time) because sql instances are far more ephemeral
-// than cluster nodes, and this Nodes endpoint is only able to answer for
-// currently-live sql instances. What I think we want is to store locality
-// information directly in the sqlstats tables, sourced from some new tracing
-// in the distsql flow.
-func (s *statusServer) Nodes(
-	ctx context.Context, req *serverpb.NodesRequest,
-) (*serverpb.NodesResponse, error) {
-	ctx = forwardSQLIdentityThroughRPCCalls(ctx)
-	ctx = s.AnnotateCtx(ctx)
-
-	if err := s.privilegeChecker.requireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
-		// NB: not using serverError() here since the priv checker
-		// already returns a proper gRPC error status.
-		return nil, err
-	}
-
-	instances, err := s.sqlServer.sqlInstanceReader.GetAllInstances(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var resp serverpb.NodesResponse
-	for _, instance := range instances {
-		resp.Nodes = append(resp.Nodes, statuspb.NodeStatus{
-			Desc: roachpb.NodeDescriptor{
-				NodeID:   roachpb.NodeID(instance.InstanceID),
-				Locality: instance.Locality,
-			},
-		})
-	}
-	return &resp, err
 }
 
 // Nodes returns all node statuses.
@@ -2132,7 +2151,7 @@ func (s *systemStatusServer) rangesHelper(
 				RequestsPerSecond:   loadStats.RequestsPerSecond,
 				WritesPerSecond:     loadStats.WriteKeysPerSecond,
 				ReadsPerSecond:      loadStats.ReadKeysPerSecond,
-				WriteBytesPerSecond: loadStats.WriteKeysPerSecond,
+				WriteBytesPerSecond: loadStats.WriteBytesPerSecond,
 				ReadBytesPerSecond:  loadStats.ReadBytesPerSecond,
 				CPUTimePerSecond:    loadStats.RaftCPUNanosPerSecond + loadStats.RequestCPUNanosPerSecond,
 			},
@@ -2464,6 +2483,13 @@ type tableMeta struct {
 func (t *statusServer) HotRangesV2(
 	ctx context.Context, req *serverpb.HotRangesRequest,
 ) (*serverpb.HotRangesResponseV2, error) {
+	ctx = t.AnnotateCtx(ctx)
+
+	err := t.privilegeChecker.requireViewClusterMetadataPermission(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	return t.sqlServer.tenantConnect.HotRangesV2(ctx, req)
 }
 
@@ -3441,6 +3467,19 @@ func (s *systemStatusServer) SpanStats(
 		// NB: not using serverError() here since the priv checker
 		// already returns a proper gRPC error status.
 		return nil, err
+	}
+	// If we receive a request using the old format.
+	if isLegacyRequest(req) {
+		// We want to force 23.1 callers to use the new format (e.g. Spans field).
+		if req.NodeID == "0" {
+			return nil, errors.New(UnexpectedLegacyRequest)
+		}
+		// We want to error if we receive a legacy request from a 22.2
+		// node (e.g. during a mixed-version fanout).
+		return nil, errors.New(MixedVersionErr)
+	}
+	if len(req.Spans) > int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)) {
+		return nil, errors.Newf(exceedSpanLimitPlaceholder, len(req.Spans), int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)))
 	}
 	return s.getSpanStatsInternal(ctx, req)
 }

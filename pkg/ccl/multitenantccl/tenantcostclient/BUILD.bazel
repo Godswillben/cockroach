@@ -46,9 +46,12 @@ go_test(
     args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":tenantcostclient"],
+    tags = [
+        "ccl_test",
+        "no-remote-exec",
+    ],
     deps = [
         "//pkg/base",
-        "//pkg/blobs",
         "//pkg/ccl",
         "//pkg/ccl/changefeedccl",
         "//pkg/ccl/kvccl/kvtenantccl",
@@ -71,6 +74,7 @@ go_test(
         "//pkg/server",
         "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog/systemschema",
         "//pkg/sql/distsql",
         "//pkg/sql/execinfra",
         "//pkg/sql/sqlliveness",

@@ -35,8 +35,9 @@ ALTER TABLE shipments ALTER COLUMN udfcol SET DEFAULT f1();
 ops
 DROP TABLE defaultdb.shipments CASCADE;
 ----
-StatementPhase stage 1 of 1 with 22 MutationType ops
+StatementPhase stage 1 of 1 with 23 MutationType ops
   transitions:
+    [[ConstraintWithoutIndexName:{DescID: 109, Name: check, ConstraintID: 5}, ABSENT], PUBLIC] -> ABSENT
     [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], PUBLIC] -> VALIDATED
     [[ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT], PUBLIC] -> ABSENT
     [[ConstraintComment:{DescID: 109, ConstraintID: 2, Comment: customer is not god}, ABSENT], PUBLIC] -> ABSENT
@@ -49,7 +50,7 @@ StatementPhase stage 1 of 1 with 22 MutationType ops
     [[UserPrivileges:{DescID: 111, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 111, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[View:{DescID: 111}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 111, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[Column:{DescID: 111, ColumnID: 1}, ABSENT], PUBLIC] -> WRITE_ONLY
     [[ColumnName:{DescID: 111, Name: customer_id, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
@@ -63,6 +64,10 @@ StatementPhase stage 1 of 1 with 22 MutationType ops
     [[ColumnName:{DescID: 111, Name: tableoid, ColumnID: 4294967294}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT], PUBLIC] -> ABSENT
   ops:
+    *scop.SetConstraintName
+      ConstraintID: 5
+      Name: crdb_internal_constraint_5_name_placeholder
+      TableID: 109
     *scop.MakePublicForeignKeyConstraintValidated
       ConstraintID: 2
       TableID: 109
@@ -141,6 +146,7 @@ StatementPhase stage 1 of 1 with 22 MutationType ops
       User: root
 PreCommitPhase stage 1 of 2 with 1 MutationType op
   transitions:
+    [[ConstraintWithoutIndexName:{DescID: 109, Name: check, ConstraintID: 5}, ABSENT], ABSENT] -> PUBLIC
     [[ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT], VALIDATED] -> PUBLIC
     [[ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT], ABSENT] -> PUBLIC
     [[ConstraintComment:{DescID: 109, ConstraintID: 2, Comment: customer is not god}, ABSENT], ABSENT] -> PUBLIC
@@ -153,7 +159,7 @@ PreCommitPhase stage 1 of 2 with 1 MutationType op
     [[UserPrivileges:{DescID: 111, Name: admin}, ABSENT], ABSENT] -> PUBLIC
     [[UserPrivileges:{DescID: 111, Name: root}, ABSENT], ABSENT] -> PUBLIC
     [[View:{DescID: 111}, ABSENT], DROPPED] -> PUBLIC
-    [[ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT], ABSENT] -> PUBLIC
+    [[SchemaChild:{DescID: 111, ReferencedDescID: 101}, ABSENT], ABSENT] -> PUBLIC
     [[Column:{DescID: 111, ColumnID: 1}, ABSENT], WRITE_ONLY] -> PUBLIC
     [[ColumnName:{DescID: 111, Name: customer_id, ColumnID: 1}, ABSENT], ABSENT] -> PUBLIC
     [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 1}, ABSENT], ABSENT] -> PUBLIC
@@ -176,7 +182,7 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
     [[UserPrivileges:{DescID: 109, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 109, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[Table:{DescID: 109}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 109, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 109, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[TableComment:{DescID: 109, Comment: shipment is important}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT], PUBLIC] -> ABSENT
     [[Column:{DescID: 109, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
@@ -237,13 +243,13 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
     [[UserPrivileges:{DescID: 110, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 110, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[Sequence:{DescID: 110}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 110, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 110, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[Namespace:{DescID: 111, Name: v1, ReferencedDescID: 100}, ABSENT], PUBLIC] -> ABSENT
     [[Owner:{DescID: 111}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 111, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 111, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[View:{DescID: 111}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 111, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[Column:{DescID: 111, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnName:{DescID: 111, Name: customer_id, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
@@ -257,6 +263,10 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
     [[ColumnName:{DescID: 111, Name: tableoid, ColumnID: 4294967294}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnType:{DescID: 111, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT], PUBLIC] -> ABSENT
   ops:
+    *scop.SetConstraintName
+      ConstraintID: 5
+      Name: crdb_internal_constraint_5_name_placeholder
+      TableID: 109
     *scop.MakePublicForeignKeyConstraintValidated
       ConstraintID: 2
       TableID: 109
@@ -323,10 +333,6 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
       ColumnID: 4294967294
       Name: crdb_internal_column_4294967294_name_placeholder
       TableID: 111
-    *scop.SetConstraintName
-      ConstraintID: 5
-      Name: crdb_internal_constraint_5_name_placeholder
-      TableID: 109
     *scop.RemoveForeignKeyBackReference
       OriginConstraintID: 2
       OriginTableID: 109
@@ -397,9 +403,6 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
       ParentSchemaID: 101
     *scop.RemoveTableComment
       TableID: 109
-    *scop.NotImplementedForPublicObjects
-      DescID: 109
-      ElementType: scpb.ColumnFamily
     *scop.MakePublicColumnWriteOnly
       ColumnID: 1
       TableID: 109
@@ -567,6 +570,8 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
     *scop.MakeWriteOnlyColumnDeleteOnly
       ColumnID: 4294967294
       TableID: 109
+    *scop.AssertColumnFamilyIsRemoved
+      TableID: 109
     *scop.MakeWriteOnlyColumnDeleteOnly
       ColumnID: 1
       TableID: 109
@@ -694,6 +699,7 @@ PreCommitPhase stage 2 of 2 with 127 MutationType ops
       Initialize: true
     *scop.CreateSchemaChangerJob
       Authorization:
+        AppName: $ internal-test
         UserName: root
       DescriptorIDs:
       - 104
@@ -1157,6 +1163,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 1}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 1}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -1164,6 +1174,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [Column:{DescID: 109, ColumnID: 2}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 2}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 2}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1173,6 +1187,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -1180,6 +1198,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [Column:{DescID: 109, ColumnID: 4294967295}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4294967295}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4294967295}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1189,6 +1211,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 4}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -1196,6 +1222,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [Column:{DescID: 109, ColumnID: 5}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 5}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 5}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1205,6 +1235,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 6}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 109, ColumnFamilyID: 0, ColumnID: 6}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -1212,6 +1246,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [Column:{DescID: 109, ColumnID: 3}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 109, ReferencedTypeIDs: [107 108], ColumnFamilyID: 0, ColumnID: 3}, ABSENT]
+  to:   [ColumnFamily:{DescID: 109, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 109, ReferencedTypeIDs: [107 108], ColumnFamilyID: 0, ColumnID: 3}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1258,8 +1296,8 @@ DROP TABLE defaultdb.shipments CASCADE;
   rule: non-data dependents removed before descriptor
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: check, ConstraintID: 5}, ABSENT]
   to:   [CheckConstraintUnvalidated:{DescID: 109, ConstraintID: 5, ReferencedSequenceIDs: [106]}, ABSENT]
-  kind: SameStagePrecedence
-  rule: dependents removed right before simple constraint
+  kind: Precedence
+  rule: Constraint should be hidden before name
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: check, ConstraintID: 5}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1267,7 +1305,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT]
   to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, ABSENT]
   kind: Precedence
-  rule: dependents removed before constraint
+  rule: Constraint should be hidden before name
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1275,7 +1313,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers2, ConstraintID: 4}, ABSENT]
   to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 4, ReferencedDescID: 104}, ABSENT]
   kind: Precedence
-  rule: dependents removed before constraint
+  rule: Constraint should be hidden before name
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers2, ConstraintID: 4}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1283,7 +1321,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT]
   to:   [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, ABSENT]
   kind: Precedence
-  rule: dependents removed before constraint
+  rule: Constraint should be hidden before name
 - from: [ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1303,7 +1341,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}, VALIDATED]
   to:   [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers, ConstraintID: 2}, ABSENT]
   kind: Precedence
-  rule: constraint no longer public before dependents
+  rule: Constraint should be hidden before name
 - from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1315,7 +1353,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 3, ReferencedDescID: 105}, VALIDATED]
   to:   [ConstraintWithoutIndexName:{DescID: 109, Name: fk_orders, ConstraintID: 3}, ABSENT]
   kind: Precedence
-  rule: constraint no longer public before dependents
+  rule: Constraint should be hidden before name
 - from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 4, ReferencedDescID: 104}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1327,7 +1365,7 @@ DROP TABLE defaultdb.shipments CASCADE;
 - from: [ForeignKeyConstraint:{DescID: 109, IndexID: 0, ConstraintID: 4, ReferencedDescID: 104}, VALIDATED]
   to:   [ConstraintWithoutIndexName:{DescID: 109, Name: fk_customers2, ConstraintID: 4}, ABSENT]
   kind: Precedence
-  rule: constraint no longer public before dependents
+  rule: Constraint should be hidden before name
 - from: [IndexColumn:{DescID: 109, ColumnID: 1, IndexID: 1}, ABSENT]
   to:   [Column:{DescID: 109, ColumnID: 1}, ABSENT]
   kind: Precedence
@@ -1476,18 +1514,6 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [View:{DescID: 111}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
-- from: [ObjectParent:{DescID: 109, ReferencedDescID: 101}, ABSENT]
-  to:   [Table:{DescID: 109}, ABSENT]
-  kind: Precedence
-  rule: non-data dependents removed before descriptor
-- from: [ObjectParent:{DescID: 110, ReferencedDescID: 101}, ABSENT]
-  to:   [Sequence:{DescID: 110}, ABSENT]
-  kind: Precedence
-  rule: non-data dependents removed before descriptor
-- from: [ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT]
-  to:   [View:{DescID: 111}, ABSENT]
-  kind: Precedence
-  rule: non-data dependents removed before descriptor
 - from: [Owner:{DescID: 109}, ABSENT]
   to:   [Table:{DescID: 109}, ABSENT]
   kind: Precedence
@@ -1540,6 +1566,18 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [IndexName:{DescID: 109, Name: shipments_pkey, IndexID: 1}, ABSENT]
   kind: Precedence
   rule: index no longer public before dependents, excluding columns
+- from: [SchemaChild:{DescID: 109, ReferencedDescID: 101}, ABSENT]
+  to:   [Table:{DescID: 109}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
+- from: [SchemaChild:{DescID: 110, ReferencedDescID: 101}, ABSENT]
+  to:   [Sequence:{DescID: 110}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
+- from: [SchemaChild:{DescID: 111, ReferencedDescID: 101}, ABSENT]
+  to:   [View:{DescID: 111}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
 - from: [SecondaryIndex:{DescID: 109, IndexID: 2, ConstraintID: 0}, ABSENT]
   to:   [IndexData:{DescID: 109, IndexID: 2}, DROPPED]
   kind: Precedence
@@ -1577,13 +1615,13 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: descriptor dropped before dependent element removal
 - from: [Sequence:{DescID: 110}, DROPPED]
-  to:   [ObjectParent:{DescID: 110, ReferencedDescID: 101}, ABSENT]
-  kind: SameStagePrecedence
-  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
-- from: [Sequence:{DescID: 110}, DROPPED]
   to:   [Owner:{DescID: 110}, ABSENT]
   kind: Precedence
   rule: descriptor dropped before dependent element removal
+- from: [Sequence:{DescID: 110}, DROPPED]
+  to:   [SchemaChild:{DescID: 110, ReferencedDescID: 101}, ABSENT]
+  kind: SameStagePrecedence
+  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
 - from: [Sequence:{DescID: 110}, DROPPED]
   to:   [Sequence:{DescID: 110}, ABSENT]
   kind: PreviousStagePrecedence
@@ -1793,10 +1831,6 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: descriptor dropped before dependent element removal
 - from: [Table:{DescID: 109}, DROPPED]
-  to:   [ObjectParent:{DescID: 109, ReferencedDescID: 101}, ABSENT]
-  kind: SameStagePrecedence
-  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
-- from: [Table:{DescID: 109}, DROPPED]
   to:   [Owner:{DescID: 109}, ABSENT]
   kind: Precedence
   rule: descriptor dropped before dependent element removal
@@ -1804,6 +1838,10 @@ DROP TABLE defaultdb.shipments CASCADE;
   to:   [PrimaryIndex:{DescID: 109, IndexID: 1, ConstraintID: 1}, VALIDATED]
   kind: Precedence
   rule: relation dropped before dependent index
+- from: [Table:{DescID: 109}, DROPPED]
+  to:   [SchemaChild:{DescID: 109, ReferencedDescID: 101}, ABSENT]
+  kind: SameStagePrecedence
+  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
 - from: [Table:{DescID: 109}, DROPPED]
   to:   [SecondaryIndex:{DescID: 109, IndexID: 2, ConstraintID: 0}, VALIDATED]
   kind: Precedence
@@ -1917,13 +1955,13 @@ DROP TABLE defaultdb.shipments CASCADE;
   kind: Precedence
   rule: descriptor dropped before dependent element removal
 - from: [View:{DescID: 111}, DROPPED]
-  to:   [ObjectParent:{DescID: 111, ReferencedDescID: 101}, ABSENT]
-  kind: SameStagePrecedence
-  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
-- from: [View:{DescID: 111}, DROPPED]
   to:   [Owner:{DescID: 111}, ABSENT]
   kind: Precedence
   rule: descriptor dropped before dependent element removal
+- from: [View:{DescID: 111}, DROPPED]
+  to:   [SchemaChild:{DescID: 111, ReferencedDescID: 101}, ABSENT]
+  kind: SameStagePrecedence
+  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
 - from: [View:{DescID: 111}, DROPPED]
   to:   [UserPrivileges:{DescID: 111, Name: admin}, ABSENT]
   kind: Precedence
@@ -1989,6 +2027,7 @@ PreCommitPhase stage 2 of 2 with 7 MutationType ops
       Initialize: true
     *scop.CreateSchemaChangerJob
       Authorization:
+        AppName: $ internal-test
         UserName: root
       DescriptorIDs:
       - 104
@@ -2009,7 +2048,7 @@ PostCommitNonRevertiblePhase stage 1 of 2 with 47 MutationType ops
     [[UserPrivileges:{DescID: 104, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 104, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[Table:{DescID: 104}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 104, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 104, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnFamily:{DescID: 104, Name: primary, ColumnFamilyID: 0}, ABSENT], PUBLIC] -> ABSENT
     [[Column:{DescID: 104, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnName:{DescID: 104, Name: id, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
@@ -2062,9 +2101,6 @@ PostCommitNonRevertiblePhase stage 1 of 2 with 47 MutationType ops
     *scop.RemoveObjectParent
       ObjectID: 104
       ParentSchemaID: 101
-    *scop.NotImplementedForPublicObjects
-      DescID: 104
-      ElementType: scpb.ColumnFamily
     *scop.MakePublicColumnWriteOnly
       ColumnID: 1
       TableID: 104
@@ -2121,6 +2157,8 @@ PostCommitNonRevertiblePhase stage 1 of 2 with 47 MutationType ops
     *scop.RemoveUserPrivileges
       DescriptorID: 104
       User: root
+    *scop.AssertColumnFamilyIsRemoved
+      TableID: 104
     *scop.RemoveColumnNotNull
       ColumnID: 1
       TableID: 104
@@ -2354,6 +2392,10 @@ DROP TABLE defaultdb.customers CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 1}, ABSENT]
+  to:   [ColumnFamily:{DescID: 104, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 1}, ABSENT]
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -2361,6 +2403,10 @@ DROP TABLE defaultdb.customers CASCADE;
   to:   [Column:{DescID: 104, ColumnID: 2}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 2}, ABSENT]
+  to:   [ColumnFamily:{DescID: 104, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 2}, ABSENT]
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
@@ -2370,6 +2416,10 @@ DROP TABLE defaultdb.customers CASCADE;
   kind: Precedence
   rule: dependents removed before column
 - from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT]
+  to:   [ColumnFamily:{DescID: 104, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
+- from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 4294967294}, ABSENT]
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
@@ -2377,6 +2427,10 @@ DROP TABLE defaultdb.customers CASCADE;
   to:   [Column:{DescID: 104, ColumnID: 4294967295}, ABSENT]
   kind: Precedence
   rule: dependents removed before column
+- from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 4294967295}, ABSENT]
+  to:   [ColumnFamily:{DescID: 104, Name: primary, ColumnFamilyID: 0}, ABSENT]
+  kind: Precedence
+  rule: column type removed before column family
 - from: [ColumnType:{DescID: 104, ColumnFamilyID: 0, ColumnID: 4294967295}, ABSENT]
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
@@ -2489,10 +2543,6 @@ DROP TABLE defaultdb.customers CASCADE;
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
   rule: non-data dependents removed before descriptor
-- from: [ObjectParent:{DescID: 104, ReferencedDescID: 101}, ABSENT]
-  to:   [Table:{DescID: 104}, ABSENT]
-  kind: Precedence
-  rule: non-data dependents removed before descriptor
 - from: [Owner:{DescID: 104}, ABSENT]
   to:   [Table:{DescID: 104}, ABSENT]
   kind: Precedence
@@ -2517,6 +2567,10 @@ DROP TABLE defaultdb.customers CASCADE;
   to:   [IndexName:{DescID: 104, Name: customers_pkey, IndexID: 1}, ABSENT]
   kind: Precedence
   rule: index no longer public before dependents, excluding columns
+- from: [SchemaChild:{DescID: 104, ReferencedDescID: 101}, ABSENT]
+  to:   [Table:{DescID: 104}, ABSENT]
+  kind: Precedence
+  rule: non-data dependents removed before descriptor
 - from: [SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 1}, ABSENT]
   to:   [IndexData:{DescID: 104, IndexID: 2}, DROPPED]
   kind: Precedence
@@ -2630,10 +2684,6 @@ DROP TABLE defaultdb.customers CASCADE;
   kind: Precedence
   rule: descriptor dropped before dependent element removal
 - from: [Table:{DescID: 104}, DROPPED]
-  to:   [ObjectParent:{DescID: 104, ReferencedDescID: 101}, ABSENT]
-  kind: SameStagePrecedence
-  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
-- from: [Table:{DescID: 104}, DROPPED]
   to:   [Owner:{DescID: 104}, ABSENT]
   kind: Precedence
   rule: descriptor dropped before dependent element removal
@@ -2641,6 +2691,10 @@ DROP TABLE defaultdb.customers CASCADE;
   to:   [PrimaryIndex:{DescID: 104, IndexID: 1, ConstraintID: 2}, VALIDATED]
   kind: Precedence
   rule: relation dropped before dependent index
+- from: [Table:{DescID: 104}, DROPPED]
+  to:   [SchemaChild:{DescID: 104, ReferencedDescID: 101}, ABSENT]
+  kind: SameStagePrecedence
+  rules: [descriptor dropped before dependent element removal; descriptor dropped right before removing back-reference in its parent descriptor]
 - from: [Table:{DescID: 104}, DROPPED]
   to:   [SecondaryIndex:{DescID: 104, IndexID: 2, ConstraintID: 1}, VALIDATED]
   kind: Precedence
@@ -2713,7 +2767,7 @@ PreCommitPhase stage 2 of 2 with 59 MutationType ops
     [[UserPrivileges:{DescID: 115, Name: admin}, ABSENT], PUBLIC] -> ABSENT
     [[UserPrivileges:{DescID: 115, Name: root}, ABSENT], PUBLIC] -> ABSENT
     [[Table:{DescID: 115}, ABSENT], PUBLIC] -> DROPPED
-    [[ObjectParent:{DescID: 115, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
+    [[SchemaChild:{DescID: 115, ReferencedDescID: 101}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnFamily:{DescID: 115, Name: primary, ColumnFamilyID: 0}, ABSENT], PUBLIC] -> ABSENT
     [[Column:{DescID: 115, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
     [[ColumnName:{DescID: 115, Name: x, ColumnID: 1}, ABSENT], PUBLIC] -> ABSENT
@@ -2766,9 +2820,6 @@ PreCommitPhase stage 2 of 2 with 59 MutationType ops
     *scop.RemoveObjectParent
       ObjectID: 115
       ParentSchemaID: 101
-    *scop.NotImplementedForPublicObjects
-      DescID: 115
-      ElementType: scpb.ColumnFamily
     *scop.MakePublicColumnWriteOnly
       ColumnID: 1
       TableID: 115
@@ -2869,6 +2920,8 @@ PreCommitPhase stage 2 of 2 with 59 MutationType ops
     *scop.MakeWriteOnlyColumnDeleteOnly
       ColumnID: 4294967294
       TableID: 115
+    *scop.AssertColumnFamilyIsRemoved
+      TableID: 115
     *scop.MakeWriteOnlyColumnDeleteOnly
       ColumnID: 2
       TableID: 115
@@ -2949,6 +3002,7 @@ PreCommitPhase stage 2 of 2 with 59 MutationType ops
       Initialize: true
     *scop.CreateSchemaChangerJob
       Authorization:
+        AppName: $ internal-test
         UserName: root
       DescriptorIDs:
       - 113

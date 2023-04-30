@@ -202,7 +202,8 @@ func isColumnTypeDependent(e scpb.Element) bool {
 
 func isIndexDependent(e scpb.Element) bool {
 	switch e.(type) {
-	case *scpb.IndexName, *scpb.IndexComment, *scpb.IndexColumn:
+	case *scpb.IndexName, *scpb.IndexComment, *scpb.IndexColumn,
+		*scpb.IndexZoneConfig:
 		return true
 	case *scpb.IndexPartitioning, *scpb.SecondaryIndexPartial:
 		return true
@@ -263,6 +264,14 @@ func isConstraintDependent(e scpb.Element) bool {
 	return false
 }
 
+func isConstraintWithIndexName(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.ConstraintWithoutIndexName:
+		return true
+	}
+	return false
+}
+
 func isData(e scpb.Element) bool {
 	switch e.(type) {
 	case *scpb.DatabaseData:
@@ -277,7 +286,7 @@ func isData(e scpb.Element) bool {
 
 func isDescriptorParentReference(e scpb.Element) bool {
 	switch e.(type) {
-	case *scpb.ObjectParent, *scpb.SchemaParent:
+	case *scpb.SchemaChild, *scpb.SchemaParent:
 		return true
 	}
 	return false

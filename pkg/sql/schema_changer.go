@@ -51,9 +51,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -286,7 +287,7 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 			username.RootUserName(),
 			&MemoryMetrics{},
 			sc.execCfg,
-			sessiondatapb.SessionData{},
+			NewInternalSessionData(ctx, sc.execCfg.Settings, "backfillQueryIntoTable"),
 		)
 
 		defer cleanup()
@@ -348,6 +349,7 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 					ctx, localPlanner, localPlanner.ExtendedEvalContextCopy,
 					localPlanner.curPlan.subqueryPlans, recv, &subqueryResultMemAcc,
 					false, /* skipDistSQLDiagramGeneration */
+					false, /* mustUseLeafTxn */
 				) {
 					if planAndRunErr = rw.Err(); planAndRunErr != nil {
 						return
@@ -540,6 +542,8 @@ func (sc *SchemaChanger) execLogTags() *logtags.Buffer {
 	}
 	if sc.droppedDatabaseID != descpb.InvalidID {
 		buf = buf.Add("db", sc.droppedDatabaseID)
+	} else if !sc.droppedSchemaIDs.Empty() {
+		buf = buf.Add("schema", sc.droppedSchemaIDs)
 	}
 	return buf
 }
@@ -716,7 +720,7 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 	}
 
 	// Otherwise, continue with the rest of the schema change state machine.
-	if tableDesc.Dropped() && sc.droppedDatabaseID == descpb.InvalidID {
+	if tableDesc.Dropped() && sc.droppedDatabaseID == descpb.InvalidID && sc.droppedSchemaIDs.Empty() {
 		if tableDesc.IsPhysicalTable() {
 			// We've dropped this physical table, let's kick off a GC job.
 			dropTime := timeutil.Now().UnixNano()
@@ -736,7 +740,7 @@ func (sc *SchemaChanger) exec(ctx context.Context) error {
 				sc.job.Payload().UsernameProto.Decode(),
 				sc.job.Payload().Description,
 				gcDetails,
-				!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+				!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 			); err != nil {
 				return err
 			}
@@ -1072,7 +1076,7 @@ func (sc *SchemaChanger) rollbackSchemaChange(ctx context.Context, err error) er
 					},
 				},
 			},
-			!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+			!storage.CanUseMVCCRangeTombstones(ctx, sc.settings),
 		)
 		if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, jobRecord, gcJobID, txn); err != nil {
 			return err
@@ -1143,7 +1147,6 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 				tbl,
 				m,
 				false, // isDone
-				txn.Descriptors(),
 			); err != nil {
 				return err
 			}
@@ -1282,7 +1285,7 @@ func (sc *SchemaChanger) createIndexGCJobWithDropTime(
 
 	gcJobRecord := CreateGCJobRecord(
 		jobDesc, sc.job.Payload().UsernameProto.Decode(), indexGCDetails,
-		!sc.settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob),
+		!sc.settings.Version.IsActive(ctx, clusterversion.V23_1_UseDelRangeInGCJob),
 	)
 	jobID := sc.jobRegistry.MakeJobID()
 	if _, err := sc.jobRegistry.CreateJobWithTxn(ctx, gcJobRecord, jobID, txn); err != nil {
@@ -1438,7 +1441,6 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 				scTable,
 				m,
 				true, // isDone
-				txn.Descriptors(),
 			); err != nil {
 				return err
 			}
@@ -1814,14 +1816,13 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 // tenant.
 func maybeUpdateZoneConfigsForPKChange(
 	ctx context.Context,
-	txn isql.Txn,
+	txn descs.Txn,
 	execCfg *ExecutorConfig,
 	kvTrace bool,
-	descriptors *descs.Collection,
 	table *tabledesc.Mutable,
 	swapInfo *descpb.PrimaryKeySwap,
 ) error {
-	zoneWithRaw, err := descriptors.GetZoneConfig(ctx, txn.KV(), table.GetID())
+	zoneWithRaw, err := txn.Descriptors().GetZoneConfig(ctx, txn.KV(), table.GetID())
 	if err != nil {
 		return err
 	}
@@ -1861,9 +1862,9 @@ func maybeUpdateZoneConfigsForPKChange(
 	// Write the zone back. This call regenerates the index spans that apply
 	// to each partition in the index.
 	_, err = writeZoneConfig(
-		ctx, txn.KV(), table.ID, table,
+		ctx, txn, table.ID, table,
 		zoneWithRaw.ZoneConfigProto(), zoneWithRaw.GetRawBytesInStorage(),
-		execCfg, descriptors, false, kvTrace,
+		execCfg, false, kvTrace,
 	)
 	if err != nil && !sqlerrors.IsCCLRequiredError(err) {
 		return err
@@ -2458,7 +2459,7 @@ func (sc *SchemaChanger) txn(ctx context.Context, f func(context.Context, descs.
 		ctx context.Context, txn descs.Txn,
 	) error {
 		return f(ctx, txn)
-	})
+	}, isql.WithPriority(admissionpb.BulkNormalPri))
 }
 
 // createSchemaChangeEvalCtx creates an extendedEvalContext() to be used for backfills.
@@ -2499,6 +2500,7 @@ func createSchemaChangeEvalCtx(
 			NodeID:               execCfg.NodeInfo.NodeID,
 			Codec:                execCfg.Codec,
 			Locality:             execCfg.Locality,
+			OriginalLocality:     execCfg.Locality,
 			Tracer:               execCfg.AmbientCtx.Tracer,
 		},
 	}
@@ -2517,36 +2519,6 @@ func createSchemaChangeEvalCtx(
 	evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, ts.WallTime))
 
 	return evalCtx
-}
-
-// NewFakeSessionData returns "fake" session data for use in internal queries
-// that are not run on behalf of a user session, such as those run during the
-// steps of background jobs and schema changes.
-func NewFakeSessionData(sv *settings.Values) *sessiondata.SessionData {
-	sd := &sessiondata.SessionData{
-		SessionData: sessiondatapb.SessionData{
-			// The database is not supposed to be needed in schema changes, as there
-			// shouldn't be unqualified identifiers in backfills, and the pure functions
-			// that need it should have already been evaluated.
-			//
-			// TODO(andrei): find a way to assert that this field is indeed not used.
-			// And in fact it is used by `current_schemas()`, which, although is a pure
-			// function, takes arguments which might be impure (so it can't always be
-			// pre-evaluated).
-			Database:      "",
-			UserProto:     username.NodeUserName().EncodeProto(),
-			VectorizeMode: sessiondatapb.VectorizeExecMode(VectorizeClusterMode.Get(sv)),
-			Internal:      true,
-		},
-		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-			DistSQLMode: sessiondatapb.DistSQLExecMode(DistSQLClusterExecMode.Get(sv)),
-		},
-		SearchPath:    sessiondata.DefaultSearchPathForUser(username.NodeUserName()),
-		SequenceState: sessiondata.NewSequenceState(),
-		Location:      time.UTC,
-	}
-
-	return sd
 }
 
 type schemaChangeResumer struct {
@@ -2753,9 +2725,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			r.job.Payload().UsernameProto.Decode(),
 			r.job.Payload().Description,
 			multiTableGCDetails,
-			!p.ExecCfg().Settings.Version.IsActive(
-				ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob,
-			),
+			!storage.CanUseMVCCRangeTombstones(ctx, p.ExecCfg().Settings),
 		); err != nil {
 			return err
 		}
@@ -2925,12 +2895,11 @@ func (sc *SchemaChanger) queueCleanupJob(
 
 func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 	ctx context.Context,
-	txn isql.Txn,
+	txn descs.Txn,
 	dbDesc catalog.DatabaseDescriptor,
 	tableDesc *tabledesc.Mutable,
 	mutation catalog.Mutation,
 	isDone bool,
-	descsCol *descs.Collection,
 ) error {
 	if pkSwap := mutation.AsPrimaryKeySwap(); pkSwap != nil {
 		if pkSwap.HasLocalityConfig() {
@@ -2993,16 +2962,15 @@ func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 				)
 			}
 
-			regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), dbDesc.GetID(), descsCol)
+			regionConfig, err := SynthesizeRegionConfig(ctx, txn.KV(), dbDesc.GetID(), txn.Descriptors())
 			if err != nil {
 				return err
 			}
 			if err := ApplyZoneConfigForMultiRegionTable(
 				ctx,
-				txn.KV(),
+				txn,
 				sc.execCfg,
 				false, /* kvTrace */
-				descsCol,
 				regionConfig,
 				tableDesc,
 				opts...,
@@ -3015,7 +2983,7 @@ func (sc *SchemaChanger) applyZoneConfigChangeForMutation(
 		// Note this is done even for isDone = true, though not strictly
 		// necessary.
 		return maybeUpdateZoneConfigsForPKChange(
-			ctx, txn, sc.execCfg, false /* kvTrace */, descsCol, tableDesc, pkSwap.PrimaryKeySwapDesc(),
+			ctx, txn, sc.execCfg, false /* kvTrace */, tableDesc, pkSwap.PrimaryKeySwapDesc(),
 		)
 	}
 	return nil

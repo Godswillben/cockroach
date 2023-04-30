@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestutils"
@@ -42,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
@@ -73,7 +75,7 @@ func SingleNodeCluster(
 ) (serverutils.TestServerInterface, *gosql.DB, func()) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disabled due to a failure in TestBackupRestore. Tracked with #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			SQLDeclarativeSchemaChanger: knobs,
 			JobsTestingKnobs:            newJobsKnobs(),
@@ -98,7 +100,7 @@ func SingleNodeMixedCluster(
 	}
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disabled due to a failure in TestBackupRestore. Tracked with #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
 				BinaryVersionOverride:          targetVersion,
@@ -166,9 +168,9 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 	tdb := sqlutils.MakeSQLRunner(db)
 	defer cleanup()
 	numTestStatementsObserved := 0
-	var setupStmts parser.Statements
+	var setupStmts statements.Statements
 	datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-		parseStmts := func() (parser.Statements, func()) {
+		parseStmts := func() (statements.Statements, func()) {
 			sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
 			stmts, err := parser.Parse(d.Input)
 			require.NoError(t, err)
@@ -218,7 +220,7 @@ func EndToEndSideEffects(t *testing.T, relPath string, newCluster NewClusterFunc
 			// dependency resolution.
 			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 			refFactory, refFactoryCleanup := sql.NewReferenceProviderFactoryForTest(
-				"test" /* opName */, kv.NewTxn(context.Background(), s.DB(), s.NodeID()), username.RootUserName(), &execCfg, "defaultdb",
+				ctx, "test" /* opName */, kv.NewTxn(ctx, s.DB(), s.NodeID()), username.RootUserName(), &execCfg, "defaultdb",
 			)
 			defer refFactoryCleanup()
 
@@ -276,7 +278,7 @@ const (
 func checkExplainDiagrams(
 	t *testing.T,
 	path string,
-	setupStmts, stmts parser.Statements,
+	setupStmts, stmts statements.Statements,
 	explainedStmt, fileNameSuffix string,
 	state scpb.CurrentState,
 	inRollback, rewrite bool,
@@ -365,7 +367,10 @@ func replaceNonDeterministicOutput(text string) string {
 // execStatementWithTestDeps executes the DDL statement using the declarative
 // schema changer with testing dependencies injected.
 func execStatementWithTestDeps(
-	ctx context.Context, t *testing.T, deps *sctestdeps.TestState, stmts ...parser.Statement,
+	ctx context.Context,
+	t *testing.T,
+	deps *sctestdeps.TestState,
+	stmts ...statements.Statement[tree.Statement],
 ) (stateAfterBuildingEachStatement []scpb.CurrentState) {
 	var jobID jobspb.JobID
 	var state scpb.CurrentState
@@ -376,7 +381,7 @@ func execStatementWithTestDeps(
 		deps.IncrementPhase()
 		deps.LogSideEffectf("# begin %s", deps.Phase())
 		for _, stmt := range stmts {
-			state, err = scbuild.Build(ctx, deps, state, stmt.AST)
+			state, err = scbuild.Build(ctx, deps, state, stmt.AST, nil /* memAcc */)
 			require.NoError(t, err, "error in builder")
 			stateAfterBuildingEachStatement = append(stateAfterBuildingEachStatement, state)
 			state, _, err = scrun.RunStatementPhase(ctx, s.TestingKnobs(), s, state)
@@ -444,6 +449,18 @@ func waitForSchemaChangesToFinish(t *testing.T, tdb *sqlutils.SQLRunner) {
 	)
 }
 
+func schemaChangeQueryLatestStatus(t *testing.T, tdb *sqlutils.SQLRunner) string {
+	q := fmt.Sprintf(
+		`SELECT status FROM [SHOW JOBS] WHERE job_type IN ('%s', '%s', '%s') ORDER BY finished DESC LIMIT 1`,
+		jobspb.TypeSchemaChange,
+		jobspb.TypeTypeSchemaChange,
+		jobspb.TypeNewSchemaChange,
+	)
+	result := tdb.QueryStr(t, q)
+	require.Len(t, result, 1)
+	require.Len(t, result[0], 1)
+	return result[0][0]
+}
 func schemaChangeWaitQuery(statusInString string) string {
 	q := fmt.Sprintf(
 		`SELECT status, job_type, description FROM [SHOW JOBS] WHERE job_type IN ('%s', '%s', '%s') AND status NOT IN %s`,

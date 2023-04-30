@@ -290,6 +290,114 @@ deprules
     - descriptorIsNotBeingDropped-23.1($prev)
     - joinTargetNode($prev, $prev-Target, $prev-Node)
     - joinTargetNode($next, $next-Target, $next-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - toAbsent($constraint-name-Target, $constraint-Target)
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - transient($constraint-name-Target, $constraint-Target)
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - $constraint-name-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - $constraint-Target[TargetStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - $constraint-name-Target[TargetStatus] = ABSENT
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - toAbsent($constraint-Target, $constraint-name-Target)
+    - $constraint-Node[CurrentStatus] = VALIDATED
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - transient($constraint-Target, $constraint-name-Target)
+    - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $constraint-name-Target[TargetStatus] = ABSENT
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - $constraint-Target[TargetStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = VALIDATED
+    - $constraint-name-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
 - name: DEFAULT or ON UPDATE existence precedes writes to column
   from: expr-Node
   kind: Precedence
@@ -1534,7 +1642,7 @@ deprules
   kind: Precedence
   to: parent-descriptor-Node
   query:
-    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.ObjectParent']
+    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.SchemaChild']
     - $parent-descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinReferencedDescID($back-reference-in-parent-descriptor, $parent-descriptor, $desc-id)
     - toAbsent($back-reference-in-parent-descriptor-Target, $parent-descriptor-Target)
@@ -1744,6 +1852,19 @@ deprules
     - $column-type-Node[CurrentStatus] = ABSENT
     - joinTargetNode($dependent, $dependent-Target, $dependent-Node)
     - joinTargetNode($column-type, $column-type-Target, $column-type-Node)
+- name: column type removed before column family
+  from: column-type-Node
+  kind: Precedence
+  to: column-family-Node
+  query:
+    - $column-type[Type] = '*scpb.ColumnType'
+    - $column-family[Type] = '*scpb.ColumnFamily'
+    - joinOnColumnFamilyID($column-type, $column-family, $table-id, $family-id)
+    - toAbsent($column-type-Target, $column-family-Target)
+    - $column-type-Node[CurrentStatus] = ABSENT
+    - $column-family-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($column-type, $column-type-Target, $column-type-Node)
+    - joinTargetNode($column-family, $column-family-Target, $column-family-Node)
 - name: column type removed right before column when not dropping relation
   from: column-type-Node
   kind: SameStagePrecedence
@@ -1776,7 +1897,7 @@ deprules
   kind: SameStagePrecedence
   to: complex-constraint-Node
   query:
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - $complex-constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependent, $complex-constraint, $table-id, $constraint-id)
     - ToPublicOrTransient($dependent-Target, $complex-constraint-Target)
@@ -1790,7 +1911,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - toAbsent($constraint-Target, $dependent-Target)
     - $constraint-Node[CurrentStatus] = VALIDATED
@@ -1803,7 +1924,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - transient($constraint-Target, $dependent-Target)
     - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -1816,7 +1937,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
     - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -1830,7 +1951,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - $constraint-Target[TargetStatus] = ABSENT
     - $constraint-Node[CurrentStatus] = VALIDATED
@@ -1977,7 +2098,7 @@ deprules
   kind: Precedence
   to: relation-Node
   query:
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - $relation[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinOnDescID($dependent, $relation, $relation-id)
     - ToPublicOrTransient($dependent-Target, $relation-Target)
@@ -2044,7 +2165,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - toAbsent($dependents-Target, $constraint-Target)
@@ -2057,7 +2178,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - transient($dependents-Target, $constraint-Target)
@@ -2070,7 +2191,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -2084,7 +2205,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = ABSENT
@@ -2098,7 +2219,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - toAbsent($dependent-Target, $index-Target)
@@ -2111,7 +2232,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - transient($dependent-Target, $index-Target)
@@ -2124,7 +2245,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - $dependent-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -2138,7 +2259,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - $dependent-Target[TargetStatus] = ABSENT
@@ -2152,7 +2273,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - toAbsent($dependents-Target, $constraint-Target)
@@ -2165,7 +2286,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - transient($dependents-Target, $constraint-Target)
@@ -2178,7 +2299,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -2192,7 +2313,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = ABSENT
@@ -2221,7 +2342,7 @@ deprules
   to: referencing-via-attr-Node
   query:
     - $referenced-descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaComment', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaComment', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinReferencedDescID($referencing-via-attr, $referenced-descriptor, $desc-id)
     - toAbsent($referenced-descriptor-Target, $referencing-via-attr-Target)
     - $referenced-descriptor-Node[CurrentStatus] = DROPPED
@@ -2277,7 +2398,7 @@ deprules
   to: dependent-Node
   query:
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinOnDescID($descriptor, $dependent, $desc-id)
     - toAbsent($descriptor-Target, $dependent-Target)
     - $descriptor-Node[CurrentStatus] = DROPPED
@@ -2303,7 +2424,7 @@ deprules
   to: back-reference-in-parent-descriptor-Node
   query:
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.ObjectParent']
+    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.SchemaChild']
     - joinOnDescID($descriptor, $back-reference-in-parent-descriptor, $desc-id)
     - toAbsent($descriptor-Target, $back-reference-in-parent-descriptor-Target)
     - $descriptor-Node[CurrentStatus] = DROPPED
@@ -2316,7 +2437,7 @@ deprules
   to: dependent-Node
   query:
     - $relation[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinOnDescID($relation, $dependent, $relation-id)
     - ToPublicOrTransient($relation-Target, $dependent-Target)
     - $relation-Node[CurrentStatus] = DESCRIPTOR_ADDED
@@ -2358,7 +2479,7 @@ deprules
   to: function-parent-Node
   query:
     - $function-name[Type] = '*scpb.FunctionName'
-    - $function-parent[Type] = '*scpb.ObjectParent'
+    - $function-parent[Type] = '*scpb.SchemaChild'
     - joinOnDescID($function-name, $function-parent, $function-id)
     - ToPublicOrTransient($function-name-Target, $function-parent-Target)
     - $function-name-Node[CurrentStatus] = PUBLIC
@@ -2383,7 +2504,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - ToPublicOrTransient($dependent-Target, $index-Target)
@@ -2451,7 +2572,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - ToPublicOrTransient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = BACKFILL_ONLY
@@ -2479,7 +2600,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - toAbsent($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = VALIDATED
@@ -2492,7 +2613,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - transient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -2505,7 +2626,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - $index-Target[TargetStatus] = TRANSIENT_ABSENT
     - $index-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -2519,7 +2640,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - $index-Target[TargetStatus] = ABSENT
     - $index-Node[CurrentStatus] = VALIDATED
@@ -2728,7 +2849,7 @@ deprules
   kind: Precedence
   to: descriptor-Node
   query:
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinOnDescID($dependent, $descriptor, $desc-id)
     - toAbsent($dependent-Target, $descriptor-Target)
@@ -3276,6 +3397,19 @@ deprules
     - $dependent-Node[CurrentStatus] = PUBLIC
     - joinTargetNode($simple-constraint, $simple-constraint-Target, $simple-constraint-Node)
     - joinTargetNode($dependent, $dependent-Target, $dependent-Node)
+- name: simple constraint visible before name
+  from: simple-constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $simple-constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($simple-constraint, $constraint-name, $table-id, $constraint-id)
+    - ToPublicOrTransient($simple-constraint-Target, $constraint-name-Target)
+    - $simple-constraint-Node[CurrentStatus] = WRITE_ONLY
+    - $constraint-name-Node[CurrentStatus] = PUBLIC
+    - joinTargetNode($simple-constraint, $simple-constraint-Target, $simple-constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
 - name: swapped primary index public before column
   from: index-Node
   kind: Precedence
@@ -3322,7 +3456,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] = '*scpb.TemporaryIndex'
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - ToPublicOrTransient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = DELETE_ONLY
@@ -3638,6 +3772,114 @@ deprules
     - descriptorIsNotBeingDropped-23.1($prev)
     - joinTargetNode($prev, $prev-Target, $prev-Node)
     - joinTargetNode($next, $next-Target, $next-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - toAbsent($constraint-name-Target, $constraint-Target)
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - transient($constraint-name-Target, $constraint-Target)
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - $constraint-name-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - $constraint-Target[TargetStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-name-Node
+  kind: Precedence
+  to: constraint-Node
+  query:
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - joinOnConstraintID($constraint-name, $constraint, $table-id, $constraint-id)
+    - $constraint-name-Target[TargetStatus] = ABSENT
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - toAbsent($constraint-Target, $constraint-name-Target)
+    - $constraint-Node[CurrentStatus] = VALIDATED
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - transient($constraint-Target, $constraint-name-Target)
+    - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
+    - $constraint-name-Target[TargetStatus] = ABSENT
+    - $constraint-name-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
+- name: Constraint should be hidden before name
+  from: constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($constraint, $constraint-name, $table-id, $constraint-id)
+    - $constraint-Target[TargetStatus] = ABSENT
+    - $constraint-Node[CurrentStatus] = VALIDATED
+    - $constraint-name-Target[TargetStatus] = TRANSIENT_ABSENT
+    - $constraint-name-Node[CurrentStatus] = TRANSIENT_ABSENT
+    - joinTargetNode($constraint, $constraint-Target, $constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
 - name: DEFAULT or ON UPDATE existence precedes writes to column
   from: expr-Node
   kind: Precedence
@@ -4882,7 +5124,7 @@ deprules
   kind: Precedence
   to: parent-descriptor-Node
   query:
-    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.ObjectParent']
+    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.SchemaChild']
     - $parent-descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinReferencedDescID($back-reference-in-parent-descriptor, $parent-descriptor, $desc-id)
     - toAbsent($back-reference-in-parent-descriptor-Target, $parent-descriptor-Target)
@@ -5092,6 +5334,19 @@ deprules
     - $column-type-Node[CurrentStatus] = ABSENT
     - joinTargetNode($dependent, $dependent-Target, $dependent-Node)
     - joinTargetNode($column-type, $column-type-Target, $column-type-Node)
+- name: column type removed before column family
+  from: column-type-Node
+  kind: Precedence
+  to: column-family-Node
+  query:
+    - $column-type[Type] = '*scpb.ColumnType'
+    - $column-family[Type] = '*scpb.ColumnFamily'
+    - joinOnColumnFamilyID($column-type, $column-family, $table-id, $family-id)
+    - toAbsent($column-type-Target, $column-family-Target)
+    - $column-type-Node[CurrentStatus] = ABSENT
+    - $column-family-Node[CurrentStatus] = ABSENT
+    - joinTargetNode($column-type, $column-type-Target, $column-type-Node)
+    - joinTargetNode($column-family, $column-family-Target, $column-family-Node)
 - name: column type removed right before column when not dropping relation
   from: column-type-Node
   kind: SameStagePrecedence
@@ -5124,7 +5379,7 @@ deprules
   kind: SameStagePrecedence
   to: complex-constraint-Node
   query:
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - $complex-constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependent, $complex-constraint, $table-id, $constraint-id)
     - ToPublicOrTransient($dependent-Target, $complex-constraint-Target)
@@ -5138,7 +5393,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - toAbsent($constraint-Target, $dependent-Target)
     - $constraint-Node[CurrentStatus] = VALIDATED
@@ -5151,7 +5406,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - transient($constraint-Target, $dependent-Target)
     - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -5164,7 +5419,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - $constraint-Target[TargetStatus] = TRANSIENT_ABSENT
     - $constraint-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -5178,7 +5433,7 @@ deprules
   to: dependent-Node
   query:
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
-    - $dependent[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependent[Type] = '*scpb.ConstraintComment'
     - joinOnConstraintID($constraint, $dependent, $table-id, $constraint-id)
     - $constraint-Target[TargetStatus] = ABSENT
     - $constraint-Node[CurrentStatus] = VALIDATED
@@ -5325,7 +5580,7 @@ deprules
   kind: Precedence
   to: relation-Node
   query:
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - $relation[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinOnDescID($dependent, $relation, $relation-id)
     - ToPublicOrTransient($dependent-Target, $relation-Target)
@@ -5392,7 +5647,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - toAbsent($dependents-Target, $constraint-Target)
@@ -5405,7 +5660,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - transient($dependents-Target, $constraint-Target)
@@ -5418,7 +5673,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -5432,7 +5687,7 @@ deprules
   kind: Precedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.CheckConstraint', '*scpb.ForeignKeyConstraint', '*scpb.ColumnNotNull']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = ABSENT
@@ -5446,7 +5701,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - toAbsent($dependent-Target, $index-Target)
@@ -5459,7 +5714,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - transient($dependent-Target, $index-Target)
@@ -5472,7 +5727,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - $dependent-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -5486,7 +5741,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - $dependent-Target[TargetStatus] = ABSENT
@@ -5500,7 +5755,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - toAbsent($dependents-Target, $constraint-Target)
@@ -5513,7 +5768,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - transient($dependents-Target, $constraint-Target)
@@ -5526,7 +5781,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = TRANSIENT_ABSENT
@@ -5540,7 +5795,7 @@ deprules
   kind: SameStagePrecedence
   to: constraint-Node
   query:
-    - $dependents[Type] IN ['*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment']
+    - $dependents[Type] = '*scpb.ConstraintComment'
     - $constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated']
     - joinOnConstraintID($dependents, $constraint, $table-id, $constraint-id)
     - $dependents-Target[TargetStatus] = ABSENT
@@ -5569,7 +5824,7 @@ deprules
   to: referencing-via-attr-Node
   query:
     - $referenced-descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaComment', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $referencing-via-attr[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaComment', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinReferencedDescID($referencing-via-attr, $referenced-descriptor, $desc-id)
     - toAbsent($referenced-descriptor-Target, $referencing-via-attr-Target)
     - $referenced-descriptor-Node[CurrentStatus] = DROPPED
@@ -5625,7 +5880,7 @@ deprules
   to: dependent-Node
   query:
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinOnDescID($descriptor, $dependent, $desc-id)
     - toAbsent($descriptor-Target, $dependent-Target)
     - $descriptor-Node[CurrentStatus] = DROPPED
@@ -5651,7 +5906,7 @@ deprules
   to: back-reference-in-parent-descriptor-Node
   query:
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.ObjectParent']
+    - $back-reference-in-parent-descriptor[Type] IN ['*scpb.SchemaParent', '*scpb.SchemaChild']
     - joinOnDescID($descriptor, $back-reference-in-parent-descriptor, $desc-id)
     - toAbsent($descriptor-Target, $back-reference-in-parent-descriptor-Target)
     - $descriptor-Node[CurrentStatus] = DROPPED
@@ -5664,7 +5919,7 @@ deprules
   to: dependent-Node
   query:
     - $relation[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TableData', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.IndexData', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.DatabaseData', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - joinOnDescID($relation, $dependent, $relation-id)
     - ToPublicOrTransient($relation-Target, $dependent-Target)
     - $relation-Node[CurrentStatus] = DESCRIPTOR_ADDED
@@ -5706,7 +5961,7 @@ deprules
   to: function-parent-Node
   query:
     - $function-name[Type] = '*scpb.FunctionName'
-    - $function-parent[Type] = '*scpb.ObjectParent'
+    - $function-parent[Type] = '*scpb.SchemaChild'
     - joinOnDescID($function-name, $function-parent, $function-id)
     - ToPublicOrTransient($function-name-Target, $function-parent-Target)
     - $function-name-Node[CurrentStatus] = PUBLIC
@@ -5731,7 +5986,7 @@ deprules
   kind: Precedence
   to: index-Node
   query:
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
     - joinOnIndexID($dependent, $index, $table-id, $index-id)
     - ToPublicOrTransient($dependent-Target, $index-Target)
@@ -5799,7 +6054,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - ToPublicOrTransient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = BACKFILL_ONLY
@@ -5827,7 +6082,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - toAbsent($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = VALIDATED
@@ -5840,7 +6095,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - transient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -5853,7 +6108,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - $index-Target[TargetStatus] = TRANSIENT_ABSENT
     - $index-Node[CurrentStatus] = TRANSIENT_VALIDATED
@@ -5867,7 +6122,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] IN ['*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex']
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - $index-Target[TargetStatus] = ABSENT
     - $index-Node[CurrentStatus] = VALIDATED
@@ -6076,7 +6331,7 @@ deprules
   kind: Precedence
   to: descriptor-Node
   query:
-    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.TablePartitioning', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.ObjectParent', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
+    - $dependent[Type] IN ['*scpb.ColumnFamily', '*scpb.Column', '*scpb.PrimaryIndex', '*scpb.SecondaryIndex', '*scpb.TemporaryIndex', '*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.TableComment', '*scpb.RowLevelTTL', '*scpb.TableZoneConfig', '*scpb.IndexZoneConfig', '*scpb.TablePartitioning', '*scpb.TableSchemaLocked', '*scpb.TableLocalityGlobal', '*scpb.TableLocalityPrimaryRegion', '*scpb.TableLocalitySecondaryRegion', '*scpb.TableLocalityRegionalByRow', '*scpb.ColumnName', '*scpb.ColumnType', '*scpb.ColumnDefaultExpression', '*scpb.ColumnOnUpdateExpression', '*scpb.SequenceOwner', '*scpb.ColumnComment', '*scpb.ColumnNotNull', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn', '*scpb.ConstraintWithoutIndexName', '*scpb.ConstraintComment', '*scpb.Namespace', '*scpb.Owner', '*scpb.UserPrivileges', '*scpb.DatabaseRegionConfig', '*scpb.DatabaseRoleSetting', '*scpb.DatabaseComment', '*scpb.SchemaParent', '*scpb.SchemaComment', '*scpb.SchemaChild', '*scpb.EnumTypeValue', '*scpb.CompositeTypeAttrType', '*scpb.CompositeTypeAttrName', '*scpb.FunctionName', '*scpb.FunctionVolatility', '*scpb.FunctionLeakProof', '*scpb.FunctionNullInputBehavior', '*scpb.FunctionBody', '*scpb.FunctionParamDefaultExpression']
     - $descriptor[Type] IN ['*scpb.Database', '*scpb.Schema', '*scpb.View', '*scpb.Sequence', '*scpb.Table', '*scpb.EnumType', '*scpb.AliasType', '*scpb.CompositeType', '*scpb.Function']
     - joinOnDescID($dependent, $descriptor, $desc-id)
     - toAbsent($dependent-Target, $descriptor-Target)
@@ -6624,6 +6879,19 @@ deprules
     - $dependent-Node[CurrentStatus] = PUBLIC
     - joinTargetNode($simple-constraint, $simple-constraint-Target, $simple-constraint-Node)
     - joinTargetNode($dependent, $dependent-Target, $dependent-Node)
+- name: simple constraint visible before name
+  from: simple-constraint-Node
+  kind: Precedence
+  to: constraint-name-Node
+  query:
+    - $simple-constraint[Type] IN ['*scpb.UniqueWithoutIndexConstraint', '*scpb.UniqueWithoutIndexConstraintUnvalidated', '*scpb.CheckConstraint', '*scpb.CheckConstraintUnvalidated', '*scpb.ForeignKeyConstraint', '*scpb.ForeignKeyConstraintUnvalidated', '*scpb.ColumnNotNull']
+    - $constraint-name[Type] = '*scpb.ConstraintWithoutIndexName'
+    - joinOnConstraintID($simple-constraint, $constraint-name, $table-id, $constraint-id)
+    - ToPublicOrTransient($simple-constraint-Target, $constraint-name-Target)
+    - $simple-constraint-Node[CurrentStatus] = WRITE_ONLY
+    - $constraint-name-Node[CurrentStatus] = PUBLIC
+    - joinTargetNode($simple-constraint, $simple-constraint-Target, $simple-constraint-Node)
+    - joinTargetNode($constraint-name, $constraint-name-Target, $constraint-name-Node)
 - name: swapped primary index public before column
   from: index-Node
   kind: Precedence
@@ -6670,7 +6938,7 @@ deprules
   to: dependent-Node
   query:
     - $index[Type] = '*scpb.TemporaryIndex'
-    - $dependent[Type] IN ['*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
+    - $dependent[Type] IN ['*scpb.IndexZoneConfig', '*scpb.IndexName', '*scpb.IndexPartitioning', '*scpb.SecondaryIndexPartial', '*scpb.IndexComment', '*scpb.IndexColumn']
     - joinOnIndexID($index, $dependent, $table-id, $index-id)
     - ToPublicOrTransient($index-Target, $dependent-Target)
     - $index-Node[CurrentStatus] = DELETE_ONLY

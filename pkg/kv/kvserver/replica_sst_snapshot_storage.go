@@ -13,6 +13,7 @@ package kvserver
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -23,6 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/time/rate"
 )
 
@@ -112,7 +115,7 @@ func (s *SSTSnapshotStorageScratch) filename(id int) string {
 }
 
 func (s *SSTSnapshotStorageScratch) createDir() error {
-	err := s.storage.engine.MkdirAll(s.snapDir)
+	err := s.storage.engine.MkdirAll(s.snapDir, os.ModePerm)
 	s.dirCreated = s.dirCreated || err == nil
 	return err
 }
@@ -154,18 +157,11 @@ func (s *SSTSnapshotStorageScratch) WriteSST(ctx context.Context, data []byte) e
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// Closing an SSTSnapshotStorageFile multiple times is idempotent. Nothing
-		// actionable if closing fails.
-		_ = f.Close()
-	}()
-	if _, err := f.Write(data); err != nil {
+	if err := f.Write(data); err != nil {
+		f.Abort()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	return f.Close()
+	return f.Finish()
 }
 
 // SSTs returns the names of the files created.
@@ -188,11 +184,13 @@ func (s *SSTSnapshotStorageScratch) Close() error {
 type SSTSnapshotStorageFile struct {
 	scratch      *SSTSnapshotStorageScratch
 	created      bool
-	file         fs.File
+	file         vfs.File
 	filename     string
 	ctx          context.Context
 	bytesPerSync int64
 }
+
+var _ objstorage.Writable = (*SSTSnapshotStorageFile)(nil)
 
 func (f *SSTSnapshotStorageFile) ensureFile() error {
 	if f.created {
@@ -211,7 +209,7 @@ func (f *SSTSnapshotStorageFile) ensureFile() error {
 	}
 	var err error
 	if f.bytesPerSync > 0 {
-		f.file, err = f.scratch.storage.engine.CreateWithSync(f.filename, int(f.bytesPerSync))
+		f.file, err = fs.CreateWithSync(f.scratch.storage.engine, f.filename, int(f.bytesPerSync))
 	} else {
 		f.file, err = f.scratch.storage.engine.Create(f.filename)
 	}
@@ -222,41 +220,45 @@ func (f *SSTSnapshotStorageFile) ensureFile() error {
 	return nil
 }
 
-// Write writes contents to the file while respecting the limiter passed into
-// SSTSnapshotStorageScratch. Writing empty contents is okay and is treated as
-// a noop. The file must have not been closed.
-func (f *SSTSnapshotStorageFile) Write(contents []byte) (int, error) {
+// Write is part of objstorage.Writable; it writes contents to the file while
+// respecting the limiter passed into SSTSnapshotStorageScratch. Writing empty
+// contents is okay and is treated as a noop.
+// Cannot be called after Finish or Abort.
+func (f *SSTSnapshotStorageFile) Write(contents []byte) error {
 	if len(contents) == 0 {
-		return 0, nil
+		return nil
 	}
 	if err := f.ensureFile(); err != nil {
-		return 0, err
+		return err
 	}
 	if err := kvserverbase.LimitBulkIOWrite(f.ctx, f.scratch.storage.limiter, len(contents)); err != nil {
-		return 0, err
+		return err
 	}
-	return f.file.Write(contents)
+	// Write always returns an error if it can't write all the contents.
+	_, err := f.file.Write(contents)
+	return err
 }
 
-// Close closes the file. Calling this function multiple times is idempotent.
-// The file must have been written to before being closed.
-func (f *SSTSnapshotStorageFile) Close() error {
+// Finish is part of the objstorage.Writable interface.
+func (f *SSTSnapshotStorageFile) Finish() error {
 	// We throw an error for empty files because it would be an error to ingest
 	// an empty SST so catch this error earlier.
 	if !f.created {
 		return errors.New("file is empty")
 	}
-	if f.file == nil {
-		return nil
-	}
-	if err := f.file.Close(); err != nil {
-		return err
-	}
+	errSync := f.file.Sync()
+	errClose := f.file.Close()
 	f.file = nil
-	return nil
+	if errSync != nil {
+		return errSync
+	}
+	return errClose
 }
 
-// Sync syncs the file to disk. Implements writeCloseSyncer in engine.
-func (f *SSTSnapshotStorageFile) Sync() error {
-	return f.file.Sync()
+// Abort is part of the objstorage.Writable interface.
+func (f *SSTSnapshotStorageFile) Abort() {
+	if f.file != nil {
+		_ = f.file.Close()
+		f.file = nil
+	}
 }

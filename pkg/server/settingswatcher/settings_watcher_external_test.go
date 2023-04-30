@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -135,6 +136,14 @@ func TestSettingWatcherOnTenant(t *testing.T) {
 	s0 := tc.Server(0)
 	tenantSettings := cluster.MakeTestingClusterSettings()
 	tenantSettings.SV.SetNonSystemTenant()
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	deprecatedshowranges.ShowRangesDeprecatedBehaviorSetting.Override(
+		ctx, &tenantSettings.SV,
+		// In unit tests, we exercise the new behavior.
+		false)
+
 	storage := &fakeStorage{}
 	sw := settingswatcher.New(s0.Clock(), fakeCodec, tenantSettings,
 		s0.ExecutorConfig().(sql.ExecutorConfig).RangeFeedFactory,
@@ -236,14 +245,14 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 
 	expect := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		require.Equal(t, value, s.String(&st.SV))
 	}
 
 	expectSoon := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		testutils.SucceedsSoon(t, func() error {
 			if actual := s.String(&st.SV); actual != value {
@@ -292,7 +301,7 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 	expectSoon("i1", "10")
 
 	// Verify that version cannot be overridden.
-	version, ok := settings.Lookup("version", settings.LookupForLocalAccess, settings.ForSystemTenant)
+	version, ok := settings.LookupForLocalAccess("version", settings.ForSystemTenant)
 	require.True(t, ok)
 	versionValue := version.String(&st.SV)
 
@@ -373,6 +382,14 @@ func TestOverflowRestart(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	sideSettings := cluster.MakeTestingClusterSettings()
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	deprecatedshowranges.ShowRangesDeprecatedBehaviorSetting.Override(
+		ctx, &sideSettings.SV,
+		// In unit tests, we exercise the new behavior.
+		false)
+
 	w := settingswatcher.New(
 		s.Clock(),
 		s.ExecutorConfig().(sql.ExecutorConfig).Codec,
@@ -423,7 +440,7 @@ func TestOverflowRestart(t *testing.T) {
 // two settings do not match. It generally gets used with SucceeedsSoon.
 func CheckSettingsValuesMatch(t *testing.T, a, b *cluster.Settings) error {
 	for _, k := range settings.Keys(false /* forSystemTenant */) {
-		s, ok := settings.Lookup(k, settings.LookupForLocalAccess, false /* forSystemTenant */)
+		s, ok := settings.LookupForLocalAccess(k, false /* forSystemTenant */)
 		require.True(t, ok)
 		if s.Class() == settings.SystemOnly {
 			continue

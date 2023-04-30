@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -456,7 +458,7 @@ type testValue struct {
 func intent(key roachpb.Key, val string, ts hlc.Timestamp) testValue {
 	var value = roachpb.MakeValueFromString(val)
 	value.InitChecksum(key)
-	tx := roachpb.MakeTransaction(fmt.Sprintf("txn-%v", key), key, roachpb.NormalUserPriority, ts, 1000, 99)
+	tx := roachpb.MakeTransaction(fmt.Sprintf("txn-%v", key), key, isolation.Serializable, roachpb.NormalUserPriority, ts, 1000, 99)
 	var txn = &tx
 	return testValue{key, value, ts, txn}
 }
@@ -493,7 +495,7 @@ func requireTxnForValue(t *testing.T, val testValue, intent roachpb.Intent) {
 // nonFatalLogger implements pebble.Logger by recording that a fatal log event
 // was encountered at least once. Fatal log events are downgraded to Info level.
 type nonFatalLogger struct {
-	pebble.Logger
+	pebble.LoggerAndTracer
 	t      *testing.T
 	caught atomic.Value
 }
@@ -507,9 +509,11 @@ func TestPebbleKeyValidationFunc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Capture fatal errors by swapping out the logger.
+	// nonFatalLogger.LoggerAndTracer is nil, since the test exercises only
+	// Fatalf.
 	l := &nonFatalLogger{t: t}
 	opt := func(cfg *engineConfig) error {
-		cfg.Opts.Logger = l
+		cfg.Opts.LoggerAndTracer = l
 		return nil
 	}
 	engine := createTestPebbleEngine(opt).(*Pebble)
@@ -1339,4 +1343,46 @@ func TestNoMinVerFile(t *testing.T) {
 
 	_, err = Open(ctx, loc, st)
 	require.ErrorContains(t, err, "store has no min-version file")
+}
+
+func TestApproximateDiskBytes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	rng, _ := randutil.NewTestRand()
+
+	p, err := Open(ctx, InMemory(), cluster.MakeTestingClusterSettings())
+	require.NoError(t, err)
+	defer p.Close()
+
+	key := func(i int) roachpb.Key {
+		return keys.SystemSQLCodec.TablePrefix(uint32(i))
+	}
+
+	// Write keys 0000...0999.
+	b := p.NewWriteBatch()
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, b.PutMVCC(
+			MVCCKey{Key: key(i), Timestamp: hlc.Timestamp{WallTime: int64(i + 1)}},
+			MVCCValue{Value: roachpb.Value{RawBytes: randutil.RandBytes(rng, 100)}},
+		))
+	}
+	require.NoError(t, b.Commit(true /* sync */))
+	require.NoError(t, p.Flush())
+
+	approxBytes := func(span roachpb.Span) uint64 {
+		v, err := p.ApproximateDiskBytes(span.Key, span.EndKey)
+		require.NoError(t, err)
+		t.Logf("%s (%x-%x): %d bytes", span, span.Key, span.EndKey, v)
+		return v
+	}
+
+	all := approxBytes(roachpb.Span{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax})
+	for i := 0; i < 1000; i++ {
+		s := roachpb.Span{Key: key(i), EndKey: key(i + 1)}
+		if v := approxBytes(s); v >= all {
+			t.Errorf("ApproximateDiskBytes(%q) = %d >= entire DB size %d", s, v, all)
+		}
+	}
 }

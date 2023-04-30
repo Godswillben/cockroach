@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -81,7 +80,7 @@ var localityCfgs = map[string]roachpb.Locality{
 }
 
 var clusterVersionKeys = map[string]clusterversion.Key{
-	"Start22_2":           clusterversion.TODODelete_V22_2Start,
+	"23_1_Start":          clusterversion.V23_1Start,
 	"23_1_MVCCTombstones": clusterversion.V23_1_MVCCRangeTombstonesUnconditionallyEnabled,
 }
 
@@ -135,15 +134,15 @@ func (d *datadrivenTestState) cleanup(ctx context.Context, t *testing.T) {
 }
 
 type clusterCfg struct {
-	name           string
-	iodir          string
-	nodes          int
-	splits         int
-	ioConf         base.ExternalIODirConfig
-	localities     string
-	beforeVersion  string
-	testingKnobCfg string
-	disableTenant  bool
+	name              string
+	iodir             string
+	nodes             int
+	splits            int
+	ioConf            base.ExternalIODirConfig
+	localities        string
+	beforeVersion     string
+	testingKnobCfg    string
+	defaultTestTenant base.DefaultTestTenantOptions
 }
 
 func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
@@ -151,22 +150,20 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 	var cleanup func()
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODirConfig = cfg.ioConf
-	params.ServerArgs.DisableDefaultTestTenant = cfg.disableTenant
+
+	params.ServerArgs.DefaultTestTenant = cfg.defaultTestTenant
 	params.ServerArgs.Knobs = base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-	}
-	// Backups issue splits underneath the hood, and as such, will fail capability
-	// checks for tests that run as secondary tenants. Skip these checks at a
-	// global level using a testing knob.
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
+		TenantTestingKnobs: &sql.TenantTestingKnobs{
+			// The tests in this package are particular about the tenant IDs
+			// they get in CREATE TENANT.
+			EnableTenantIDReuse: true,
+		},
 	}
 
 	settings := cluster.MakeTestingClusterSettings()
-
 	if cfg.beforeVersion != "" {
+		settings = cluster.MakeClusterSettings()
 		beforeKey, ok := clusterVersionKeys[cfg.beforeVersion]
 		if !ok {
 			t.Fatalf("clusterVersion %s does not exist in data driven global map", cfg.beforeVersion)
@@ -174,12 +171,9 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 		beforeKey--
 		params.ServerArgs.Knobs.Server = &server.TestingKnobs{
 			BinaryVersionOverride:          clusterversion.ByKey(beforeKey),
-			DisableAutomaticVersionUpgrade: make(chan struct{})}
-		settings = cluster.MakeTestingClusterSettingsWithVersions(
-			clusterversion.TestingBinaryVersion,
-			clusterversion.ByKey(beforeKey),
-			false,
-		)
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			BootstrapVersionKeyOverride:    clusterversion.BinaryMinSupportedVersionKey,
+		}
 	}
 
 	closedts.TargetDuration.Override(context.Background(), &settings.SV, 10*time.Millisecond)
@@ -286,15 +280,14 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, name string, user string) *
 //
 //   - splits: specifies the number of ranges the bank table is split into.
 //
-//   - before-version=<beforeVersion>: creates a mixed version cluster where all
-//     nodes running the test cluster binary think the clusterVersion is one
-//     version before the passed in <beforeVersion> key. See cockroach_versions.go
-//     for possible values.
+//   - before-version=<beforeVersion>: bootstraps the test cluster and upgrades
+//     it to a cluster version that is one version before the passed in
+//     <beforeVersion> key. See cockroach_versions.go for possible values.
 //
 //   - testingKnobCfg: specifies a key to a hardcoded testingKnob configuration
 //
 //   - disable-tenant : ensures the test is never run in a multitenant environment by
-//     setting testserverargs.DisableDefaultTestTenant to true.
+//     setting testserverargs.DefaultTestTenant to base.TestTenantDisabled.
 //
 //   - "upgrade-cluster version=<version>"
 //     Upgrade the cluster version of the active cluster to the passed in
@@ -482,7 +475,7 @@ func TestDataDriven(t *testing.T) {
 			case "new-cluster":
 				var name, shareDirWith, iodir, localities, beforeVersion, testingKnobCfg string
 				var splits int
-				var disableTenant bool
+				var defaultTestTenant base.DefaultTestTenantOptions
 				nodes := singleNode
 				var io base.ExternalIODirConfig
 				d.ScanArgs(t, "name", &name)
@@ -518,20 +511,20 @@ func TestDataDriven(t *testing.T) {
 					d.ScanArgs(t, "testingKnobCfg", &testingKnobCfg)
 				}
 				if d.HasArg("disable-tenant") {
-					disableTenant = true
+					defaultTestTenant = base.TestTenantDisabled
 				}
 
 				lastCreatedCluster = name
 				cfg := clusterCfg{
-					name:           name,
-					iodir:          iodir,
-					nodes:          nodes,
-					splits:         splits,
-					ioConf:         io,
-					localities:     localities,
-					beforeVersion:  beforeVersion,
-					testingKnobCfg: testingKnobCfg,
-					disableTenant:  disableTenant,
+					name:              name,
+					iodir:             iodir,
+					nodes:             nodes,
+					splits:            splits,
+					ioConf:            io,
+					localities:        localities,
+					beforeVersion:     beforeVersion,
+					testingKnobCfg:    testingKnobCfg,
+					defaultTestTenant: defaultTestTenant,
 				}
 				err := ds.addCluster(t, cfg)
 				if err != nil {

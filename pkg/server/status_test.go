@@ -266,7 +266,7 @@ func TestStatusEngineStatsJson(t *testing.T) {
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{{
 			Path: dir,
 		}},
@@ -276,10 +276,17 @@ func TestStatusEngineStatsJson(t *testing.T) {
 	}
 	defer s.Stopper().Stop(context.Background())
 
+	t.Logf("using admin URL %s", s.AdminURL())
+
 	var engineStats serverpb.EngineStatsResponse
-	if err := getStatusJSONProto(s, "enginestats/local", &engineStats); err != nil {
-		t.Fatal(err)
-	}
+	// Using SucceedsSoon because we have seen in the wild that
+	// occasionally requests don't go through with error "transport:
+	// error while dialing: connection interrupted (did the remote node
+	// shut down or are there networking issues?)"
+	testutils.SucceedsSoon(t, func() error {
+		return getStatusJSONProto(s, "enginestats/local", &engineStats)
+	})
+
 	if len(engineStats.Stats) != 1 {
 		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
 	}
@@ -424,7 +431,7 @@ func TestStatusGetFiles(t *testing.T) {
 		}
 
 		request := serverpb.GetFilesRequest{
-			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
+			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"heap*"}}
 		response, err := client.GetFiles(context.Background(), &request)
 		if err != nil {
 			t.Fatal(err)
@@ -1058,9 +1065,9 @@ func TestHotRangesResponse(t *testing.T) {
 					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
 				}
 				if r.QueriesPerSecond > 0 {
-					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
-						t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
-							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond)
+					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 && r.ReadBytesPerSecond == 0 && r.WriteBytesPerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected either reads=%.2f, writes=%.2f, readBytes=%.2f or writeBytes=%.2f to be non-zero",
+							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond, r.ReadBytesPerSecond, r.WriteBytesPerSecond)
 					}
 					// If the architecture doesn't support sampling CPU, it
 					// will also be zero.
@@ -1099,9 +1106,9 @@ func TestHotRanges2Response(t *testing.T) {
 			t.Errorf("unexpected empty range id: %d", r.RangeID)
 		}
 		if r.QPS > 0 {
-			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
-				t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
-					r.QPS, r.ReadsPerSecond, r.WritesPerSecond)
+			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 && r.ReadBytesPerSecond == 0 && r.WriteBytesPerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected either reads=%.2f, writes=%.2f, readBytes=%.2f or writeBytes=%.2f to be non-zero",
+					r.QPS, r.ReadsPerSecond, r.WritesPerSecond, r.ReadBytesPerSecond, r.WriteBytesPerSecond)
 			}
 			// If the architecture doesn't support sampling CPU, it
 			// will also be zero.
@@ -1150,7 +1157,7 @@ func TestHotRanges2ResponseWithViewActivityOptions(t *testing.T) {
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer kvserver.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistoryForTesting(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
@@ -1336,20 +1343,20 @@ func TestStatusVarsTxnMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_begin_count{tenant=\"system\"} 1")) {
-		t.Errorf("expected `sql_txn_begin_count{tenant=\"system\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_begin_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_begin_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{tenant=\"system\"} 1")) {
-		t.Errorf("expected `sql_restart_savepoint_count{tenant=\"system\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{tenant=\"system\"} 1")) {
-		t.Errorf("expected `sql_restart_savepoint_release_count{tenant=\"system\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_commit_count{tenant=\"system\"} 1")) {
-		t.Errorf("expected `sql_txn_commit_count{tenant=\"system\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_commit_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_commit_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_rollback_count{tenant=\"system\"} 0")) {
-		t.Errorf("expected `sql_txn_rollback_count{tenant=\"system\"} 0`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count{node_id=\"1\"} 0")) {
+		t.Errorf("expected `sql_txn_rollback_count{node_id=\"1\"} 0`, got: %s", body)
 	}
 }
 
@@ -1365,10 +1372,13 @@ func TestSpanStatsResponse(t *testing.T) {
 	}
 
 	var response roachpb.SpanStatsResponse
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
 	request := roachpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.AdminURL() + statusPrefix + "span"
@@ -1379,7 +1389,8 @@ func TestSpanStatsResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Errorf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -1394,10 +1405,13 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
 	rpcContext := newRPCTestContext(ctx, ts, ts.RPCContext().Config)
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
 	request := roachpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.ServingRPCAddr()
@@ -1416,7 +1430,8 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Fatalf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -1503,7 +1518,7 @@ func TestDiagnosticsResponse(t *testing.T) {
 func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer kvserver.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistoryForTesting(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
@@ -2055,7 +2070,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		t.Fatalf("expected privilege error, got %v", err)
 	}
 
-	testPath := func(path string, expectedStmts []string) {
+	verifyStmts := func(path string, expectedStmts []string, hasTxns bool, t *testing.T) {
 		// Hit query endpoint.
 		if err := getStatusJSONProtoWithAdminOption(firstServerProto, path, &resp, false); err != nil {
 			t.Fatal(err)
@@ -2063,6 +2078,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 
 		// See if the statements returned are what we executed.
 		var statementsInResponse []string
+		expectedTxnFingerprints := map[appstatspb.TransactionFingerprintID]struct{}{}
 		for _, respStatement := range resp.Statements {
 			if respStatement.Key.KeyData.Failed {
 				// We ignore failed statements here as the INSERT statement can fail and
@@ -2079,14 +2095,28 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 			}
 
 			statementsInResponse = append(statementsInResponse, respStatement.Key.KeyData.Query)
+			for _, txnFingerprintID := range respStatement.TxnFingerprintIDs {
+				expectedTxnFingerprints[txnFingerprintID] = struct{}{}
+			}
+		}
+
+		for _, respTxn := range resp.Transactions {
+			delete(expectedTxnFingerprints, respTxn.StatsData.TransactionFingerprintID)
 		}
 
 		sort.Strings(expectedStmts)
 		sort.Strings(statementsInResponse)
 
 		if !reflect.DeepEqual(expectedStmts, statementsInResponse) {
-			t.Fatalf("expected queries\n\n%v\n\ngot queries\n\n%v\n%s",
-				expectedStmts, statementsInResponse, pretty.Sprint(resp))
+			t.Fatalf("expected queries\n\n%v\n\ngot queries\n\n%v\n%s\n path: %s",
+				expectedStmts, statementsInResponse, pretty.Sprint(resp), path)
+		}
+		if hasTxns {
+			// We expect that expectedTxnFingerprints is now empty since
+			// we should have removed them all.
+			assert.Empty(t, expectedTxnFingerprints)
+		} else {
+			assert.Empty(t, resp.Transactions)
 		}
 	}
 
@@ -2099,33 +2129,65 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		expectedStatements = append(expectedStatements, expectedStmt)
 	}
 
-	// Grant VIEWACTIVITY.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
-
-	// Test with no query params.
-	testPath("combinedstmts", expectedStatements)
-
 	oneMinAfterAggregatedTs := aggregatedTs + 60
-	// Test with end = 1 min after aggregatedTs; should give the same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 min after aggregatedTs; should give no results
-	testPath(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil)
 
-	// Remove VIEWACTIVITY so we can test with just the VIEWACTIVITYREDACTED role.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s NOVIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
-	// Grant VIEWACTIVITYREDACTED.
-	thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+	t.Run("fetch_mode=combined, VIEWACTIVITY", func(t *testing.T) {
+		// Grant VIEWACTIVITY.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
 
-	// Test with no query params.
-	testPath("combinedstmts", expectedStatements)
-	// Test with end = 1 min after aggregatedTs; should give the same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
-	testPath(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements)
-	// Test with start = 1 min after aggregatedTs; should give no results
-	testPath(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil)
+		// Test with no query params.
+		verifyStmts("combinedstmts", expectedStatements, true, t)
+		// Test with end = 1 min after aggregatedTs; should give the same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs),
+			expectedStatements, true, t)
+		// Test with start = 1 min after aggregatedTs; should give no results
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil, true, t)
+	})
+
+	t.Run("fetch_mode=combined, VIEWACTIVITYREDACTED", func(t *testing.T) {
+		// Remove VIEWACTIVITY so we can test with just the VIEWACTIVITYREDACTED role.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s NOVIEWACTIVITY", authenticatedUserNameNoAdmin().Normalized()))
+		// Grant VIEWACTIVITYREDACTED.
+		thirdServerSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", authenticatedUserNameNoAdmin().Normalized()))
+
+		// Test with no query params.
+		verifyStmts("combinedstmts", expectedStatements, true, t)
+		// Test with end = 1 min after aggregatedTs; should give the same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?end=%d", oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 hour before aggregatedTs  end = 1 min after aggregatedTs; should give same results as get all.
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs), expectedStatements, true, t)
+		// Test with start = 1 min after aggregatedTs; should give no results
+		verifyStmts(fmt.Sprintf("combinedstmts?start=%d", oneMinAfterAggregatedTs), nil, true, t)
+	})
+
+	t.Run("fetch_mode=StmtsOnly", func(t *testing.T) {
+		verifyStmts("combinedstmts?fetch_mode.stats_type=0", expectedStatements, false, t)
+	})
+
+	t.Run("fetch_mode=TxnsOnly with limit", func(t *testing.T) {
+		// Verify that we only return stmts for the txns in the response.
+		// We'll add a limit in a later commit to help verify this behaviour.
+		if err := getStatusJSONProtoWithAdminOption(firstServerProto, "combinedstmts?fetch_mode.stats_type=1&limit=2",
+			&resp, false); err != nil {
+			t.Fatal(err)
+		}
+
+		assert.Equal(t, 2, len(resp.Transactions))
+		stmtFingerprintIDs := map[appstatspb.StmtFingerprintID]struct{}{}
+		for _, txn := range resp.Transactions {
+			for _, stmtFingerprint := range txn.StatsData.StatementFingerprintIDs {
+				stmtFingerprintIDs[stmtFingerprint] = struct{}{}
+			}
+		}
+
+		for _, stmt := range resp.Statements {
+			if _, ok := stmtFingerprintIDs[stmt.ID]; !ok {
+				t.Fatalf("unexpected stmt; stmt unrelated to a txn int he response: %s", stmt.Key.KeyData.Query)
+			}
+		}
+	})
 }
 
 func TestStatusAPIStatementDetails(t *testing.T) {
@@ -2168,6 +2230,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	for _, stmt := range statements {
 		thirdServerSQL.Exec(t, stmt)
 	}
+
 	query := `INSERT INTO posts VALUES (_, '_')`
 	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
 		false, true, `roachblog`)
@@ -2596,15 +2659,15 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
 					},
 				},
 			},
@@ -2612,15 +2675,15 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
 					},
 				},
 			},
@@ -2631,15 +2694,15 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
 					},
 				},
 			},
@@ -2648,15 +2711,15 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
 					},
 				},
 			},
@@ -2667,21 +2730,21 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[2],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[3],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 0, Timestamp: ts[0]},
 					},
 				},
 			},
@@ -2689,22 +2752,22 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 0, Timestamp: ts[0]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 0, Timestamp: ts[0]},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
 					},
 				},
 				{
 					FlowID: flowIDs[3],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
 					},
 				},
 			},
@@ -2712,32 +2775,32 @@ func TestMergeDistSQLRemoteFlows(t *testing.T) {
 				{
 					FlowID: flowIDs[0],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 0, Timestamp: ts[0]},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[1],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 0, Timestamp: ts[0]},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
 					},
 				},
 				{
 					FlowID: flowIDs[2],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 3, Timestamp: ts[3], Status: serverpb.DistSQLRemoteFlows_RUNNING},
+						{NodeID: 3, Timestamp: ts[3]},
 					},
 				},
 				{
 					FlowID: flowIDs[3],
 					Infos: []serverpb.DistSQLRemoteFlows_Info{
-						{NodeID: 0, Timestamp: ts[0], Status: serverpb.DistSQLRemoteFlows_QUEUED},
-						{NodeID: 1, Timestamp: ts[1], Status: serverpb.DistSQLRemoteFlows_RUNNING},
-						{NodeID: 2, Timestamp: ts[2], Status: serverpb.DistSQLRemoteFlows_QUEUED},
+						{NodeID: 0, Timestamp: ts[0]},
+						{NodeID: 1, Timestamp: ts[1]},
+						{NodeID: 2, Timestamp: ts[2]},
 					},
 				},
 			},

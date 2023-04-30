@@ -82,9 +82,7 @@ func (rpcCtx *Context) AddTestingDialOpts(opts ...grpc.DialOption) {
 
 func newTestServer(t testing.TB, ctx *Context, extraOpts ...grpc.ServerOption) *grpc.Server {
 	tlsConfig, err := ctx.GetServerTLSConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	opts := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
 	}
@@ -194,7 +192,7 @@ func TestPingInterceptors(t *testing.T) {
 			}
 			return nil
 		},
-		OnIncomingPing: func(ctx context.Context, req *PingRequest) error {
+		OnIncomingPing: func(ctx context.Context, req *PingRequest, resp *PingResponse) error {
 			if req.OriginNodeID == blockedOriginNodeID {
 				return errBoomRecv
 			}
@@ -1178,7 +1176,9 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 		defer mu.Unlock()
 		n := len(mu.conns)
 		for i := n - 1; i >= 0; i-- {
-			if err := mu.conns[i].Close(); err != nil {
+			// This can spuriously return ErrClosed since the listener is closed
+			// before us.
+			if err := mu.conns[i].Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				return 0, err
 			}
 			mu.conns = mu.conns[:i]
@@ -1274,10 +1274,17 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 		return nil
 	})
 
+	// TODO(baptist): Better understand when this happens. It appears we can get
+	// spurious connections to other tests on a stress run. This has been
+	// happening for a while, but only comes out rarely when this package is
+	// stressed. This test is very aggressive since it is calling GRPCDialNode in
+	// a busy loop for 50ms.
+	expectedCluster := "doesn't match server cluster ID"
+	expectedNode := "doesn't match server node ID"
 	// Should stay unhealthy despite reconnection attempts.
 	for then := timeutil.Now(); timeutil.Since(then) < 50*clientCtx.Config.RPCHeartbeatTimeout; {
 		err := clientCtx.TestingConnHealth(remoteAddr, serverNodeID)
-		if !isUnhealthy(err) {
+		if !isUnhealthy(err) && !testutils.IsError(err, expectedCluster) && !testutils.IsError(err, expectedNode) {
 			t.Fatal(err)
 		}
 	}
@@ -1648,7 +1655,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 // its response stream even if it doesn't get any new requests.
 func TestGRPCKeepaliveFailureFailsInflightRPCs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 51800, "Takes too long given https://github.com/grpc/grpc-go/pull/2642")
+	skip.UnderShort(t, "Takes too long given https://github.com/grpc/grpc-go/pull/2642")
 
 	sc := log.Scope(t)
 	defer sc.Close(t)
@@ -2466,7 +2473,7 @@ func BenchmarkGRPCDial(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := rpcCtx.GRPCDialNode(remoteAddr, serverNodeID, DefaultClass).Connect(context.Background())
+			_, err := rpcCtx.grpcDialRaw(ctx, remoteAddr, DefaultClass)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -2556,3 +2563,233 @@ func TestOnlyOnceDialer(t *testing.T) {
 		}
 	}
 }
+
+type trackingListener struct {
+	net.Listener
+	mu          syncutil.Mutex
+	connections []net.Conn
+	closed      bool
+}
+
+func (d *trackingListener) Accept() (net.Conn, error) {
+	c, err := d.Listener.Accept()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// If we get any trailing accepts after we close, just close the connection immediately.
+	if err == nil {
+		if d.closed {
+			_ = c.Close()
+		} else {
+			d.connections = append(d.connections, c)
+		}
+	}
+	return c, err
+}
+
+func (d *trackingListener) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	for _, c := range d.connections {
+		_ = c.Close()
+	}
+	err := d.Listener.Close()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func newRegisteredServer(
+	t testing.TB, stopper *stop.Stopper, clusterID uuid.UUID, nodeID roachpb.NodeID,
+) (*Context, string, chan *PingRequest, *trackingListener) {
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	// We don't want to stall sending to this channel.
+	pingChan := make(chan *PingRequest, 5)
+
+	opts := ContextOptions{
+		TenantID:        roachpb.SystemTenantID,
+		Config:          testutils.NewNodeTestBaseContext(),
+		Clock:           clock,
+		ToleratedOffset: time.Duration(0),
+		Stopper:         stopper,
+		Settings:        cluster.MakeTestingClusterSettings(),
+		NeedsDialback:   true,
+		Knobs:           ContextTestingKnobs{NoLoopbackDialer: true},
+	}
+	// Heartbeat faster so we don't have to wait as long.
+	opts.Config.RPCHeartbeatInterval = 10 * time.Millisecond
+	opts.Config.RPCHeartbeatTimeout = 100 * time.Millisecond
+
+	rpcCtx := NewContext(context.Background(), opts)
+	// This is normally set up inside the server, we want to hold onto all PingRequests that come through.
+	rpcCtx.OnIncomingPing = func(ctx context.Context, req *PingRequest, resp *PingResponse) error {
+		pingChan <- req
+		err := rpcCtx.VerifyDialback(ctx, req, resp, roachpb.Locality{})
+		// On success store the ping to the channel for test analysis.
+		return err
+	}
+
+	rpcCtx.NodeID.Set(context.Background(), nodeID)
+	rpcCtx.StorageClusterID.Set(context.Background(), clusterID)
+	s := newTestServer(t, rpcCtx)
+
+	RegisterHeartbeatServer(s, rpcCtx.NewHeartbeatService())
+
+	ln, err := net.Listen("tcp", util.TestAddr.String())
+	require.Nil(t, err)
+	tracker := trackingListener{Listener: ln}
+	_ = stopper.RunAsyncTask(context.Background(), "serve", func(context.Context) {
+		closeReason := s.Serve(&tracker)
+		log.Infof(context.Background(), "Closed listener with reason %v", closeReason)
+	})
+
+	addr := ln.Addr().String()
+	log.Infof(context.Background(), "Listening on %s", addr)
+	// This needs to be set once we know our address so that ping requests have
+	// the correct reverse addr in them.
+	rpcCtx.Config.AdvertiseAddr = addr
+	return rpcCtx, addr, pingChan, &tracker
+}
+
+// TestHeartbeatDialer verifies that unidirectional partitions are converted
+// into bidirectional partitions. The test sets up two nodes that are pinging each
+func TestHeartbeatDialback(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	clusterID := uuid.MakeV4()
+
+	ctx1, remoteAddr1, pingChan1, ln1 := newRegisteredServer(t, stopper, clusterID, 1)
+	ctx2, remoteAddr2, pingChan2, ln2 := newRegisteredServer(t, stopper, clusterID, 2)
+	defer func() { netutil.FatalIfUnexpected(ln1.Close()) }()
+	defer func() { netutil.FatalIfUnexpected(ln2.Close()) }()
+
+	// Test an incorrect remoteNodeID, this should fail with a heartbeat error.
+	// This invariant is important to make sure we don't try and connect to the
+	// wrong node.
+	{
+		_, err := ctx1.GRPCDialNode(remoteAddr2, 3, DefaultClass).Connect(ctx)
+		var respErr *netutil.InitialHeartbeatFailedError
+		require.ErrorAs(t, err, &respErr)
+		// Verify no heartbeat received in either direction.
+		require.Equal(t, 0, len(pingChan1))
+		require.Equal(t, 0, len(pingChan2))
+	}
+
+	// Initiate connection from node 1 to node 2 which will create a dialback
+	// connection back to 1. This will be a blocking connection since there is no
+	// reverse connection.
+	{
+		conn, err := ctx1.GRPCDialNode(remoteAddr2, 2, DefaultClass).Connect(ctx)
+		defer func() {
+			_ = conn.Close() // nolint:grpcconnclose
+		}()
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+		require.Equal(t, 1, len(pingChan2))
+		pingReq := <-pingChan2
+		require.Equal(t, PingRequest_BLOCKING, pingReq.NeedsDialback)
+		require.Equal(t, 0, len(pingChan1))
+	}
+
+	//Now connect back in the opposite direction. This should not initiate any
+	//dialback since we are already connected.
+	{
+		conn, err := ctx1.GRPCDialNode(remoteAddr2, 2, DefaultClass).Connect(ctx)
+		defer func() {
+			_ = conn.Close() // nolint:grpcconnclose
+		}()
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+		// The reverse connection was already set up, but we are still blocking.
+		pingReq := <-pingChan1
+		require.Equal(t, PingRequest_BLOCKING, pingReq.NeedsDialback)
+
+		// At this point, node 1 has a fully established connection to node 2, however node 2 has not yet finished connecting back.
+		require.Equal(t, nil, ctx1.ConnHealth(remoteAddr2, 2, DefaultClass))
+	}
+
+	// Verify we get non-blocking requests in both directions now.
+	require.Equal(t, PingRequest_NON_BLOCKING, (<-pingChan2).NeedsDialback)
+	require.Equal(t, PingRequest_NON_BLOCKING, (<-pingChan1).NeedsDialback)
+
+	// Verify we are fully healthy in both directions (note the dialback is on the
+	// system class).
+	require.Equal(t, nil, ctx1.ConnHealth(remoteAddr2, 2, DefaultClass))
+	require.Equal(t, nil, ctx2.ConnHealth(remoteAddr1, 1, SystemClass))
+
+	// Forcibly shut down listener 2 and the connection node1 -> node2.
+	// Test the reverse connection also closes within ~RPCHeartbeatTimeout.
+	log.Info(ctx, "Closing node 2 listener")
+	_ = ln2.Close()
+
+	// Wait for a few more pings to go through to make sure it has a chance to
+	// shut down the reverse connection. Normally the connect attempt times out
+	// immediately and returns an error, but occasionally it needs to wait for the
+	// RPCHeartbeatTimeout (100 ms). Wait until pings have stopped in both
+	// directions for at least 1 second before checking health.
+	for {
+		select {
+		case ping := <-pingChan1:
+			log.Infof(ctx, "Received %+v", ping)
+		case ping := <-pingChan2:
+			log.Infof(ctx, "Received %+v", ping)
+		case <-time.After(1 * time.Second):
+			require.ErrorAs(t, ctx1.ConnHealth(remoteAddr2, 2, DefaultClass), &ErrNoConnection)
+			require.ErrorAs(t, ctx2.ConnHealth(remoteAddr1, 1, SystemClass), &ErrNoConnection)
+			return
+		}
+	}
+}
+
+// TestSRVResolvingDialer tests srvResolvingDialer dials the correct target if SRV query
+// is successful, and dials the input target directly if SRV query returns empty records.
+func TestSRVResolvingDialer(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	t.Run("success SRV lookup", func(t *testing.T) {
+		expected := &net.SRV{
+			Target: "test",
+			Port:   123,
+		}
+		defer netutil.TestingOverrideSRVLookupFn(func(service, proto, name string) (string, []*net.SRV, error) {
+			return "", []*net.SRV{expected}, nil
+		})()
+
+		dialed := false
+		dial := func(ctx context.Context, addr string) (net.Conn, error) {
+			dialed = true
+			require.Equal(t, fmt.Sprintf("%s:%d", expected.Target, expected.Port), addr)
+			return nil, nil
+		}
+		dialer := &srvResolvingDialer{dialerFunc: dial}
+		_, err := dialer.dial(ctx, "srvquery")
+		require.NoError(t, err)
+		require.True(t, dialed)
+	})
+
+	t.Run("empty SRV lookup", func(t *testing.T) {
+		defer netutil.TestingOverrideSRVLookupFn(func(service, proto, name string) (string, []*net.SRV, error) {
+			return "", []*net.SRV{}, nil
+		})()
+		expected := "test-expected"
+		dialed := false
+		dial := func(ctx context.Context, addr string) (net.Conn, error) {
+			dialed = true
+			require.Equal(t, expected, addr)
+			return nil, nil
+		}
+		dialer := &srvResolvingDialer{dialerFunc: dial}
+		_, err := dialer.dial(ctx, expected)
+		require.NoError(t, err)
+		require.True(t, dialed)
+	})
+}
+
+// TODO(baptist): Add a test using TestCluster to verify this works in a full
+// integration test.

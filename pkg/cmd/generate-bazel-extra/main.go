@@ -232,12 +232,24 @@ test_suite(
     tests = ALL_TESTS,
 )`)
 
+	fmt.Fprintln(w, `
+test_suite(
+    name = "ccl_tests",
+    tags = [
+        "-broken_in_bazel",
+        "-integration",
+        "ccl_test",
+    ],
+    tests = ALL_TESTS,
+)`)
+
 	for _, size := range []string{"small", "medium", "large", "enormous"} {
 		fmt.Fprintf(w, `
 test_suite(
-    name = "%[1]s_tests",
+    name = "%[1]s_non_ccl_tests",
     tags = [
         "-broken_in_bazel",
+        "-ccl_test",
         "-flaky",
         "-integration",
         "%[1]s",
@@ -289,10 +301,22 @@ unused_checker(srcs = GET_X_DATA_TARGETS)`)
 func excludeReallyEnormousTargets(targets []string) []string {
 	for i := 0; i < len(targets); i++ {
 		var excluded bool
+		// Answer the following questions before adding a test target to this list:
+		//  1. Does this target run in Bazel Essential CI? If it does and you need
+		//     timeout to be > 1 hour then you need to talk to dev-inf. This is not
+		//	   expected.
+		//  2. Are you increasing the timeout for stress-testing purposes in CI? Make
+		// 	   your change in `pkg/cmd/teamcity-trigger` by updating `customTimeouts`.
+		//	3. You should only add a test target here if it's for stand-alone testing.
+		//	   For example: `/pkg/sql/sqlitelogictest` is only tested in a nightly in
+		//	   `build/teamcity/cockroach/nightlies/sqlite_logic_test_impl.sh`. If this is
+		//	   the case, you should tag your test as `integration`.
+		//  4. If you are not sure, please ask the dev-inf team for help.
 		for _, toExclude := range []string{
 			"//pkg/ccl/sqlitelogictestccl",
 			"//pkg/sql/sqlitelogictest",
-			"//pkg/ccl/backupccl",
+			// acceptance is excluded because it's an integration test.
+			"//pkg/acceptance",
 		} {
 			if strings.HasPrefix(targets[i], toExclude) {
 				excluded = true
@@ -330,6 +354,15 @@ func generateTestsTimeouts() {
 			targets[size]...,
 		))
 	}
+	var ccl_targets []string
+	for _, targetsForSize := range targets {
+		for _, target := range targetsForSize {
+			if strings.HasPrefix(target, "//pkg/ccl") {
+				ccl_targets = append(ccl_targets, target)
+			}
+		}
+	}
+	runBuildozer(append([]string{`add tags "ccl_test"`}, ccl_targets...))
 }
 
 func main() {

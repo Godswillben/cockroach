@@ -42,13 +42,17 @@ type Encoder interface {
 }
 
 func getEncoder(
-	opts changefeedbase.EncodingOptions, targets changefeedbase.Targets,
+	opts changefeedbase.EncodingOptions,
+	targets changefeedbase.Targets,
+	encodeForQuery bool,
+	p externalConnectionProvider,
+	sliMetrics *sliMetrics,
 ) (Encoder, error) {
 	switch opts.Format {
 	case changefeedbase.OptFormatJSON:
-		return makeJSONEncoder(opts)
+		return makeJSONEncoder(jsonEncoderOptions{EncodingOptions: opts, encodeForQuery: encodeForQuery})
 	case changefeedbase.OptFormatAvro, changefeedbase.DeprecatedOptFormatAvro:
-		return newConfluentAvroEncoder(opts, targets)
+		return newConfluentAvroEncoder(opts, targets, p, sliMetrics)
 	case changefeedbase.OptFormatCSV:
 		return newCSVEncoder(opts), nil
 	case changefeedbase.OptFormatParquet:

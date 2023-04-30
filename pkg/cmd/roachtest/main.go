@@ -94,6 +94,7 @@ func main() {
 	var clusterID string
 	var count = 1
 	var versionsBinaryOverride map[string]string
+	var enableFIPS bool
 
 	cobra.EnableCommandSorting = false
 
@@ -178,15 +179,25 @@ Use --bench to list benchmarks instead of tests.
 
 Each test has a set of tags. The tags are used to skip tests which don't match
 the tag filter. The tag filter is specified by specifying a pattern with the
-"tag:" prefix. The default tag filter is "tag:default" which matches any test
-that has the "default" tag. Note that tests are selected based on their name,
-and skipped based on their tag.
+"tag:" prefix. 
+
+If multiple "tag:" patterns are specified, the test must match at
+least one of them.
+
+Within a single "tag:" pattern, multiple tags can be specified by separating them
+with a comma. In this case, the test must match all of the tags.
 
 Examples:
 
    roachtest list acceptance copy/bank/.*false
-   roachtest list tag:acceptance
+   roachtest list tag:owner-kv
    roachtest list tag:weekly
+
+   # match weekly kv owned tests
+   roachtest list tag:owner-kv,weekly
+
+   # match weekly kv owner tests or aws tests
+   roachtest list tag:owner-kv,weekly tag:aws
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
 			r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
@@ -209,6 +220,8 @@ Examples:
 	}
 	listCmd.Flags().BoolVar(
 		&listBench, "bench", false, "list benchmarks instead of tests")
+	listCmd.Flags().StringVar(
+		&cloud, "cloud", cloud, "cloud provider to use (aws, azure, or gce)")
 
 	var runCmd = &cobra.Command{
 		// Don't display usage when tests fail.
@@ -244,6 +257,7 @@ runner itself.
 				user:                   username,
 				clusterID:              clusterID,
 				versionsBinaryOverride: versionsBinaryOverride,
+				enableFIPS:             enableFIPS,
 			})
 		},
 	}
@@ -281,6 +295,7 @@ runner itself.
 				user:                   username,
 				clusterID:              clusterID,
 				versionsBinaryOverride: versionsBinaryOverride,
+				enableFIPS:             enableFIPS,
 			})
 		},
 	}
@@ -333,6 +348,8 @@ runner itself.
 				"is present in the list,"+"the respective binary will be used when a "+
 				"multi-version test asks for the respective binary, instead of "+
 				"`roachprod stage <ver>`. Example: 20.1.4=cockroach-20.1,20.2.0=cockroach-20.2.")
+		cmd.Flags().BoolVar(
+			&enableFIPS, "fips", false, "Run tests in enableFIPS mode")
 	}
 
 	parseCreateOpts(runCmd.Flags(), &overrideOpts)
@@ -348,6 +365,8 @@ runner itself.
 		fmt.Fprintf(os.Stderr, "unable to lookup current user: %s\n", err)
 		os.Exit(1)
 	}
+	// Disable spinners and other fancy status messages since all IO is non-interactive.
+	config.Quiet = true
 
 	if err := roachprod.InitDirs(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
@@ -382,6 +401,7 @@ type cliCfg struct {
 	user                   string
 	clusterID              string
 	versionsBinaryOverride map[string]string
+	enableFIPS             bool
 }
 
 func runTests(register func(registry.Registry), cfg cliCfg) error {
@@ -389,6 +409,9 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 		return fmt.Errorf("--count (%d) must by greater than 0", cfg.count)
 	}
 	r := makeTestRegistry(cloud, instanceType, zonesF, localSSDArg)
+
+	// actual registering of tests
+	// TODO: don't register if we can't run on the specified registry cloud
 	register(&r)
 	cr := newClusterRegistry()
 	stopper := stop.NewStopper()
@@ -419,6 +442,7 @@ func runTests(register func(registry.Registry), cfg cliCfg) error {
 		cpuQuota:    cfg.cpuQuota,
 		debugMode:   cfg.debugMode,
 		clusterID:   cfg.clusterID,
+		enableFIPS:  cfg.enableFIPS,
 	}
 	if err := runner.runHTTPServer(cfg.httpPort, os.Stdout, bindTo); err != nil {
 		return err

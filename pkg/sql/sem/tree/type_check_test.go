@@ -111,7 +111,7 @@ func TestTypeCheck(t *testing.T) {
 		{`NULL = ALL ARRAY[NULL, NULL]`, `NULL`},
 		{`1 = ALL NULL`, `NULL`},
 		{`'a' = ALL current_schemas(true)`, `'a':::STRING = ALL current_schemas(true)`},
-		{`NULL = ALL current_schemas(true)`, `NULL`},
+		{`NULL = ALL current_schemas(true)`, `NULL = ALL current_schemas(true)`},
 
 		{`INTERVAL '1'`, `'00:00:01':::INTERVAL`},
 		{`DECIMAL '1.0'`, `1.0:::DECIMAL`},
@@ -213,6 +213,13 @@ func TestTypeCheck(t *testing.T) {
 
 		// String preference.
 		{`st_geomfromgeojson($1)`, `st_geomfromgeojson($1:::STRING):::GEOMETRY`},
+
+		// TSQuery and TSVector
+		{`'a' @@ 'b'`, `to_tsvector('a':::STRING) @@ plainto_tsquery('b':::STRING)`},
+		{`'a' @@ 'b':::TSQUERY`, `to_tsvector('a':::STRING) @@ '''b''':::TSQUERY`},
+		{`'a':::TSQUERY @@ 'b'`, `'''a''':::TSQUERY @@ to_tsvector('b':::STRING)`},
+		{`'a' @@ 'b':::TSVECTOR`, `'''a''':::TSQUERY @@ '''b''':::TSVECTOR`},
+		{`'a':::TSVECTOR @@ 'b'`, `'''a''':::TSVECTOR @@ '''b''':::TSQUERY`},
 	}
 	ctx := context.Background()
 	for _, d := range testData {

@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -75,7 +76,7 @@ func (el EventLogger) HandlePanicAndLogError(ctx context.Context, err *error) {
 			log.InfofDepth(ctx, depth, "done %s in %s", el.msg, redact.Safe(timeutil.Since(el.start)))
 		}
 	case HasNotImplemented(*err):
-		log.InfofDepth(ctx, depth, "failed %s with error: %v", el.msg, *err)
+		log.VEventfDepth(ctx, depth, 1, "declarative schema changer does not support %s: %v", el.msg, *err)
 	case errors.HasAssertionFailure(*err):
 		*err = errors.Wrapf(*err, "%s", el.msg)
 		fallthrough
@@ -129,6 +130,8 @@ type concurrentSchemaChangeError struct {
 	// from the builder.
 	descID descpb.ID
 }
+
+var _ pgerror.ClientVisibleRetryError = (*concurrentSchemaChangeError)(nil)
 
 // ClientVisibleRetryError is detected by the pgwire layer and will convert
 // this error into a serialization error to be retried. See

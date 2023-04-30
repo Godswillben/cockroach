@@ -15,7 +15,7 @@ export type SqlExecutionRequest = {
   execute?: boolean;
   timeout?: string; // Default 5s
   application_name?: string; // Defaults to '$ api-v2-sql'
-  database?: string; // Defaults to defaultDb
+  database?: string; // Defaults to system
   max_result_size?: number; // Default 10kib
 };
 
@@ -57,13 +57,15 @@ export type SqlExecutionErrorMessage = {
   message: string;
   code: string;
   severity: string;
-  source: { file: string; line: number; function: "string" };
+  source: { file: string; line: number; function: string };
 };
 
 export type SqlApiResponse<ResultType> = {
   maxSizeReached: boolean;
   results: ResultType;
 };
+
+export type SqlApiQueryResponse<Result> = Result & { error?: Error };
 
 export const SQL_API_PATH = "/api/v2/sql/";
 
@@ -76,6 +78,11 @@ export const SQL_API_PATH = "/api/v2/sql/";
 export function executeSql<RowType>(
   req: SqlExecutionRequest,
 ): Promise<SqlExecutionResponse<RowType>> {
+  // TODO(maryliag) remove this part of code when cloud is updated with
+  // a new CRDB release.
+  if (!req.database) {
+    req.database = FALLBACK_DB;
+  }
   return fetchDataJSON<SqlExecutionResponse<RowType>, SqlExecutionRequest>(
     SQL_API_PATH,
     req,
@@ -85,6 +92,7 @@ export function executeSql<RowType>(
 export const INTERNAL_SQL_API_APP = "$ internal-console";
 export const LONG_TIMEOUT = "300s";
 export const LARGE_RESULT_SIZE = 50000; // 50 kib
+export const FALLBACK_DB = "system";
 
 /**
  * executeInternalSql executes the provided SQL statements with
@@ -119,9 +127,7 @@ export function sqlResultsAreEmpty(
 ): boolean {
   return (
     !result.execution?.txn_results?.length ||
-    result.execution.txn_results.every(
-      txn => !txn.rows || txn.rows.length === 0,
-    )
+    result.execution.txn_results.every(txn => txnResultIsEmpty(txn))
   );
 }
 
@@ -130,7 +136,7 @@ export function sqlResultsAreEmpty(
 // different versions. For now we just try to give more info as to why
 // this page is unavailable for insights.
 const UPGRADE_RELATED_ERRORS = [
-  /relation "crdb_internal.txn_execution_insights" does not exist/i,
+  /relation "(.*)" does not exist/i,
   /column "(.*)" does not exist/i,
 ];
 
@@ -169,11 +175,11 @@ export function isMaxSizeError(message: string): boolean {
   return !!message?.includes("max result size exceeded");
 }
 
-export function formatApiResult(
-  results: Array<any>,
+export function formatApiResult<ResultType>(
+  results: ResultType,
   error: SqlExecutionErrorMessage,
   errorMessageContext: string,
-): SqlApiResponse<any> {
+): SqlApiResponse<ResultType> {
   const maxSizeError = isMaxSizeError(error?.message);
 
   if (error && !maxSizeError) {
@@ -188,4 +194,8 @@ export function formatApiResult(
     maxSizeReached: maxSizeError,
     results: results,
   };
+}
+
+export function txnResultIsEmpty(txn_result: SqlTxnResult<unknown>): boolean {
+  return !txn_result.rows || txn_result.rows?.length === 0;
 }

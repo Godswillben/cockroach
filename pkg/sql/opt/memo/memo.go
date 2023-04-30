@@ -162,6 +162,8 @@ type Memo struct {
 	useImprovedDisjunctionStats            bool
 	useLimitOrderingForStreamingGroupBy    bool
 	useImprovedSplitDisjunctionForJoins    bool
+	alwaysUseHistograms                    bool
+	hoistUncorrelatedEqualitySubqueries    bool
 
 	// curRank is the highest currently in-use scalar expression rank.
 	curRank opt.ScalarRank
@@ -219,6 +221,8 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 		useImprovedDisjunctionStats:            evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats,
 		useLimitOrderingForStreamingGroupBy:    evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy,
 		useImprovedSplitDisjunctionForJoins:    evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins,
+		alwaysUseHistograms:                    evalCtx.SessionData().OptimizerAlwaysUseHistograms,
+		hoistUncorrelatedEqualitySubqueries:    evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries,
 	}
 	m.metadata.Init()
 	m.logPropsBuilder.init(ctx, evalCtx, m)
@@ -359,14 +363,16 @@ func (m *Memo) IsStale(
 		m.allowOrdinalColumnReferences != evalCtx.SessionData().AllowOrdinalColumnReferences ||
 		m.useImprovedDisjunctionStats != evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats ||
 		m.useLimitOrderingForStreamingGroupBy != evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy ||
-		m.useImprovedSplitDisjunctionForJoins != evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins {
+		m.useImprovedSplitDisjunctionForJoins != evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins ||
+		m.alwaysUseHistograms != evalCtx.SessionData().OptimizerAlwaysUseHistograms ||
+		m.hoistUncorrelatedEqualitySubqueries != evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries {
 		return true, nil
 	}
 
 	// Memo is stale if the fingerprint of any object in the memo's metadata has
 	// changed, or if the current user no longer has sufficient privilege to
 	// access the object.
-	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, catalog); err != nil {
+	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil {
 		return true, err
 	} else if !depsUpToDate {
 		return true, nil

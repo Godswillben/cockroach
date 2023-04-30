@@ -38,7 +38,7 @@ type alterTenantSetClusterSettingNode struct {
 }
 
 // AlterTenantSetClusterSetting sets tenant level session variables.
-// Privileges: super user.
+// Privileges: MANAGETENANT.
 func (p *planner) AlterTenantSetClusterSetting(
 	ctx context.Context, n *tree.AlterTenantSetClusterSetting,
 ) (planNode, error) {
@@ -46,10 +46,7 @@ func (p *planner) AlterTenantSetClusterSetting(
 	// privileged operation than changing local cluster settings. So we
 	// shouldn't be allowing with just the role option
 	// MODIFYCLUSTERSETTINGS.
-	//
-	// TODO(knz): Using admin authz for now; we may want to introduce a
-	// more specific role option later.
-	if err := p.RequireAdminRole(ctx, "change a tenant cluster setting"); err != nil {
+	if err := CanManageTenant(ctx, p); err != nil {
 		return nil, err
 	}
 	// Error out if we're trying to call this from a non-system tenant.
@@ -60,12 +57,12 @@ func (p *planner) AlterTenantSetClusterSetting(
 
 	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
-	v, ok := settings.Lookup(name, settings.LookupForLocalAccess, true /* forSystemTenant - checked above already */)
+	setting, ok := settings.LookupForLocalAccess(name, true /* forSystemTenant - checked above already */)
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
 	}
 	// Error out if we're trying to set a system-only variable.
-	if v.Class() == settings.SystemOnly {
+	if setting.Class() == settings.SystemOnly {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
 			"%s is a system-only setting and must be set in the admin tenant using SET CLUSTER SETTING", name)
 	}
@@ -73,11 +70,6 @@ func (p *planner) AlterTenantSetClusterSetting(
 	tspec, err := p.planTenantSpec(ctx, n.TenantSpec, "ALTER TENANT SET CLUSTER SETTING "+name)
 	if err != nil {
 		return nil, err
-	}
-
-	setting, ok := v.(settings.NonMaskedSetting)
-	if !ok {
-		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
 	value, err := p.getAndValidateTypedClusterSetting(ctx, name, n.Value, setting)
@@ -182,17 +174,9 @@ func (p *planner) ShowTenantClusterSetting(
 	}
 
 	name := strings.ToLower(n.Name)
-	val, ok := settings.Lookup(
-		name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant(),
-	)
+	setting, ok := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
-	}
-	setting, ok := val.(settings.NonMaskedSetting)
-	if !ok {
-		// If we arrive here, this means Lookup() did not properly
-		// ignore the masked setting, which is a bug in Lookup().
-		return nil, errors.AssertionFailedf("setting is masked: %v", name)
 	}
 
 	// Error out if we're trying to call this from a non-system tenant or if

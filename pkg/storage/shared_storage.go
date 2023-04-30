@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/objstorage/shared"
 )
 
@@ -79,6 +80,12 @@ type externalStorageWrapper struct {
 	ctx context.Context
 }
 
+// MakeExternalStorageWrapper returns a shared.Storage implementation that wraps
+// cloud.ExternalStorage.
+func MakeExternalStorageWrapper(ctx context.Context, es cloud.ExternalStorage) shared.Storage {
+	return &externalStorageWrapper{p: &Pebble{}, es: es, ctx: ctx}
+}
+
 var _ shared.Storage = &externalStorageWrapper{}
 
 // Close implements the shared.Storage interface.
@@ -121,4 +128,8 @@ func (e *externalStorageWrapper) Delete(basename string) error {
 // Size implements the shared.Storage interface.
 func (e *externalStorageWrapper) Size(basename string) (int64, error) {
 	return e.es.Size(e.ctx, basename)
+}
+
+func (e *externalStorageWrapper) IsNotExistError(err error) bool {
+	return errors.Is(err, cloud.ErrFileDoesNotExist)
 }

@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -45,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
@@ -1778,11 +1780,10 @@ func TestMVCCDeleteRangeInline(t *testing.T) {
 	}
 
 	// Attempt to delete non-inline key at zero timestamp; should fail.
-	const writeTooOldErrString = "WriteTooOldError"
 	if _, _, _, err := MVCCDeleteRange(ctx, engine, nil, testKey6, keyMax,
 		1, hlc.Timestamp{Logical: 0}, hlc.ClockTimestamp{}, nil, true,
-	); !testutils.IsError(err, writeTooOldErrString) {
-		t.Fatalf("got error %v, expected error with text '%s'", err, writeTooOldErrString)
+	); !testutils.IsError(err, inlineMismatchErrString) {
+		t.Fatalf("got error %v, expected error with text '%s'", err, inlineMismatchErrString)
 	}
 
 	// Attempt to delete inline keys in a transaction; should fail.
@@ -2022,7 +2023,7 @@ func TestMVCCClearTimeRange(t *testing.T) {
 	})
 
 	// Add an intent at k3@ts3.
-	txn := roachpb.MakeTransaction("test", nil, roachpb.NormalUserPriority, ts3, 1, 1)
+	txn := roachpb.MakeTransaction("test", nil, isolation.Serializable, roachpb.NormalUserPriority, ts3, 1, 1)
 	addIntent := func(t *testing.T, rw ReadWriter) {
 		require.NoError(t, MVCCPut(ctx, rw, nil, testKey3, ts3, hlc.ClockTimestamp{}, value3, &txn))
 	}
@@ -6141,6 +6142,10 @@ func TestWillOverflow(t *testing.T) {
 // in which mis-handling of resume spans would cause MVCCExportToSST
 // to return an empty resume key in cases where the resource limiters
 // caused an early return of a resume span.
+//
+// NB: That this test treats the result of MVCCExportToSST _without_
+// CPU rate limiting as the truth. Bugs that affect all exports will
+// not be caught by this test.
 func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -6152,26 +6157,74 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 		maxKey       = int64(1000)
 		minTimestamp = hlc.Timestamp{WallTime: 100000}
 		maxTimestamp = hlc.Timestamp{WallTime: 200000}
+
+		exportAllQuery = queryLimits{
+			minKey:       minKey,
+			maxKey:       maxKey,
+			minTimestamp: minTimestamp,
+			maxTimestamp: maxTimestamp,
+			latest:       false,
+		}
 	)
 
-	assertExportEqualWithOptions := func(t *testing.T, ctx context.Context, engine Engine, expectedData []MVCCKey, initialOpts MVCCExportOptions) {
-		dataIndex := 0
+	// When ExportRequest is interrupted by the CPU limiter, the currently
+	// buffered range key stack will have its EndKey truncated to the resume
+	// key. To account for this, we write all of the range keys back into a
+	// store and then export them out again without interruption.
+	canonicalizeRangeKeys := func(in []MVCCRangeKeyStack) []MVCCRangeKeyStack {
+		if len(in) == 0 {
+			return in
+		}
+
+		engine := createTestPebbleEngine()
+		defer engine.Close()
+		for _, keyStack := range in {
+			for _, version := range keyStack.Versions {
+				require.NoError(t, engine.PutRawMVCCRangeKey(keyStack.AsRangeKey(version), []byte{}))
+			}
+		}
+		require.NoError(t, engine.Flush())
+		keys, rKeys := exportAllData(t, engine, exportAllQuery)
+		require.Equal(t, 0, len(keys))
+		return rKeys
+	}
+
+	assertExportEqualWithOptions := func(t *testing.T, ctx context.Context, engine Engine,
+		expectedKeys []MVCCKey,
+		expectedRangeKeys []MVCCRangeKeyStack,
+		initialOpts MVCCExportOptions) {
+
+		keysIndex := 0
+		rKeysBuf := []MVCCRangeKeyStack{}
+
 		startKey := initialOpts.StartKey
 		for len(startKey.Key) > 0 {
-			sstFile := &MemFile{}
+			var sstFile bytes.Buffer
 			opts := initialOpts
 			opts.StartKey = startKey
-			_, resumeInfo, err := MVCCExportToSST(ctx, st, engine, opts, sstFile)
+			_, resumeInfo, err := MVCCExportToSST(ctx, st, engine, opts, &sstFile)
 			require.NoError(t, err)
-			chunk := sstToKeys(t, sstFile.Data())
-			require.LessOrEqual(t, len(chunk), len(expectedData)-dataIndex, "remaining test data")
-			for _, key := range chunk {
-				require.True(t, key.Equal(expectedData[dataIndex]), "returned key is not equal")
-				dataIndex++
+
+			keys, rangeKeys := sstToKeys(t, sstFile.Bytes())
+
+			require.LessOrEqual(t, len(keys), len(expectedKeys)-keysIndex, "remaining test key data")
+
+			for _, key := range keys {
+				require.True(t, key.Equal(expectedKeys[keysIndex]), "returned key is not equal")
+				keysIndex++
 			}
+			rKeysBuf = append(rKeysBuf, rangeKeys...)
 			startKey = resumeInfo.ResumeKey
 		}
-		require.Equal(t, len(expectedData), dataIndex, "not all expected data was consumed")
+		require.Equal(t, len(expectedKeys), keysIndex, "not all expected keys were consumed")
+
+		actualRangeKeys := canonicalizeRangeKeys(rKeysBuf)
+		require.Equal(t, len(expectedRangeKeys), len(actualRangeKeys))
+		for i, actual := range actualRangeKeys {
+			expected := expectedRangeKeys[i]
+			require.True(t, actual.Equal(expected), "range key mismatch %v != %v", actual, expected)
+		}
+
 	}
 	t.Run("elastic CPU limit exhausted",
 		func(t *testing.T) {
@@ -6186,13 +6239,7 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 				tombstoneChance: 0.01,
 			}
 			generateData(t, engine, limits, (limits.maxKey-limits.minKey)*10)
-			data := exportAllData(t, engine, queryLimits{
-				minKey:       minKey,
-				maxKey:       maxKey,
-				minTimestamp: minTimestamp,
-				maxTimestamp: maxTimestamp,
-				latest:       false,
-			})
+			keys, rKeys := exportAllData(t, engine, exportAllQuery)
 
 			// Our ElasticCPUWorkHandle will fail on the very first call. As a result,
 			// the very first return from MVCCExportToSST will actually contain no
@@ -6205,7 +6252,7 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 				}
 				return false, 0
 			}))
-			assertExportEqualWithOptions(t, ctx, engine, data, MVCCExportOptions{
+			assertExportEqualWithOptions(t, ctx, engine, keys, rKeys, MVCCExportOptions{
 				StartKey:           MVCCKey{Key: testKey(limits.minKey), Timestamp: limits.minTimestamp},
 				EndKey:             testKey(limits.maxKey),
 				StartTS:            limits.minTimestamp,
@@ -6227,26 +6274,50 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 				tombstoneChance: 0.01,
 			}
 			generateData(t, engine, limits, (limits.maxKey-limits.minKey)*10)
-			data := exportAllData(t, engine, queryLimits{
-				minKey:       minKey,
-				maxKey:       maxKey,
-				minTimestamp: minTimestamp,
-				maxTimestamp: maxTimestamp,
-				latest:       false,
-			})
+			keys, rKeys := exportAllData(t, engine, exportAllQuery)
 
-			// Our ElasticCPUWorkHandle will always
-			// fail. But, we should still make progress,
-			// one key at a time.
+			// Our ElasticCPUWorkHandle will always fail. But, we
+			// should still make progress, one key at a time.
 			ctx := admission.ContextWithElasticCPUWorkHandle(context.Background(), admission.TestingNewElasticCPUHandleWithCallback(func() (bool, time.Duration) {
-				return false, 0
+				return true, 0
 			}))
-			assertExportEqualWithOptions(t, ctx, engine, data, MVCCExportOptions{
+			assertExportEqualWithOptions(t, ctx, engine, keys, rKeys, MVCCExportOptions{
 				StartKey:           MVCCKey{Key: testKey(limits.minKey), Timestamp: limits.minTimestamp},
 				EndKey:             testKey(limits.maxKey),
 				StartTS:            limits.minTimestamp,
 				EndTS:              limits.maxTimestamp,
 				ExportAllRevisions: true,
+			})
+		})
+	t.Run("elastic CPU limit always exhausted with range keys",
+		func(t *testing.T) {
+			engine := createTestPebbleEngine()
+			defer engine.Close()
+			limits := dataLimits{
+				minKey:             minKey,
+				maxKey:             maxKey,
+				minTimestamp:       minTimestamp,
+				maxTimestamp:       maxTimestamp,
+				tombstoneChance:    0.50,
+				useRangeTombstones: true,
+			}
+			// Adding many range keys makes this test much slower,
+			// so we use 2*keyRange rather than 10*keyRange here.
+			generateData(t, engine, limits, (limits.maxKey-limits.minKey)*2)
+			keys, rKeys := exportAllData(t, engine, exportAllQuery)
+
+			// Our ElasticCPUWorkHandle will always fail. But, we
+			// should still make progress, one key at a time.
+			ctx := admission.ContextWithElasticCPUWorkHandle(context.Background(), admission.TestingNewElasticCPUHandleWithCallback(func() (bool, time.Duration) {
+				return true, 0
+			}))
+			assertExportEqualWithOptions(t, ctx, engine, keys, rKeys, MVCCExportOptions{
+				StartKey:           MVCCKey{Key: testKey(limits.minKey), Timestamp: limits.minTimestamp},
+				EndKey:             testKey(limits.maxKey),
+				StartTS:            limits.minTimestamp,
+				EndTS:              limits.maxTimestamp,
+				ExportAllRevisions: true,
+				StopMidKey:         true,
 			})
 		})
 	t.Run("elastic CPU limit exhausted respects StopMidKey",
@@ -6272,7 +6343,7 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 			}
 			require.NoError(t, engine.Flush(), "Flush engine data")
 
-			sstFile := &MemFile{}
+			var sstFile bytes.Buffer
 			opts := MVCCExportOptions{
 				StartKey:           MVCCKey{Key: testKey(minKey), Timestamp: minTimestamp},
 				EndKey:             testKey(maxKey),
@@ -6297,19 +6368,19 @@ func TestMVCCExportToSSTExhaustedAtStart(t *testing.T) {
 
 			// With StopMidKey=false, we expect 6
 			// revisions or 0 revisions.
-			_, _, err := MVCCExportToSST(ctx, st, engine, opts, sstFile)
+			_, _, err := MVCCExportToSST(ctx, st, engine, opts, &sstFile)
 			require.NoError(t, err)
-			chunk := sstToKeys(t, sstFile.Data())
+			chunk, _ := sstToKeys(t, sstFile.Bytes())
 			require.Equal(t, 6, len(chunk))
 
 			// With StopMidKey=true, we can stop in the
 			// middle of iteration.
 			callsBeforeFailure = 2
-			sstFile = &MemFile{}
+			sstFile.Reset()
 			opts.StopMidKey = true
-			_, _, err = MVCCExportToSST(ctx, st, engine, opts, sstFile)
+			_, _, err = MVCCExportToSST(ctx, st, engine, opts, &sstFile)
 			require.NoError(t, err)
-			chunk = sstToKeys(t, sstFile.Data())
+			chunk, _ = sstToKeys(t, sstFile.Bytes())
 			// We expect 3 here rather than 2 because the
 			// first iteration never calls the handler.
 			require.Equal(t, 3, len(chunk))
@@ -6330,30 +6401,35 @@ func testKey(id int64) roachpb.Key {
 }
 
 type dataLimits struct {
-	minKey          int64
-	maxKey          int64
-	minTimestamp    hlc.Timestamp
-	maxTimestamp    hlc.Timestamp
-	tombstoneChance float64
+	minKey             int64
+	maxKey             int64
+	minTimestamp       hlc.Timestamp
+	maxTimestamp       hlc.Timestamp
+	tombstoneChance    float64
+	useRangeTombstones bool
 }
 
-func exportAllData(t *testing.T, engine Engine, limits queryLimits) []MVCCKey {
+func exportAllData(
+	t *testing.T, engine Engine, limits queryLimits,
+) ([]MVCCKey, []MVCCRangeKeyStack) {
 	st := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
+	var sstFile bytes.Buffer
 	_, _, err := MVCCExportToSST(context.Background(), st, engine, MVCCExportOptions{
 		StartKey:           MVCCKey{Key: testKey(limits.minKey), Timestamp: limits.minTimestamp},
 		EndKey:             testKey(limits.maxKey),
 		StartTS:            limits.minTimestamp,
 		EndTS:              limits.maxTimestamp,
 		ExportAllRevisions: !limits.latest,
-	}, sstFile)
+	}, &sstFile)
 	require.NoError(t, err, "Failed to export expected data")
-	return sstToKeys(t, sstFile.Data())
+	return sstToKeys(t, sstFile.Bytes())
 }
 
-func sstToKeys(t *testing.T, data []byte) []MVCCKey {
+func sstToKeys(t *testing.T, data []byte) ([]MVCCKey, []MVCCRangeKeyStack) {
 	var results []MVCCKey
+	var rangeKeyRes []MVCCRangeKeyStack
 	it, err := NewMemSSTIterator(data, false, IterOptions{
+		KeyTypes:   pebble.IterKeyTypePointsAndRanges,
 		LowerBound: keys.MinKey,
 		UpperBound: keys.MaxKey,
 	})
@@ -6365,26 +6441,47 @@ func sstToKeys(t *testing.T, data []byte) []MVCCKey {
 		if !ok {
 			break
 		}
+
+		if it.RangeKeyChanged() {
+			hasPoint, hasRange := it.HasPointAndRange()
+			if hasRange {
+				rangeKeyRes = append(rangeKeyRes, it.RangeKeys().Clone())
+			}
+			if !hasPoint {
+				it.Next()
+				continue
+			}
+		}
+
 		results = append(results, MVCCKey{
 			Key:       append(roachpb.Key(nil), it.UnsafeKey().Key...),
 			Timestamp: it.UnsafeKey().Timestamp,
 		})
 		it.Next()
 	}
-	return results
+	return results, rangeKeyRes
 }
 
 func generateData(t *testing.T, engine Engine, limits dataLimits, totalEntries int64) {
 	rng := rand.New(rand.NewSource(timeutil.Now().Unix()))
 	for i := int64(0); i < totalEntries; i++ {
-		key := testKey(limits.minKey + rand.Int63n(limits.maxKey-limits.minKey))
+		keyID := limits.minKey + rand.Int63n(limits.maxKey-limits.minKey)
+		key := testKey(keyID)
 		timestamp := limits.minTimestamp.Add(rand.Int63n(limits.maxTimestamp.WallTime-limits.minTimestamp.WallTime), 0)
 		size := 256
 		if rng.Float64() < limits.tombstoneChance {
 			size = 0
 		}
-		value := MVCCValue{Value: roachpb.MakeValueFromBytes(randutil.RandBytes(rng, size))}
-		require.NoError(t, engine.PutMVCC(MVCCKey{Key: key, Timestamp: timestamp}, value), "Write data to test storage")
+
+		if limits.useRangeTombstones && size == 0 {
+			require.NoError(t, engine.PutRawMVCCRangeKey(MVCCRangeKey{
+				StartKey:  key,
+				EndKey:    testKey(keyID + 2),
+				Timestamp: timestamp}, []byte{}), "write data to test storage")
+		} else {
+			value := MVCCValue{Value: roachpb.MakeValueFromBytes(randutil.RandBytes(rng, size))}
+			require.NoError(t, engine.PutMVCC(MVCCKey{Key: key, Timestamp: timestamp}, value), "Write data to test storage")
+		}
 	}
 	require.NoError(t, engine.Flush(), "Flush engine data")
 }
@@ -6404,7 +6501,6 @@ func TestMVCCExportToSSTFailureIntentBatching(t *testing.T) {
 
 			require.NoError(t, fillInData(ctx, engine, data))
 
-			destination := &MemFile{}
 			_, _, err := MVCCExportToSST(ctx, st, engine, MVCCExportOptions{
 				StartKey:           MVCCKey{Key: key(10)},
 				EndKey:             key(20000),
@@ -6415,7 +6511,7 @@ func TestMVCCExportToSSTFailureIntentBatching(t *testing.T) {
 				MaxSize:            0,
 				MaxIntents:         uint64(MaxIntentsPerWriteIntentError.Default()),
 				StopMidKey:         false,
-			}, destination)
+			}, &bytes.Buffer{})
 			if len(expectedIntentIndices) == 0 {
 				require.NoError(t, err)
 			} else {
@@ -6493,7 +6589,6 @@ func TestMVCCExportToSSTSplitMidKey(t *testing.T) {
 					maxSize = keyValueSize * 2
 				}
 				for !resumeKey.Equal(MVCCKey{}) {
-					dest := &MemFile{}
 					_, resumeInfo, err := MVCCExportToSST(
 						ctx, st, engine, MVCCExportOptions{
 							StartKey:           resumeKey,
@@ -6504,7 +6599,7 @@ func TestMVCCExportToSSTSplitMidKey(t *testing.T) {
 							TargetSize:         1,
 							MaxSize:            maxSize,
 							StopMidKey:         test.stopMidKey,
-						}, dest)
+						}, &bytes.Buffer{})
 					require.NoError(t, err)
 					resumeKey = resumeInfo.ResumeKey
 					if !resumeKey.Timestamp.IsEmpty() {
@@ -6540,7 +6635,7 @@ func TestMVCCExportToSSTSErrorsOnLargeKV(t *testing.T) {
 			TargetSize:         1,
 			MaxSize:            1,
 			StopMidKey:         true,
-		}, &MemFile{})
+		}, &bytes.Buffer{})
 	require.Equal(t, int64(0), summary.DataSize)
 	expectedErr := &ExceedMaxSizeError{}
 	require.ErrorAs(t, err, &expectedErr)
@@ -6560,15 +6655,15 @@ func TestMVCCExportFingerprint(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 
 	fingerprint := func(opts MVCCExportOptions, engine Engine) (uint64, []byte, kvpb.BulkOpSummary, MVCCKey) {
-		dest := &MemFile{}
+		var dest bytes.Buffer
 		var err error
 		res, resumeInfo, fingerprint, hasRangeKeys, err := MVCCExportFingerprint(
-			ctx, st, engine, opts, dest)
+			ctx, st, engine, opts, &dest)
 		require.NoError(t, err)
 		if !hasRangeKeys {
-			dest = &MemFile{}
+			dest.Reset()
 		}
-		return fingerprint, dest.Data(), res, resumeInfo.ResumeKey
+		return fingerprint, dest.Bytes(), res, resumeInfo.ResumeKey
 	}
 
 	// verifyFingerprintAgainstOracle uses the `fingerprintOracle` to compute a
@@ -6814,10 +6909,10 @@ func (f *fingerprintOracle) getFingerprintAndRangeKeys(
 ) (uint64, []MVCCRangeKeyStack) {
 	t.Helper()
 
-	dest := &MemFile{}
-	_, _, err := MVCCExportToSST(ctx, f.st, f.engine, *f.opts, dest)
+	var dest bytes.Buffer
+	_, _, err := MVCCExportToSST(ctx, f.st, f.engine, *f.opts, &dest)
 	require.NoError(t, err)
-	return f.fingerprintPointKeys(t, dest.Data()), getRangeKeys(t, dest.Data())
+	return f.fingerprintPointKeys(t, dest.Bytes()), getRangeKeys(t, dest.Bytes())
 }
 
 func (f *fingerprintOracle) fingerprintPointKeys(t *testing.T, dataSST []byte) uint64 {

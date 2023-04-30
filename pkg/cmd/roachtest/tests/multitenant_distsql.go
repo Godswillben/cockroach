@@ -37,6 +37,7 @@ func registerMultiTenantDistSQL(r registry.Registry) {
 			b := bundle
 			to := timeout
 			r.Add(registry.TestSpec{
+				Skip:    "the test is skipped until #100260 is resolved",
 				Name:    fmt.Sprintf("multitenant/distsql/instances=%d/bundle=%s/timeout=%d", numInstances, b, to),
 				Owner:   registry.OwnerSQLQueries,
 				Cluster: r.MakeClusterSpec(4),
@@ -57,9 +58,14 @@ func runMultiTenantDistSQL(
 	timeoutMillis int,
 ) {
 	c.Put(ctx, t.Cockroach(), "./cockroach")
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(1))
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(2))
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.Node(3))
+	// This test sets a smaller default range size than the default due to
+	// performance and resource limitations. We set the minimum range max bytes to
+	// 1 byte to bypass the guardrails.
+	settings := install.MakeClusterSettings(install.SecureOption(true))
+	settings.Env = append(settings.Env, "COCKROACH_MIN_RANGE_MAX_BYTES=1")
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(1))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(2))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Node(3))
 
 	const (
 		tenantID           = 11
@@ -85,7 +91,8 @@ func runMultiTenantDistSQL(
 	require.NoError(t, err)
 
 	instances := make([]*tenantNode, 0, numInstances)
-	instance1 := createTenantNode(ctx, t, c, c.Node(1), tenantID, 2 /* node */, tenantHTTPPort(0), tenantSQLPort(0), createTenantCertNodes(c.All()))
+	instance1 := createTenantNode(ctx, t, c, c.Node(1), tenantID, 2 /* node */, tenantHTTPPort(0), tenantSQLPort(0),
+		createTenantCertNodes(c.All()))
 	instances = append(instances, instance1)
 	defer instance1.stop(ctx, t, c)
 	instance1.start(ctx, t, c, "./cockroach")

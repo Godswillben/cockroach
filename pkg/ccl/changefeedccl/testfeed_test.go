@@ -29,6 +29,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	pubsubv1 "cloud.google.com/go/pubsub/apiv1"
+	pb "cloud.google.com/go/pubsub/apiv1/pubsubpb"
+	"cloud.google.com/go/pubsub/pstest"
 	"github.com/Shopify/sarama"
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
@@ -45,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -59,6 +63,9 @@ import (
 	"github.com/cockroachdb/errors"
 	goparquet "github.com/fraugster/parquet-go"
 	"github.com/jackc/pgx/v4"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type sinklessFeedFactory struct {
@@ -299,7 +306,6 @@ func (e *externalConnectionFeedFactory) Feed(
 	createStmt.SinkURI = tree.NewStrVal(`external://` + randomExternalConnectionName)
 
 	return e.TestFeedFactory.Feed(createStmt.String(), args...)
-
 }
 
 func setURI(
@@ -459,10 +465,11 @@ func (f *jobFeed) Resume() error {
 
 // Details implements FeedJob interface.
 func (f *jobFeed) Details() (*jobspb.ChangefeedDetails, error) {
+	stmt := fmt.Sprintf(`
+SELECT payload FROM (%s)
+`, jobutils.InternalSystemJobsBaseQuery)
 	var payloadBytes []byte
-	if err := f.db.QueryRow(
-		`SELECT payload FROM system.jobs WHERE id=$1`, f.jobID,
-	).Scan(&payloadBytes); err != nil {
+	if err := f.db.QueryRow(stmt, f.jobID).Scan(&payloadBytes); err != nil {
 		return nil, errors.Wrapf(err, "Details for job %d", f.jobID)
 	}
 	var payload jobspb.Payload
@@ -474,10 +481,11 @@ func (f *jobFeed) Details() (*jobspb.ChangefeedDetails, error) {
 
 // HighWaterMark implements FeedJob interface.
 func (f *jobFeed) HighWaterMark() (hlc.Timestamp, error) {
+	stmt := fmt.Sprintf(`
+SELECT progress FROM (%s)
+`, jobutils.InternalSystemJobsBaseQuery)
 	var details []byte
-	if err := f.db.QueryRow(
-		`SELECT progress FROM system.jobs WHERE id=$1`, f.jobID,
-	).Scan(&details); err != nil {
+	if err := f.db.QueryRow(stmt, f.jobID).Scan(&details); err != nil {
 		return hlc.Timestamp{}, errors.Wrapf(err, "HighWaterMark for job %d", f.jobID)
 	}
 	var progress jobspb.Progress
@@ -676,18 +684,18 @@ func newDepInjector(srvs ...feedInjectable) *depInjector {
 			}
 
 		// Arrange for error reporting resumer to be used.
-		s.JobRegistry().(*jobs.Registry).TestingResumerCreationKnobs =
-			map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-				jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
-					f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
-					return &reportErrorResumer{
-						wrapped: raw,
-						jobFailed: func() {
-							f.jobFailed(f.FetchTerminalJobErr())
-						},
-					}
-				},
-			}
+		s.JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
+			jobspb.TypeChangefeed,
+			func(raw jobs.Resumer) jobs.Resumer {
+				f := di.getJobFeed(raw.(*changefeedResumer).job.ID())
+				return &reportErrorResumer{
+					wrapped: raw,
+					jobFailed: func() {
+						f.jobFailed(f.FetchTerminalJobErr())
+					},
+				}
+			},
+		)
 	}
 
 	return di
@@ -1055,7 +1063,12 @@ func (f *cloudFeedFactory) Feed(
 	// parquet format with a probability of 0.4. The rest of the time json is used
 	parquetPossible := true
 
+	explicitEnvelope := false
 	for _, opt := range createStmt.Options {
+		if string(opt.Key) == changefeedbase.OptEnvelope {
+			explicitEnvelope = true
+		}
+
 		if string(opt.Key) == changefeedbase.OptFormat {
 			parquetPossible = false
 			break
@@ -1084,7 +1097,7 @@ func (f *cloudFeedFactory) Feed(
 	}
 
 	feedDir := feedSubDir()
-	sinkURI := `nodelocal://0/` + feedDir
+	sinkURI := `nodelocal://1/` + feedDir
 	// TODO(dan): This is a pretty unsatisfying way to test that the uri passes
 	// through params it doesn't understand to ExternalStorage.
 	sinkURI += `?should_be=ignored`
@@ -1109,7 +1122,7 @@ func (f *cloudFeedFactory) Feed(
 		ss:             ss,
 		seenTrackerMap: make(map[string]struct{}),
 		dir:            feedDir,
-		isBare:         createStmt.Select != nil,
+		isBare:         createStmt.Select != nil && !explicitEnvelope,
 	}
 	if err := f.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
 		return nil, err
@@ -1341,7 +1354,7 @@ func (c *cloudFeed) appendParquetTestFeedMessages(
 
 		for k, v := range row {
 			if k == parquetCrdbEventTypeColName {
-				if string(v.([]byte)) == parquetEventDelete {
+				if string(v.([]byte)) == parquetEventDelete.DString().String() {
 					isDeleted = true
 				}
 				continue
@@ -1717,6 +1730,7 @@ func (s *fakeKafkaSink) Dial() error {
 				}
 				select {
 				case s.feedCh <- m:
+				case <-kafka.stopWorkerCh:
 				case <-s.tg.done:
 				}
 				return nil
@@ -2024,11 +2038,18 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 		return &notifyFlushSink{Sink: s, sync: ss}
 	}
 
+	explicitEnvelope := false
+	for _, opt := range createStmt.Options {
+		if string(opt.Key) == changefeedbase.OptEnvelope {
+			explicitEnvelope = true
+		}
+	}
+
 	c := &webhookFeed{
 		jobFeed:        newJobFeed(f.jobsTableConn(), wrapSink),
 		seenTrackerMap: make(map[string]struct{}),
 		ss:             ss,
-		isBare:         createStmt.Select != nil,
+		isBare:         createStmt.Select != nil && !explicitEnvelope,
 		mockSink:       sinkDest,
 	}
 	if err := f.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
@@ -2190,15 +2211,14 @@ func (f *webhookFeed) Close() error {
 
 type mockPubsubMessage struct {
 	data string
-	// TODO: implement error injection
-	// err error
 }
-type mockPubsubMessageBuffer struct {
+
+type deprecatedMockPubsubMessageBuffer struct {
 	mu   syncutil.Mutex
 	rows []mockPubsubMessage
 }
 
-func (p *mockPubsubMessageBuffer) pop() *mockPubsubMessage {
+func (p *deprecatedMockPubsubMessageBuffer) pop() *mockPubsubMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.rows) == 0 {
@@ -2209,63 +2229,134 @@ func (p *mockPubsubMessageBuffer) pop() *mockPubsubMessage {
 	return &head
 }
 
-func (p *mockPubsubMessageBuffer) push(m mockPubsubMessage) {
+func (p *deprecatedMockPubsubMessageBuffer) push(m mockPubsubMessage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.rows = append(p.rows, m)
 }
 
-type fakePubsubClient struct {
-	buffer *mockPubsubMessageBuffer
+type deprecatedFakePubsubClient struct {
+	buffer *deprecatedMockPubsubMessageBuffer
 }
 
-var _ pubsubClient = (*fakePubsubClient)(nil)
+var _ deprecatedPubsubClient = (*deprecatedFakePubsubClient)(nil)
 
-func (p *fakePubsubClient) init() error {
+func (p *deprecatedFakePubsubClient) init() error {
 	return nil
 }
 
-func (p *fakePubsubClient) closeTopics() {
+func (p *deprecatedFakePubsubClient) closeTopics() {
 }
 
 // sendMessage sends a message to the topic
-func (p *fakePubsubClient) sendMessage(m []byte, _ string, _ string) error {
+func (p *deprecatedFakePubsubClient) sendMessage(m []byte, _ string, _ string) error {
 	message := mockPubsubMessage{data: string(m)}
 	p.buffer.push(message)
 	return nil
 }
 
-func (p *fakePubsubClient) sendMessageToAllTopics(m []byte) error {
+func (p *deprecatedFakePubsubClient) sendMessageToAllTopics(m []byte) error {
 	message := mockPubsubMessage{data: string(m)}
 	p.buffer.push(message)
 	return nil
 }
 
-func (p *fakePubsubClient) flushTopics() {
+func (p *deprecatedFakePubsubClient) flushTopics() {
 }
 
-type fakePubsubSink struct {
+type deprecatedFakePubsubSink struct {
 	Sink
-	client *fakePubsubClient
+	client *deprecatedFakePubsubClient
 	sync   *sinkSynchronizer
 }
 
-var _ Sink = (*fakePubsubSink)(nil)
+var _ Sink = (*deprecatedFakePubsubSink)(nil)
 
-func (p *fakePubsubSink) Dial() error {
-	s := p.Sink.(*pubsubSink)
+func (p *deprecatedFakePubsubSink) Dial() error {
+	s := p.Sink.(*deprecatedPubsubSink)
 	s.client = p.client
 	s.setupWorkers()
 	return nil
 }
 
-func (p *fakePubsubSink) Flush(ctx context.Context) error {
+func (p *deprecatedFakePubsubSink) Flush(ctx context.Context) error {
 	defer p.sync.addFlush()
 	return p.Sink.Flush(ctx)
 }
 
-func (p *fakePubsubClient) connectivityErrorLocked() error {
+func (p *deprecatedFakePubsubClient) connectivityErrorLocked() error {
 	return nil
+}
+
+type fakePubsubServer struct {
+	srv *pstest.Server
+	mu  struct {
+		syncutil.Mutex
+		buffer []mockPubsubMessage
+		notify chan struct{}
+	}
+}
+
+func makeFakePubsubServer() *fakePubsubServer {
+	mockServer := fakePubsubServer{}
+	mockServer.mu.buffer = make([]mockPubsubMessage, 0)
+	mockServer.srv = pstest.NewServer(pstest.ServerReactorOption{
+		FuncName: "Publish",
+		Reactor:  &mockServer,
+	})
+	return &mockServer
+}
+
+var _ pstest.Reactor = (*fakePubsubServer)(nil)
+
+func (ps *fakePubsubServer) React(req interface{}) (handled bool, ret interface{}, err error) {
+	publishReq, ok := req.(*pb.PublishRequest)
+	if ok {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+		for _, msg := range publishReq.Messages {
+			ps.mu.buffer = append(ps.mu.buffer, mockPubsubMessage{data: string(msg.Data)})
+		}
+		if ps.mu.notify != nil {
+			notifyCh := ps.mu.notify
+			ps.mu.notify = nil
+			close(notifyCh)
+		}
+	}
+
+	return false, nil, nil
+}
+
+func (s *fakePubsubServer) NotifyMessage() chan struct{} {
+	c := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.mu.buffer) > 0 {
+		close(c)
+	} else {
+		s.mu.notify = c
+	}
+	return c
+}
+
+func (ps *fakePubsubServer) Dial() (*grpc.ClientConn, error) {
+	return grpc.Dial(ps.srv.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+func (ps *fakePubsubServer) Pop() *mockPubsubMessage {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if len(ps.mu.buffer) == 0 {
+		return nil
+	}
+	var head mockPubsubMessage
+	head, ps.mu.buffer = ps.mu.buffer[0], ps.mu.buffer[1:]
+	return &head
+}
+
+func (ps *fakePubsubServer) Close() error {
+	ps.srv.Wait()
+	return ps.srv.Close()
 }
 
 type pubsubFeedFactory struct {
@@ -2277,6 +2368,17 @@ var _ cdctest.TestFeedFactory = (*pubsubFeedFactory)(nil)
 // makePubsubFeedFactory returns a TestFeedFactory implementation using the `pubsub` uri.
 func makePubsubFeedFactory(srvOrCluster interface{}, db *gosql.DB) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
+
+	switch t := srvOrCluster.(type) {
+	case serverutils.TestTenantInterface:
+		t.DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).PubsubClientSkipClientCreation = true
+	case serverutils.TestClusterInterface:
+		servers := make([]feedInjectable, t.NumServers())
+		for i := range servers {
+			t.Server(i).DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).PubsubClientSkipClientCreation = true
+		}
+	}
+
 	return &pubsubFeedFactory{
 		enterpriseFeedFactory: enterpriseFeedFactory{
 			s:  s,
@@ -2298,34 +2400,47 @@ func (p *pubsubFeedFactory) Feed(create string, args ...interface{}) (cdctest.Te
 	if err != nil {
 		return nil, err
 	}
-	ss := &sinkSynchronizer{}
 
-	client := &fakePubsubClient{
-		buffer: &mockPubsubMessageBuffer{
+	mockServer := makeFakePubsubServer()
+
+	deprecatedClient := &deprecatedFakePubsubClient{
+		buffer: &deprecatedMockPubsubMessageBuffer{
 			rows: make([]mockPubsubMessage, 0),
 		},
 	}
 
+	ss := &sinkSynchronizer{}
+	var mu syncutil.Mutex
 	wrapSink := func(s Sink) Sink {
-		return &fakePubsubSink{
-			Sink:   s,
-			client: client,
-			sync:   ss,
+		mu.Lock() // Called concurrently due to getEventSink and getResolvedTimestampSink
+		defer mu.Unlock()
+		if batchingSink, ok := s.(*batchingSink); ok {
+			if sinkClient, ok := batchingSink.client.(*pubsubSinkClient); ok {
+				conn, _ := mockServer.Dial()
+				mockClient, _ := pubsubv1.NewPublisherClient(context.Background(), option.WithGRPCConn(conn))
+				sinkClient.client = mockClient
+			}
+			return &notifyFlushSink{Sink: s, sync: ss}
+		} else if _, ok := s.(*deprecatedPubsubSink); ok {
+			return &deprecatedFakePubsubSink{
+				Sink:   s,
+				client: deprecatedClient,
+				sync:   ss,
+			}
 		}
+		return s
 	}
 
 	c := &pubsubFeed{
-		jobFeed:        newJobFeed(p.jobsTableConn(), wrapSink),
-		seenTrackerMap: make(map[string]struct{}),
-		ss:             ss,
-		client:         client,
+		jobFeed:          newJobFeed(p.jobsTableConn(), wrapSink),
+		seenTrackerMap:   make(map[string]struct{}),
+		ss:               ss,
+		mockServer:       mockServer,
+		deprecatedClient: deprecatedClient,
 	}
 
 	if err := p.startFeedJob(c.jobFeed, createStmt.String(), args...); err != nil {
-		return nil, err
-	}
-
-	if err != nil {
+		_ = mockServer.Close()
 		return nil, err
 	}
 	return c, nil
@@ -2339,8 +2454,9 @@ func (p *pubsubFeedFactory) Server() serverutils.TestTenantInterface {
 type pubsubFeed struct {
 	*jobFeed
 	seenTrackerMap
-	ss     *sinkSynchronizer
-	client *fakePubsubClient
+	ss               *sinkSynchronizer
+	mockServer       *fakePubsubServer
+	deprecatedClient *deprecatedFakePubsubClient
 }
 
 var _ cdctest.TestFeed = (*pubsubFeed)(nil)
@@ -2375,7 +2491,10 @@ func extractJSONMessagePubsub(wrapped []byte) (value []byte, key []byte, topic s
 // Next implements TestFeed
 func (p *pubsubFeed) Next() (*cdctest.TestFeedMessage, error) {
 	for {
-		msg := p.client.buffer.pop()
+		msg := p.mockServer.Pop()
+		if msg == nil {
+			msg = p.deprecatedClient.buffer.pop()
+		}
 		if msg != nil {
 			details, err := p.Details()
 			if err != nil {
@@ -2418,6 +2537,8 @@ func (p *pubsubFeed) Next() (*cdctest.TestFeedMessage, error) {
 					return ctx.Err()
 				case <-p.ss.eventReady():
 					return nil
+				case <-p.mockServer.NotifyMessage():
+					return nil
 				case <-p.shutdown:
 					return p.terminalJobError()
 				}
@@ -2434,6 +2555,7 @@ func (p *pubsubFeed) Close() error {
 	if err != nil {
 		return err
 	}
+	_ = p.mockServer.Close()
 	return nil
 }
 

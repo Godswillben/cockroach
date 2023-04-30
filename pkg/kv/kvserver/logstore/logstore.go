@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -38,7 +39,7 @@ import (
 )
 
 var disableSyncRaftLog = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.raft_log.disable_synchronization_unsafe",
 	"set to true to disable synchronization on Raft log writes to persistent storage. "+
 		"Setting to true risks data loss or data corruption on server crashes. "+
@@ -47,7 +48,7 @@ var disableSyncRaftLog = settings.RegisterBoolSetting(
 )
 
 var enableNonBlockingRaftLogSync = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.raft_log.non_blocking_synchronization.enabled",
 	"set to true to enable non-blocking synchronization on Raft log writes to "+
 		"persistent storage. Setting to true does not risk data loss or data corruption "+
@@ -68,8 +69,8 @@ func MakeMsgStorageAppend(m raftpb.Message) MsgStorageAppend {
 
 // RaftState stores information about the last entry and the size of the log.
 type RaftState struct {
-	LastIndex uint64
-	LastTerm  uint64
+	LastIndex kvpb.RaftIndex
+	LastTerm  kvpb.RaftTerm
 	ByteSize  int64
 }
 
@@ -119,7 +120,7 @@ type SyncCallback interface {
 func newStoreEntriesBatch(eng storage.Engine) storage.Batch {
 	// Use an unindexed batch because we don't need to read our writes, and
 	// it is more efficient.
-	return eng.NewUnindexedBatch(false /* writeOnly */)
+	return eng.NewUnindexedBatch()
 }
 
 // StoreEntries persists newly appended Raft log Entries to the log storage,
@@ -161,7 +162,7 @@ func (s *LogStore) storeEntriesAndCommitBatch(
 	prevLastIndex := state.LastIndex
 	overwriting := false
 	if len(m.Entries) > 0 {
-		firstPurge := m.Entries[0].Index // first new entry written
+		firstPurge := kvpb.RaftIndex(m.Entries[0].Index) // first new entry written
 		overwriting = firstPurge <= prevLastIndex
 		stats.Begin = timeutil.Now()
 		// All of the entries are appended to distinct keys, returning a new
@@ -283,8 +284,8 @@ func (s *LogStore) storeEntriesAndCommitBatch(
 		// entries that we didn't overwrite). Remove any such leftover on-disk
 		// payloads (we can do that now because we've committed the deletion
 		// just above).
-		firstPurge := m.Entries[0].Index // first new entry written
-		purgeTerm := m.Entries[0].Term - 1
+		firstPurge := kvpb.RaftIndex(m.Entries[0].Index) // first new entry written
+		purgeTerm := kvpb.RaftTerm(m.Entries[0].Term - 1)
 		lastPurge := prevLastIndex // old end of the log, include in deletion
 		purgedSize, err := maybePurgeSideloaded(ctx, s.Sideload, firstPurge, lastPurge, purgeTerm)
 		if err != nil {
@@ -374,14 +375,14 @@ func logAppend(
 	defer valPool.Put(value)
 	for i := range entries {
 		ent := &entries[i]
-		key := keys.RaftLogKeyFromPrefix(raftLogPrefix, ent.Index)
+		key := keys.RaftLogKeyFromPrefix(raftLogPrefix, kvpb.RaftIndex(ent.Index))
 
 		if err := value.SetProto(ent); err != nil {
 			return RaftState{}, err
 		}
 		value.InitChecksum(key)
 		var err error
-		if ent.Index > prev.LastIndex {
+		if kvpb.RaftIndex(ent.Index) > prev.LastIndex {
 			err = storage.MVCCBlindPut(ctx, rw, &diff, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, *value, nil /* txn */)
 		} else {
 			err = storage.MVCCPut(ctx, rw, &diff, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, *value, nil /* txn */)
@@ -391,7 +392,7 @@ func logAppend(
 		}
 	}
 
-	newLastIndex := entries[len(entries)-1].Index
+	newLastIndex := kvpb.RaftIndex(entries[len(entries)-1].Index)
 	// Delete any previously appended log entries which never committed.
 	if prev.LastIndex > 0 {
 		for i := newLastIndex + 1; i <= prev.LastIndex; i++ {
@@ -406,7 +407,7 @@ func logAppend(
 	}
 	return RaftState{
 		LastIndex: newLastIndex,
-		LastTerm:  entries[len(entries)-1].Term,
+		LastTerm:  kvpb.RaftTerm(entries[len(entries)-1].Term),
 		ByteSize:  prev.ByteSize + diff.SysBytes,
 	}, nil
 }
@@ -419,11 +420,11 @@ func LoadTerm(
 	eng storage.Engine,
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
-	index uint64,
-) (uint64, error) {
+	index kvpb.RaftIndex,
+) (kvpb.RaftTerm, error) {
 	entry, found := eCache.Get(rangeID, index)
 	if found {
-		return entry.Term, nil
+		return kvpb.RaftTerm(entry.Term), nil
 	}
 
 	reader := eng.NewReadOnly(storage.StandardDurability)
@@ -442,7 +443,7 @@ func LoadTerm(
 
 	if found {
 		// Found an entry. Double-check that it has a correct index.
-		if got, want := entry.Index, index; got != want {
+		if got, want := kvpb.RaftIndex(entry.Index), index; got != want {
 			return 0, errors.Errorf("there is a gap at index %d, found entry #%d", want, got)
 		}
 		// Cache the entry except if it is sideloaded. We don't load/inline the
@@ -456,7 +457,7 @@ func LoadTerm(
 		if !typ.IsSideloaded() {
 			eCache.Add(rangeID, []raftpb.Entry{entry}, false /* truncate */)
 		}
-		return entry.Term, nil
+		return kvpb.RaftTerm(entry.Term), nil
 	}
 	// Otherwise, the entry at the given index is not found. This can happen if
 	// the index is ahead of lastIndex, or it has been compacted away.
@@ -495,10 +496,11 @@ func LoadEntries(
 	rangeID roachpb.RangeID,
 	eCache *raftentry.Cache,
 	sideloaded SideloadStorage,
-	lo, hi, maxBytes uint64,
-) ([]raftpb.Entry, error) {
+	lo, hi kvpb.RaftIndex,
+	maxBytes uint64,
+) (_ []raftpb.Entry, _cachedSize uint64, _loadedSize uint64, _ error) {
 	if lo > hi {
-		return nil, errors.Errorf("lo:%d is greater than hi:%d", lo, hi)
+		return nil, 0, 0, errors.Errorf("lo:%d is greater than hi:%d", lo, hi)
 	}
 
 	n := hi - lo
@@ -507,13 +509,15 @@ func LoadEntries(
 	}
 	ents := make([]raftpb.Entry, 0, n)
 
-	ents, size, hitIndex, exceededMaxBytes := eCache.Scan(ents, rangeID, lo, hi, maxBytes)
+	ents, cachedSize, hitIndex, exceededMaxBytes := eCache.Scan(ents, rangeID, lo, hi, maxBytes)
 
 	// Return results if the correct number of results came back or if
 	// we ran into the max bytes limit.
-	if uint64(len(ents)) == hi-lo || exceededMaxBytes {
-		return ents, nil
+	if kvpb.RaftIndex(len(ents)) == hi-lo || exceededMaxBytes {
+		return ents, cachedSize, 0, nil
 	}
+
+	combinedSize := cachedSize // size tracks total size of ents.
 
 	// Scan over the log to find the requested entries in the range [lo, hi),
 	// stopping once we have enough.
@@ -521,7 +525,7 @@ func LoadEntries(
 
 	scanFunc := func(ent raftpb.Entry) error {
 		// Exit early if we have any gaps or it has been compacted.
-		if ent.Index != expectedIndex {
+		if kvpb.RaftIndex(ent.Index) != expectedIndex {
 			return iterutil.StopIteration()
 		}
 		expectedIndex++
@@ -543,8 +547,8 @@ func LoadEntries(
 		}
 
 		// Note that we track the size of proposals with payloads inlined.
-		size += uint64(ent.Size())
-		if size > maxBytes {
+		combinedSize += uint64(ent.Size())
+		if combinedSize > maxBytes {
 			exceededMaxBytes = true
 			if len(ents) == 0 { // make sure to return at least one entry
 				ents = append(ents, ent)
@@ -559,18 +563,18 @@ func LoadEntries(
 	reader := eng.NewReadOnly(storage.StandardDurability)
 	defer reader.Close()
 	if err := raftlog.Visit(reader, rangeID, expectedIndex, hi, scanFunc); err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	eCache.Add(rangeID, ents, false /* truncate */)
 
 	// Did the correct number of results come back? If so, we're all good.
-	if uint64(len(ents)) == hi-lo {
-		return ents, nil
+	if kvpb.RaftIndex(len(ents)) == hi-lo {
+		return ents, cachedSize, combinedSize - cachedSize, nil
 	}
 
 	// Did we hit the size limit? If so, return what we have.
 	if exceededMaxBytes {
-		return ents, nil
+		return ents, cachedSize, combinedSize - cachedSize, nil
 	}
 
 	// Did we get any results at all? Because something went wrong.
@@ -578,25 +582,25 @@ func LoadEntries(
 		// Was the missing index after the last index?
 		lastIndex, err := rsl.LoadLastIndex(ctx, reader)
 		if err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
 		if lastIndex <= expectedIndex {
-			return nil, raft.ErrUnavailable
+			return nil, 0, 0, raft.ErrUnavailable
 		}
 
 		// We have a gap in the record, if so, return a nasty error.
-		return nil, errors.Errorf("there is a gap in the index record between lo:%d and hi:%d at index:%d", lo, hi, expectedIndex)
+		return nil, 0, 0, errors.Errorf("there is a gap in the index record between lo:%d and hi:%d at index:%d", lo, hi, expectedIndex)
 	}
 
 	// No results, was it due to unavailability or truncation?
 	ts, err := rsl.LoadRaftTruncatedState(ctx, reader)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	if ts.Index >= lo {
 		// The requested lo index has already been truncated.
-		return nil, raft.ErrCompacted
+		return nil, 0, 0, raft.ErrCompacted
 	}
 	// The requested lo index does not yet exist.
-	return nil, raft.ErrUnavailable
+	return nil, 0, 0, raft.ErrUnavailable
 }

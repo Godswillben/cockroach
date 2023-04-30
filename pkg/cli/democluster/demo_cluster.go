@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils/regionlatency"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -113,7 +114,7 @@ const demoOrg = "Cockroach Demo"
 const demoUsername = "demo"
 
 // demoTenantName is the name of the demo tenant.
-const demoTenantName = "demo-tenant"
+const demoTenantName = "demoapp"
 
 // LoggerFn is the type of a logger function to use by the
 // demo cluster to report special events.
@@ -883,11 +884,12 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		StoreSpecs:              []base.StoreSpec{storeSpec},
 		SQLMemoryPoolSize:       demoCtx.SQLPoolMemorySize,
 		CacheSize:               demoCtx.CacheSize,
+		AutoConfigProvider:      demoCtx.AutoConfigProvider,
 		NoAutoInitializeCluster: true,
 		EnableDemoLoginEndpoint: true,
 		// Demo clusters by default will create their own tenants, so we
 		// don't need to create them here.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
@@ -946,7 +948,12 @@ func TestingForceRandomizeDemoPorts() func() {
 }
 
 func (c *transientCluster) Close(ctx context.Context) {
-	if err := c.saveWebSessions(ctx); err != nil {
+	if err := contextutil.RunWithTimeout(ctx, "save-web-sessions", 10*time.Second, func(ctx context.Context) error {
+		if err := c.saveWebSessions(ctx); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		c.warnLog(ctx, "unable to save web sessions: %v", err)
 	}
 	if c.stopper != nil {

@@ -125,8 +125,8 @@ type StoreTestingKnobs struct {
 	// should get rid of such practices once we make TestServer take a
 	// ManualClock.
 	DisableMaxOffsetCheck bool
-	// DisableAutomaticLeaseRenewal enables turning off the background worker
-	// that attempts to automatically renew expiration-based leases.
+	// DisableAutomaticLeaseRenewal disables eager renewal of expiration-based
+	// leases.
 	DisableAutomaticLeaseRenewal bool
 	// LeaseRequestEvent, if set, is called when replica.requestLeaseLocked() is
 	// called to acquire a new lease. This can be used to assert that a request
@@ -241,7 +241,7 @@ type StoreTestingKnobs struct {
 	// of Raft group ticks.
 	RefreshReasonTicksPeriod int
 	// DisableProcessRaft disables the process raft loop.
-	DisableProcessRaft bool
+	DisableProcessRaft func(roachpb.StoreID) bool
 	// DisableLastProcessedCheck disables checking on replica queue last processed times.
 	DisableLastProcessedCheck bool
 	// ReplicateQueueAcceptsUnsplit allows the replication queue to
@@ -389,14 +389,6 @@ type StoreTestingKnobs struct {
 	// acquire any locks in this method.
 	OnRaftTimeoutCampaign func(roachpb.RangeID)
 
-	// LeaseRenewalSignalChan populates `Store.renewableLeasesSignal`.
-	LeaseRenewalSignalChan chan struct{}
-	// LeaseRenewalOnPostCycle is invoked after each lease renewal cycle.
-	LeaseRenewalOnPostCycle func()
-	// LeaseRenewalDurationOverride replaces the timer duration for proactively
-	// renewing expiration based leases.
-	LeaseRenewalDurationOverride time.Duration
-
 	// RangefeedValueHeaderFilter, if set, is invoked before each value emitted on
 	// the rangefeed, be it in steady state or during the catch-up scan.
 	//
@@ -471,6 +463,9 @@ type StoreTestingKnobs struct {
 	// DisableMergeWaitForReplicasInit skips the waitForReplicasInit calls
 	// during merges. Useful for testContext tests that want to use merges.
 	DisableMergeWaitForReplicasInit bool
+
+	// RangeLeaseAcquireTimeoutOverride overrides RaftConfig.RangeLeaseAcquireTimeout().
+	RangeLeaseAcquireTimeoutOverride time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

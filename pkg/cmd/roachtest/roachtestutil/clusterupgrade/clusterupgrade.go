@@ -133,7 +133,7 @@ func InstallFixtures(
 		}
 	}
 	// Extract fixture. Fail if there's already an LSM in the store dir.
-	c.Run(ctx, nodes, "cd {store-dir} && [ ! -f {store-dir}/CURRENT ] && tar -xf fixture.tgz")
+	c.Run(ctx, nodes, "ls {store-dir}/marker.* 1> /dev/null 2>&1 && exit 1 || (cd {store-dir} && tar -xf fixture.tgz)")
 	return nil
 }
 
@@ -146,9 +146,9 @@ func StartWithBinary(
 	nodes option.NodeListOption,
 	binaryPath string,
 	startOpts option.StartOpts,
-) {
+) error {
 	settings := install.MakeClusterSettings(install.BinaryOption(binaryPath))
-	c.Start(ctx, l, startOpts, settings, nodes)
+	return c.StartE(ctx, l, startOpts, settings, nodes)
 }
 
 // BinaryPathFromVersion shows where the binary for the given version
@@ -200,7 +200,9 @@ func RestartNodesWithNewBinary(
 		if err != nil {
 			return err
 		}
-		StartWithBinary(ctx, l, c, c.Node(node), binary, startOpts)
+		if err := StartWithBinary(ctx, l, c, c.Node(node), binary, startOpts); err != nil {
+			return err
+		}
 
 		// We have seen cases where a transient error could occur when this
 		// newly upgraded node serves as a gateway for a distributed query due
@@ -230,7 +232,7 @@ func WaitForClusterUpgrade(
 
 	l.Printf("waiting for cluster to auto-upgrade to %s", newVersion)
 	for _, node := range nodes {
-		err := retry.ForDuration(5*time.Minute, func() error {
+		err := retry.ForDuration(10*time.Minute, func() error {
 			currentVersion, err := ClusterVersion(ctx, dbFunc(node))
 			if err != nil {
 				return err

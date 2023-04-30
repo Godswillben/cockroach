@@ -19,10 +19,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
@@ -484,7 +486,7 @@ func (u Updater) PauseRequestedWithFunc(
 			return fmt.Errorf("job with status %s cannot be requested to be paused", md.Status)
 		}
 		if fn != nil {
-			execCtx, cleanup := u.j.registry.execCtx("pause request", md.Payload.UsernameProto.Decode())
+			execCtx, cleanup := u.j.registry.execCtx(ctx, "pause request", md.Payload.UsernameProto.Decode())
 			defer cleanup()
 			if err := fn(ctx, execCtx, txn, md.Progress); err != nil {
 				return err
@@ -720,11 +722,6 @@ func (j *Job) FractionCompleted() float32 {
 	return progress.GetFractionCompleted()
 }
 
-// GetInternalDB returns the internal executor factory.
-func (j *Job) GetInternalDB() isql.DB {
-	return j.registry.internalDB
-}
-
 // MarkIdle marks the job as Idle.  Idleness should not be toggled frequently
 // (no more than ~twice a minute) as the action is logged.
 func (j *Job) MarkIdle(isIdle bool) {
@@ -750,9 +747,81 @@ func HasJobNotFoundError(err error) bool {
 	return errors.HasType(err, (*JobNotFoundError)(nil))
 }
 
+func (j *Job) loadJobPayloadAndProgress(
+	ctx context.Context, st *cluster.Settings, txn isql.Txn,
+) (*jobspb.Payload, *jobspb.Progress, error) {
+	if txn == nil {
+		return nil, nil, errors.New("cannot load job payload and progress with a nil txn")
+	}
+
+	payload := &jobspb.Payload{}
+	progress := &jobspb.Progress{}
+	if st.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		infoStorage := j.InfoStorage(txn)
+
+		payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get payload for job %d", j.ID())
+		}
+		if !exists {
+			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job payload not found in system.job_info")
+		}
+		if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+			return nil, nil, err
+		}
+
+		progressBytes, exists, err := infoStorage.GetLegacyProgress(ctx)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get progress for job %d", j.ID())
+		}
+		if !exists {
+			return nil, nil, errors.Wrap(&JobNotFoundError{jobID: j.ID()}, "job progress not found in system.job_info")
+		}
+		if err := protoutil.Unmarshal(progressBytes, progress); err != nil {
+			return nil, nil, &JobNotFoundError{jobID: j.ID()}
+		}
+
+		return payload, progress, nil
+	}
+
+	// If V23_1JobInfoTableIsBackfilled is not active we should read the payload
+	// and progress from the system.jobs table.
+	const (
+		queryNoSessionID   = "SELECT payload, progress FROM system.jobs WHERE id = $1"
+		queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
+	)
+	sess := sessiondata.RootUserSessionDataOverride
+
+	var err error
+	var row tree.Datums
+	if j.session == nil {
+		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
+			queryNoSessionID, j.ID())
+	} else {
+		row, err = txn.QueryRowEx(ctx, "load-job-payload-progress-query", txn.KV(), sess,
+			queryWithSessionID, j.ID(), j.session.ID().UnsafeBytes())
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if row == nil {
+		return nil, nil, &JobNotFoundError{jobID: j.ID()}
+	}
+	payload, err = UnmarshalPayload(row[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	progress, err = UnmarshalProgress(row[1])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return payload, progress, nil
+}
+
 func (u Updater) load(ctx context.Context) (retErr error) {
 	if u.txn == nil {
-		return u.j.registry.internalDB.Txn(ctx, func(
+		return u.j.registry.db.Txn(ctx, func(
 			ctx context.Context, txn isql.Txn,
 		) error {
 			u.txn = txn
@@ -780,7 +849,7 @@ func (u Updater) load(ctx context.Context) (retErr error) {
 	}()
 
 	const (
-		queryNoSessionID   = "SELECT payload, progress, created_by_type, created_by_id, status FROM system.jobs WHERE id = $1"
+		queryNoSessionID   = "SELECT created_by_type, created_by_id, status FROM system.jobs WHERE id = $1"
 		queryWithSessionID = queryNoSessionID + " AND claim_session_id = $2"
 	)
 	sess := sessiondata.RootUserSessionDataOverride
@@ -800,19 +869,16 @@ func (u Updater) load(ctx context.Context) (retErr error) {
 	if row == nil {
 		return &JobNotFoundError{jobID: j.ID()}
 	}
-	payload, err = UnmarshalPayload(row[0])
+	createdBy, err = unmarshalCreatedBy(row[0], row[1])
 	if err != nil {
 		return err
 	}
-	progress, err = UnmarshalProgress(row[1])
+	status, err = unmarshalStatus(row[2])
 	if err != nil {
 		return err
 	}
-	createdBy, err = unmarshalCreatedBy(row[2], row[3])
-	if err != nil {
-		return err
-	}
-	status, err = unmarshalStatus(row[4])
+
+	payload, progress, err = j.loadJobPayloadAndProgress(ctx, j.registry.settings, u.txn)
 	return err
 }
 
@@ -906,8 +972,10 @@ func (sj *StartableJob) Start(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot resume %T job which is not committed", sj.resumer)
 	}
 
-	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(ctx context.Context) {
-		sj.execErr = sj.registry.runJob(sj.resumerCtx, sj.resumer, sj.Job, StatusRunning, sj.taskName())
+	if err := sj.registry.stopper.RunAsyncTask(ctx, sj.taskName(), func(_ context.Context) {
+		resumeCtx, cancel := sj.registry.stopper.WithCancelOnQuiesce(sj.resumerCtx)
+		defer cancel()
+		sj.execErr = sj.registry.runJob(resumeCtx, sj.resumer, sj.Job, StatusRunning, sj.taskName())
 		close(sj.execDone)
 	}); err != nil {
 		return err

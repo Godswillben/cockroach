@@ -30,8 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -236,7 +238,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 }
 
-func mustParseOne(s string) parser.Statement {
+func mustParseOne(s string) statements.Statement[tree.Statement] {
 	stmts, err := parser.Parse(s)
 	if err != nil {
 		log.Fatalf(context.Background(), "%v", err)
@@ -261,7 +263,14 @@ func mustParseOne(s string) parser.Statement {
 // need to read from it.
 func startConnExecutor(
 	ctx context.Context,
-) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
+) (
+	*StmtBuf,
+	<-chan []*streamingCommandResult,
+	<-chan error,
+	*stop.Stopper,
+	ieResultReader,
+	error,
+) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
 	clock := hlc.NewClockForTesting(nil)
@@ -338,10 +347,10 @@ func startConnExecutor(
 
 	s := NewServer(cfg, pool)
 	buf := NewStmtBuf()
-	syncResults := make(chan []resWithPos, 1)
+	syncResults := make(chan []*streamingCommandResult, 1)
 	resultChannel := newAsyncIEResultChannel()
 	var cc ClientComm = &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			syncResults <- res
 		},
 		w: resultChannel,
@@ -378,9 +387,9 @@ func TestSessionCloseWithPendingTempTableInTxn(t *testing.T) {
 
 	srv := s.SQLServer().(*Server)
 	stmtBuf := NewStmtBuf()
-	flushed := make(chan []resWithPos)
+	flushed := make(chan []*streamingCommandResult)
 	clientComm := &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			flushed <- res
 		},
 	}

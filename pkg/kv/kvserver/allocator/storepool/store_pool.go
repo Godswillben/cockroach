@@ -47,7 +47,7 @@ const (
 // replicate queue will not consider stores which have failed a reservation a
 // viable target.
 var FailedReservationsTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"server.failed_reservation_timeout",
 	"the amount of time to consider the store throttled for up-replication after a failed reservation call",
 	5*time.Second,
@@ -59,7 +59,7 @@ const timeAfterStoreSuspectSettingName = "server.time_after_store_suspect"
 // TimeAfterStoreSuspect measures how long we consider a store suspect since
 // it's last failure.
 var TimeAfterStoreSuspect = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	timeAfterStoreSuspectSettingName,
 	"the amount of time we consider a store suspect for after it fails a node liveness heartbeat."+
 		" A suspect node would not receive any new replicas or lease transfers, but will keep the replicas it has.",
@@ -260,6 +260,16 @@ func (sd *StoreDetail) status(
 	//         +-------------------------+    Successful liveness
 	//                                        heartbeat
 	//
+
+	// The store is considered dead if it hasn't been updated via gossip
+	// within the liveness threshold. Note that LastUpdatedTime is set
+	// when the store detail is created and will have a non-zero value
+	// even before the first gossip arrives for a store.
+	deadAsOf := sd.LastUpdatedTime.Add(deadThreshold)
+	if now.After(deadAsOf) {
+		sd.LastUnavailable = now
+		return storeStatusDead
+	}
 	// If there's no descriptor (meaning no gossip ever arrived for this
 	// store), return unavailable.
 	if sd.Desc == nil {
@@ -1062,9 +1072,7 @@ type StoreList struct {
 func MakeStoreList(descriptors []roachpb.StoreDescriptor) StoreList {
 	sl := StoreList{Stores: descriptors}
 	for _, desc := range descriptors {
-		if allocator.MaxCapacityCheck(desc) {
-			sl.CandidateRanges.update(float64(desc.Capacity.RangeCount))
-		}
+		sl.CandidateRanges.update(float64(desc.Capacity.RangeCount))
 		sl.CandidateLeases.update(float64(desc.Capacity.LeaseCount))
 		sl.candidateLogicalBytes.update(float64(desc.Capacity.LogicalBytes))
 		sl.CandidateQueriesPerSecond.update(desc.Capacity.QueriesPerSecond)

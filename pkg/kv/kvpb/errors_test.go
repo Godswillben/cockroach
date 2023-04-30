@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -53,7 +54,7 @@ func TestNewErrorNil(t *testing.T) {
 // TestSetTxn verifies that SetTxn updates the error message.
 func TestSetTxn(t *testing.T) {
 	e := NewError(NewTransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND))
-	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 1, hlc.Timestamp{}, 0, 99)
+	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), isolation.Serializable, 1, hlc.Timestamp{}, 0, 99)
 	e.SetTxn(&txn)
 	if !strings.HasPrefix(
 		e.String(), "TransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND): \"test\"") {
@@ -172,7 +173,7 @@ func TestErrorRedaction(t *testing.T) {
 			hlc.Timestamp{WallTime: 2},
 			hlc.ClockTimestamp{WallTime: 1, Logical: 2},
 		))
-		txn := roachpb.MakeTransaction("foo", roachpb.Key("bar"), 1, hlc.Timestamp{WallTime: 1}, 1, 99)
+		txn := roachpb.MakeTransaction("foo", roachpb.Key("bar"), isolation.Serializable, 1, hlc.Timestamp{WallTime: 1}, 1, 99)
 		txn.ID = uuid.Nil
 		txn.Priority = 1234
 		wrappedPErr.UnexposedTxn = &txn
@@ -182,7 +183,7 @@ func TestErrorRedaction(t *testing.T) {
 		var s redact.StringBuilder
 		s.Print(r)
 		act := s.RedactableString().Redact()
-		const exp = "ReadWithinUncertaintyIntervalError: read at time 0.000000001,0 encountered previous write with future timestamp 0.000000002,0 (local=0.000000001,2) within uncertainty interval `t <= (local=0.000000002,2, global=0.000000003,0)`; observed timestamps: [{12 0.000000004,0}]: \"foo\" meta={id=00000000 key=‹×› pri=0.00005746 epo=0 ts=0.000000001,0 min=0.000000001,0 seq=0} lock=true stat=PENDING rts=0.000000001,0 wto=false gul=0.000000002,0"
+		const exp = "ReadWithinUncertaintyIntervalError: read at time 0.000000001,0 encountered previous write with future timestamp 0.000000002,0 (local=0.000000001,2) within uncertainty interval `t <= (local=0.000000002,2, global=0.000000003,0)`; observed timestamps: [{12 0.000000004,0}]: \"foo\" meta={id=00000000 key=‹×› iso=Serializable pri=0.00005746 epo=0 ts=0.000000001,0 min=0.000000001,0 seq=0} lock=true stat=PENDING rts=0.000000001,0 wto=false gul=0.000000002,0"
 		require.Equal(t, exp, string(act))
 	})
 
@@ -215,7 +216,7 @@ func TestErrorRedaction(t *testing.T) {
 		},
 		{
 			err:    &TransactionPushError{},
-			expect: "failed to push meta={id=00000000 key=/Min pri=0.00000000 epo=0 ts=0,0 min=0,0 seq=0} lock=false stat=PENDING rts=0,0 wto=false gul=0,0",
+			expect: "failed to push meta={id=00000000 key=/Min iso=Serializable pri=0.00000000 epo=0 ts=0,0 min=0,0 seq=0} lock=false stat=PENDING rts=0,0 wto=false gul=0,0",
 		},
 		{
 			err:    &TransactionRetryError{},
@@ -300,7 +301,7 @@ func TestErrorRedaction(t *testing.T) {
 		},
 		{
 			err:    &IndeterminateCommitError{},
-			expect: "found txn in indeterminate STAGING state meta={id=00000000 key=/Min pri=0.00000000 epo=0 ts=0,0 min=0,0 seq=0} lock=false stat=PENDING rts=0,0 wto=false gul=0,0",
+			expect: "found txn in indeterminate STAGING state meta={id=00000000 key=/Min iso=Serializable pri=0.00000000 epo=0 ts=0,0 min=0,0 seq=0} lock=false stat=PENDING rts=0,0 wto=false gul=0,0",
 		},
 		{
 			err:    &InvalidLeaseError{},

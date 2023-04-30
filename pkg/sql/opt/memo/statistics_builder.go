@@ -2815,6 +2815,9 @@ func (sb *statisticsBuilder) finalizeFromRowCountAndDistinctCounts(
 }
 
 func (sb *statisticsBuilder) shouldUseHistogram(relProps *props.Relational) bool {
+	if sb.evalCtx.SessionData().OptimizerAlwaysUseHistograms {
+		return true
+	}
 	// If we know that the cardinality is below a certain threshold (e.g., due to
 	// a constraint on a key column), don't bother adding the overhead of
 	// creating a histogram.
@@ -4748,8 +4751,8 @@ func (sb *statisticsBuilder) buildStatsFromCheckConstraints(
 					dataType,
 					values, /* samples */
 					numRows,
-					int64(numValues),              /* distinctCount */
-					stats.DefaultHistogramBuckets, /* maxBuckets */
+					int64(numValues), /* distinctCount */
+					int(stats.DefaultHistogramBuckets.Get(&sb.evalCtx.Settings.SV)), /* maxBuckets */
 				)
 				// This shouldn't error out, but if it does, let's not punish the user.
 				// Just build stats without the histogram in that case.

@@ -1082,12 +1082,17 @@ func (expr *FuncExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
 	}
 
+	var hasUDFOverload bool
 	var calledOnNullInputFns, notCalledOnNullInputFns intsets.Fast
 	for _, idx := range s.overloadIdxs {
 		if def.Overloads[idx].CalledOnNullInput {
 			calledOnNullInputFns.Add(int(idx))
 		} else {
 			notCalledOnNullInputFns.Add(int(idx))
+		}
+		// TODO(harding): Check if this is a record-returning UDF instead.
+		if def.Overloads[idx].IsUDF {
+			hasUDFOverload = true
 		}
 	}
 
@@ -1135,7 +1140,7 @@ func (expr *FuncExpr) TypeCheck(
 	// NULL arguments, the function isn't a generator or aggregate builtin, and
 	// NULL is given as an argument.
 	if len(s.overloadIdxs) > 0 && calledOnNullInputFns.Len() == 0 && funcCls != GeneratorClass &&
-		funcCls != AggregateClass {
+		funcCls != AggregateClass && !hasUDFOverload {
 		for _, expr := range s.typedExprs {
 			if expr.ResolvedType().Family() == types.UnknownFamily {
 				return DNull, nil
@@ -2102,7 +2107,7 @@ func typeCheckComparisonOpWithSubOperator(
 		}
 
 		rightReturn := rightTyped.ResolvedType()
-		if cmpTypeLeft.Family() == types.UnknownFamily || rightReturn.Family() == types.UnknownFamily {
+		if rightReturn.Family() == types.UnknownFamily {
 			return leftTyped, rightTyped, nil, true /* alwaysNull */, nil
 		}
 
@@ -2204,6 +2209,38 @@ func typeCheckComparisonOp(
 	_, leftIsTuple := foldedLeft.(*Tuple)
 	_, rightIsTuple := foldedRight.(*Tuple)
 	_, rightIsSubquery := foldedRight.(SubqueryExpr)
+	var tsMatchesWithText bool
+	var typedLeft, typedRight TypedExpr
+	var leftFamily, rightFamily types.Family
+	var err error
+
+	// Do an initial check for TEXT @@ XXX special cases which might need to
+	// inject a to_tsvector or plainto_tsquery function call.
+	if op.Symbol == treecmp.TSMatches {
+		if switched {
+			// The order of operators matters as to which function call to apply.
+			foldedLeft, foldedRight = foldedRight, foldedLeft
+			switched = false
+		}
+		disallowSwitch = true
+		typedLeft, err = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
+			return nil, nil, nil, false,
+				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
+		}
+		typedRight, err = foldedRight.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
+			return nil, nil, nil, false,
+				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
+		}
+		leftFamily = typedLeft.ResolvedType().Family()
+		rightFamily = typedRight.ResolvedType().Family()
+		if leftFamily == types.StringFamily || rightFamily == types.StringFamily {
+			tsMatchesWithText = true
+		}
+	}
 
 	handleTupleTypeMismatch := false
 	switch {
@@ -2227,7 +2264,7 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 
-		typedLeft := typedSubExprs[0]
+		typedLeft = typedSubExprs[0]
 		typedSubExprs = typedSubExprs[1:]
 
 		rightTuple.typ = types.MakeTuple(make([]*types.T, len(typedSubExprs)))
@@ -2241,7 +2278,7 @@ func typeCheckComparisonOp(
 		return typedLeft, rightTuple, fn, false, nil
 
 	case foldedOp.Symbol == treecmp.In && rightIsSubquery:
-		typedLeft, err := foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		typedLeft, err = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
 		if err != nil {
 			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
 			return nil, nil, nil, false,
@@ -2256,15 +2293,19 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 
-		desired := types.MakeTuple([]*types.T{typ})
-		typedRight, err := foldedRight.TypeCheck(ctx, semaCtx, desired)
+		desired := typ
+		if desired.Family() != types.TupleFamily {
+			desired = types.MakeTuple([]*types.T{typ})
+		}
+
+		typedRight, err = foldedRight.TypeCheck(ctx, semaCtx, desired)
 		if err != nil {
 			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
 			return nil, nil, nil, false,
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sigWithErr)
 		}
 
-		if err := typeCheckSubqueryWithIn(
+		if err = typeCheckSubqueryWithIn(
 			typedLeft.ResolvedType(), typedRight.ResolvedType(),
 		); err != nil {
 			return nil, nil, nil, false, err
@@ -2279,22 +2320,53 @@ func typeCheckComparisonOp(
 				pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 		}
 		// Using non-folded left and right to avoid having to swap later.
-		typedLeft, typedRight, err := typeCheckTupleComparison(ctx, semaCtx, op, left.(*Tuple), right.(*Tuple))
+		typedLeft, typedRight, err = typeCheckTupleComparison(ctx, semaCtx, op, left.(*Tuple), right.(*Tuple))
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 		return typedLeft, typedRight, fn, false, nil
 
 	case leftIsTuple || rightIsTuple:
+		var errLeft, errRight error
 		// Tuple must compare with a tuple type, as handled above.
-		typedLeft, errLeft := foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
-		typedRight, errRight := foldedRight.TypeCheck(ctx, semaCtx, types.Any)
+		typedLeft, errLeft = foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
+		typedRight, errRight = foldedRight.TypeCheck(ctx, semaCtx, types.Any)
 		if errLeft == nil && errRight == nil &&
 			((typedLeft.ResolvedType().Family() == types.TupleFamily &&
 				typedRight.ResolvedType().Family() != types.TupleFamily) ||
 				(typedRight.ResolvedType().Family() == types.TupleFamily &&
 					typedLeft.ResolvedType().Family() != types.TupleFamily)) {
 			handleTupleTypeMismatch = true
+		}
+	case tsMatchesWithText:
+		// Apply rules from:
+		// https://www.postgresql.org/docs/current/textsearch-intro.html#TEXTSEARCH-MATCHING
+		// Perform the following type conversions:
+		//            initial             |              result
+		// -------------------------------------------------------------------------
+		// a::TEXT @@ b::TEXT             |  to_tsvector(a) @@ plainto_tsquery(b)
+		// a::TEXT @@ b::TSQUERY          |  to_tsvector(a) @@ b
+		// a::TSQUERY @@ b::TEXT          |  a @@ to_tsvector(b)
+		// a::TSVECTOR @@ b::TEXT         |  a @@ b::TSQUERY
+		// a::TEXT @@ b::TSVECTOR         |  a::TSQUERY @@ b
+		if leftFamily == types.StringFamily {
+			if rightFamily == types.StringFamily || rightFamily == types.TSQueryFamily {
+				leftExprs := make(Exprs, 1)
+				leftExprs[0] = typedLeft
+				foldedLeft = &FuncExpr{Func: WrapFunction("to_tsvector"), Exprs: leftExprs, AggType: GeneralAgg}
+			}
+		}
+
+		funcName := "plainto_tsquery"
+		if rightFamily == types.StringFamily {
+			if leftFamily == types.StringFamily || leftFamily == types.TSQueryFamily {
+				if leftFamily == types.TSQueryFamily {
+					funcName = "to_tsvector"
+				}
+				rightExprs := make(Exprs, 1)
+				rightExprs[0] = typedRight
+				foldedRight = &FuncExpr{Func: WrapFunction(funcName), Exprs: rightExprs, AggType: GeneralAgg}
+			}
 		}
 	}
 
@@ -2356,8 +2428,8 @@ func typeCheckComparisonOp(
 	}
 	leftReturn := leftExpr.ResolvedType()
 	rightReturn := rightExpr.ResolvedType()
-	leftFamily := leftReturn.Family()
-	rightFamily := rightReturn.Family()
+	leftFamily = leftReturn.Family()
+	rightFamily = rightReturn.Family()
 
 	// Return early if at least one overload is possible, NULL is an argument,
 	// and none of the overloads accept NULL.
@@ -3110,6 +3182,9 @@ func getMostSignificantOverload(
 				matchIdx = k
 			}
 		}
+		if !foundMatch {
+			return QualifiedOverload{}, ambiguousError()
+		}
 		return qualifiedOverloads[oImpls[matchIdx]], nil
 	}
 
@@ -3123,6 +3198,9 @@ func getMostSignificantOverload(
 	for _, idx := range filter {
 		o := qualifiedOverloads[idx]
 		if o.IsUDF {
+			// This check is only concerned with user-defined functions, not with
+			// builtin functions defined with a SQL string body. For this reason we
+			// check o.IsUDF instead of o.HasSQLBody().
 			udfFound = true
 		}
 		if seenSchema != "" && o.Schema != seenSchema {

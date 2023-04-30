@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 )
 
 // EvalRoutineExpr returns the result of evaluating the routine. It calls the
@@ -28,6 +29,16 @@ import (
 func (p *planner) EvalRoutineExpr(
 	ctx context.Context, expr *tree.RoutineExpr, args tree.Datums,
 ) (result tree.Datum, err error) {
+	// Strict routines (CalledOnNullInput=false) should not be invoked and they
+	// should immediately return NULL if any of their arguments are NULL.
+	if !expr.CalledOnNullInput {
+		for i := range args {
+			if args[i] == tree.DNull {
+				return tree.DNull, nil
+			}
+		}
+	}
+
 	// Return the cached result if it exists.
 	if expr.CachedResult != nil {
 		return expr.CachedResult, nil
@@ -111,14 +122,24 @@ func (g *routineGenerator) ResolvedType() *types.T {
 // is cache-able (i.e., there are no arguments to the routine and stepping is
 // disabled).
 func (g *routineGenerator) Start(ctx context.Context, txn *kv.Txn) (err error) {
-	retTypes := []*types.T{g.expr.ResolvedType()}
+	rt := g.expr.ResolvedType()
+	var retTypes []*types.T
+	if g.expr.MultiColOutput {
+		// A routine with multiple output column should have its types in a tuple.
+		if rt.Family() != types.TupleFamily {
+			return errors.AssertionFailedf("routine expected to return multiple columns")
+		}
+		retTypes = rt.TupleContents()
+	} else {
+		retTypes = []*types.T{g.expr.ResolvedType()}
+	}
 	g.rch.Init(ctx, retTypes, g.p.ExtendedEvalContext(), "routine" /* opName */)
 
 	// Configure stepping for volatile routines so that mutations made by the
 	// invoking statement are visible to the routine.
 	if g.expr.EnableStepping {
 		prevSteppingMode := txn.ConfigureStepping(ctx, kv.SteppingEnabled)
-		prevSeqNum := txn.GetLeafTxnInputState(ctx).ReadSeqNum
+		prevSeqNum := txn.GetReadSeqNum()
 		defer func() {
 			// If the routine errored, the transaction should be aborted, so
 			// there is no need to reconfigure stepping or revert to the
@@ -208,8 +229,8 @@ func (d *droppingResultWriter) AddRow(ctx context.Context, row tree.Datums) erro
 	return nil
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (d *droppingResultWriter) IncrementRowsAffected(ctx context.Context, n int) {}
+// SetRowsAffected is part of the rowResultWriter interface.
+func (d *droppingResultWriter) SetRowsAffected(ctx context.Context, n int) {}
 
 // SetError is part of the rowResultWriter interface.
 func (d *droppingResultWriter) SetError(err error) {

@@ -15,20 +15,18 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigbounds"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
-
-var capabilityTypes = map[tenantcapabilitiespb.TenantCapabilityName]*types.T{
-	tenantcapabilitiespb.CanAdminSplit:      types.Bool,
-	tenantcapabilitiespb.CanViewNodeInfo:    types.Bool,
-	tenantcapabilitiespb.CanViewTSDBMetrics: types.Bool,
-}
 
 const alterTenantCapabilityOp = "ALTER TENANT CAPABILITY"
 
@@ -49,7 +47,7 @@ func (p *planner) AlterTenantCapability(
 		return nil, err
 	}
 	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1TenantCapabilities) {
-		return nil, errors.New("cannot alter tenant capabilities until version is finalized")
+		return nil, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState, "cannot alter tenant capabilities until version is finalized")
 	}
 
 	tSpec, err := p.planTenantSpec(ctx, n.TenantSpec, alterTenantCapabilityOp)
@@ -58,40 +56,58 @@ func (p *planner) AlterTenantCapability(
 	}
 
 	exprs := make([]tree.TypedExpr, len(n.Capabilities))
-	for i, capability := range n.Capabilities {
-		capabilityName, err := tenantcapabilitiespb.TenantCapabilityNameFromString(capability.Name)
-		if err != nil {
-			return nil, err
-		}
-		desiredType, ok := capabilityTypes[capabilityName]
+	for i, update := range n.Capabilities {
+		capability, ok := tenantcapabilities.FromName(update.Name)
 		if !ok {
-			return nil, pgerror.Newf(pgcode.Syntax, "unknown capability: %q", capabilityName)
+			return nil, pgerror.Newf(pgcode.Syntax, "unknown capability: %q", update.Name)
 		}
 
-		// In REVOKE, we do not support a value assignment.
-		capabilityValue := capability.Value
-		if n.IsRevoke {
-			if capabilityValue != nil {
-				return nil, pgerror.Newf(pgcode.Syntax, "no value allowed in revoke: %q", capabilityName)
-			}
-			continue
-		}
-
-		// Type check the expression on the right-hand side of the
-		// assignment.
-		if capabilityValue != nil {
-			var dummyHelper tree.IndexedVarHelper
-			typedValue, err := p.analyzeExpr(
-				ctx,
-				capabilityValue,
-				nil, /* source */
-				dummyHelper,
-				desiredType,
-				true, /* requireType */
-				fmt.Sprintf("%s %s", alterTenantCapabilityOp, capabilityName),
+		var desiredType *types.T
+		var missingValueDefault, revokeValue tree.TypedExpr
+		switch capability.(type) {
+		case tenantcapabilities.BoolCapability:
+			desiredType = types.Bool
+			// Granting a boolean capability without providing an explicit value
+			// translates to true.
+			missingValueDefault = tree.DBoolTrue
+			revokeValue = tree.DBoolFalse
+		case tenantcapabilities.SpanConfigBoundsCapability:
+			desiredType = types.Bytes
+		default:
+			return nil, errors.AssertionFailedf(
+				"programming error: capability %v type %T not handled: capability ID: %d",
+				capability, capability, capability.ID(),
 			)
-			if err != nil {
-				return nil, err
+		}
+
+		if n.IsRevoke {
+			// In REVOKE, we do not support a value assignment.
+			if update.Value != nil {
+				return nil, pgerror.Newf(pgcode.Syntax, "no value allowed in revoke: %q", update.Name)
+			}
+			exprs[i] = revokeValue
+		} else {
+			var typedValue tree.TypedExpr
+			if update.Value == nil {
+				if missingValueDefault == nil {
+					return nil, pgerror.Newf(pgcode.Syntax, "value required for capability: %q", capability)
+				}
+				typedValue = missingValueDefault
+			} else {
+				// Type check the expression on the right-hand side of the assignment.
+				var dummyHelper tree.IndexedVarHelper
+				typedValue, err = p.analyzeExpr(
+					ctx,
+					update.Value,
+					nil, /* source */
+					dummyHelper,
+					desiredType,
+					true, /* requireType */
+					fmt.Sprintf("%s %s", alterTenantCapabilityOp, update.Name),
+				)
+				if err != nil {
+					return nil, err
+				}
 			}
 			exprs[i] = typedValue
 		}
@@ -109,7 +125,7 @@ func (n *alterTenantCapabilityNode) startExec(params runParams) error {
 	ctx := params.ctx
 
 	// Privilege check.
-	if err := p.RequireAdminRole(ctx, "update tenant capabilities"); err != nil {
+	if err := CanManageTenant(ctx, p); err != nil {
 		return err
 	}
 
@@ -130,57 +146,71 @@ func (n *alterTenantCapabilityNode) startExec(params runParams) error {
 	}
 
 	dst := &tenantInfo.Capabilities
-	for i, capability := range n.n.Capabilities {
-		capabilityName, err := tenantcapabilitiespb.TenantCapabilityNameFromString(capability.Name)
-		if err != nil {
-			return err
-		}
+	capabilities := n.n.Capabilities
+	for i, update := range capabilities {
 		typedExpr := n.typedExprs[i]
-		switch capabilityName {
-		case tenantcapabilitiespb.CanAdminSplit:
-			if n.n.IsRevoke {
-				dst.CanAdminSplit = false
-			} else {
-				b := true
-				if typedExpr != nil {
-					b, err = paramparse.DatumAsBool(ctx, p.EvalContext(), capabilityName.String(), typedExpr)
-					if err != nil {
-						return err
-					}
-				}
-				dst.CanAdminSplit = b
-			}
+		capability, ok := tenantcapabilities.FromName(update.Name)
+		if !ok {
+			// We've already checked this above.
+			return errors.AssertionFailedf("programming error: %q", update.Name)
+		}
 
-		case tenantcapabilitiespb.CanViewNodeInfo:
-			if n.n.IsRevoke {
-				dst.CanViewNodeInfo = false
-			} else {
-				b := true
-				if typedExpr != nil {
-					b, err = paramparse.DatumAsBool(ctx, p.EvalContext(), capabilityName.String(), typedExpr)
-					if err != nil {
-						return err
-					}
-				}
-				dst.CanViewNodeInfo = b
+		switch c := capability.(type) {
+		case tenantcapabilities.BoolCapability:
+			boolValue, err := paramparse.DatumAsBool(ctx, p.EvalContext(), update.Name, typedExpr)
+			if err != nil {
+				return err
 			}
+			c.Value(dst).Set(boolValue)
+		case tenantcapabilities.SpanConfigBoundsCapability:
+			if n.n.IsRevoke {
+				return pgerror.Newf(pgcode.InvalidParameterValue, "cannot REVOKE CAPABILITY %q", capability)
+			}
+			datum, err := eval.Expr(ctx, p.EvalContext(), typedExpr)
+			if err != nil {
+				return err
+			}
+			var bounds *spanconfigbounds.Bounds
+			// Allow NULL, and use it to clear the SpanConfigBounds.
+			if datum == tree.DNull {
 
-		case tenantcapabilitiespb.CanViewTSDBMetrics:
-			if n.n.IsRevoke {
-				dst.CanViewTSDBMetrics = false
-			} else {
-				b := true
-				if typedExpr != nil {
-					b, err = paramparse.DatumAsBool(ctx, p.EvalContext(), capabilityName.String(), typedExpr)
-					if err != nil {
-						return err
-					}
+			} else if dBytes, ok := datum.(*tree.DBytes); ok {
+				boundspb := new(tenantcapabilitiespb.SpanConfigBounds)
+				if err := protoutil.Unmarshal([]byte(*dBytes), boundspb); err != nil {
+					return errors.WithDetail(
+						pgerror.Wrapf(
+							err, pgcode.InvalidParameterValue, "invalid %q value",
+							capability,
+						),
+						"cannot decode into cockroach.multitenant.tenantcapabilitiespb.SpanConfigBounds",
+					)
 				}
-				dst.CanViewTSDBMetrics = b
+				// Converting the raw proto to spanconfigbounds.Bounds will ensure
+				// constraints are sorted.
+				//
+				// TODO(ajwerner,arul): Validate some properties of the bounds.
+				// We'll also want to make sure that kvserver sanity checks the values
+				// it uses when clamping -- we don't want to clamp the range sizes to be
+				// tiny or GC TTL to be too short because of operator error. Some of
+				// this checking could be pushed into spanconfigbounds.New. We might
+				// also want to check tandem fields to ensure they make sense -- for
+				// example, the range for min/max range sizes should have some overlap.
+				bounds = spanconfigbounds.New(boundspb)
+			} else {
+				return errors.WithDetailf(
+					pgerror.Newf(
+						pgcode.InvalidParameterValue, "parameter %q requires bytes value",
+					),
+					"%s is a %s", datum, datum.ResolvedType(),
+				)
 			}
+			c.Value(dst).Set(bounds)
 
 		default:
-			return errors.AssertionFailedf("unhandled: %q", capabilityName)
+			return errors.AssertionFailedf(
+				"programming error: capability %v type %v not handled: capability ID: %d",
+				capability, capability, capability.ID(),
+			)
 		}
 	}
 

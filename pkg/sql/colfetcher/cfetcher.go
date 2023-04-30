@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
@@ -181,6 +180,15 @@ type cFetcherArgs struct {
 	// collectStats, if true, indicates that cFetcher should collect execution
 	// statistics (e.g. CPU time).
 	collectStats bool
+	// alwaysReallocate indicates whether the cFetcher will allocate new batches
+	// on each NextBatch invocation (if true), or will reuse a single batch (if
+	// false).
+	//
+	// Note that if alwaysReallocate=true is used, it is the caller's
+	// responsibility to perform memory accounting for all batches except for
+	// the last one returned on the NextBatch calls if the caller wishes to keep
+	// multiple batches at the same time.
+	alwaysReallocate bool
 }
 
 // noOutputColumn is a sentinel value to denote that a system column is not
@@ -238,8 +246,7 @@ type cFetcher struct {
 	bytesRead           int64
 	batchRequestsIssued int64
 	// cpuStopWatch tracks the CPU time spent by this cFetcher while fulfilling KV
-	// requests *in the current goroutine*. It should only be accessed through
-	// getKVCPUTime().
+	// requests *in the current goroutine*.
 	cpuStopWatch *timeutil.CPUStopWatch
 
 	// machine contains fields that get updated during the run of the fetcher.
@@ -483,7 +490,7 @@ func (cf *cFetcher) Init(
 		cf.fetcher = kvFetcher
 	}
 	cf.stableKVs = nextKVer.Init(cf.getFirstKeyOfRow)
-	cf.accountingHelper.Init(allocator, cf.memoryLimit, cf.table.typs)
+	cf.accountingHelper.Init(allocator, cf.memoryLimit, cf.table.typs, cf.alwaysReallocate)
 	if cf.cFetcherArgs.collectStats {
 		cf.cpuStopWatch = timeutil.NewCPUStopWatch()
 	}
@@ -548,7 +555,7 @@ func (cf *cFetcher) StartScan(
 	cf.machine.state[0] = stateResetBatch
 	cf.machine.state[1] = stateInitFetch
 	return cf.fetcher.SetupNextFetch(
-		ctx, spans, nil /* spanIDs */, batchBytesLimit, firstBatchLimit,
+		ctx, spans, nil /* spanIDs */, batchBytesLimit, firstBatchLimit, false, /* spansCanOverlap */
 	)
 }
 
@@ -1350,12 +1357,6 @@ func (cf *cFetcher) getBytesRead() int64 {
 		return cf.fetcher.GetBytesRead()
 	}
 	return cf.bytesRead
-}
-
-// getKVCPUTime returns the amount of CPU time spent in the current goroutine
-// while fulfilling KV requests.
-func (cf *cFetcher) getKVCPUTime() time.Duration {
-	return cf.cpuStopWatch.Elapsed()
 }
 
 // getBatchRequestsIssued returns the number of BatchRequests issued by the

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -54,25 +54,6 @@ func TestStdFlagToPflag(t *testing.T) {
 			t.Errorf("unable to find \"%s\"", f.Name)
 		}
 	})
-}
-
-func TestNoLinkForbidden(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Verify that the cockroach binary doesn't depend on certain packages.
-	buildutil.VerifyNoImports(t,
-		"github.com/cockroachdb/cockroach/pkg/cmd/cockroach", true,
-		[]string{
-			"testing",  // defines flags
-			"go/build", // probably not something we want in the main binary
-		},
-		[]string{},
-		// The errors library uses go/build to determine
-		// the list of source directories (used to strip the source prefix
-		// in stack trace reports).
-		"github.com/cockroachdb/errors/withstack",
-	)
 }
 
 func TestCacheFlagValue(t *testing.T) {
@@ -189,6 +170,73 @@ func TestMemoryPoolFlagValues(t *testing.T) {
 				if *tc.config < expectedLow || *tc.config > expectedHigh {
 					t.Errorf("expected %d-%d, but got %d", expectedLow, expectedHigh, *tc.config)
 				}
+			}
+		})
+	}
+}
+
+func TestGetDefaultGoMemLimitValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	maxMem, err := status.GetTotalMemory(context.Background())
+	if err != nil {
+		t.Logf("total memory unknown: %v", err)
+		return
+	}
+	if maxMem < 1<<30 /* 1GiB */ {
+		// The test assumes that it is running on a machine with at least 1GiB
+		// of RAM.
+		skip.IgnoreLint(t)
+	}
+
+	// highCachePercentage is such that --cache would be set too high resulting
+	// in the upper bound on the goMemLimit becoming negative, so we'd use the
+	// lower bound.
+	highCachePercentage := defaultGoMemLimitMaxTotalSystemMemUsage/defaultGoMemLimitCacheSlopMultiple + 0.02
+
+	for i, tc := range []struct {
+		maxSQLMemory string
+		cache        string
+		expected     int64
+	}{
+		{
+			maxSQLMemory: "100MiB",
+			cache:        "100MiB",
+			// The default calculation says 225MiB which is smaller than the
+			// lower bound, so we use the latter.
+			expected: defaultGoMemLimitMinValue,
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        "100MiB",
+			// The default 2.25x of --max-sql-memory.
+			expected: defaultGoMemLimitSQLMultiple * 200 << 20, /* 450MiB */
+		},
+		{
+			maxSQLMemory: "200MiB",
+			cache:        fmt.Sprintf("%.2f", highCachePercentage),
+			expected:     defaultGoMemLimitMinValue,
+		},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			// Avoid leaking configuration changes after the test ends.
+			defer initCLIDefaults()
+
+			f := startCmd.Flags()
+
+			args := []string{
+				"--max-sql-memory", tc.maxSQLMemory,
+				"--cache", tc.cache,
+			}
+			if err := f.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			limit := getDefaultGoMemLimit(context.Background())
+			// Allow for some imprecision since we're dealing with float
+			// arithmetic but the result is converted to integer.
+			if diff := tc.expected - limit; diff > 1 || diff < -1 {
+				t.Errorf("expected %d, but got %d", tc.expected, limit)
 			}
 		})
 	}

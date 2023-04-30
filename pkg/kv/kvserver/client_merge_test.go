@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -486,10 +487,15 @@ func mergeCheckingTimestampCaches(
 
 	manualClock := hlc.NewHybridManualClock()
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	// This test explicitly sets up a leader/leaseholder partition, which doesn't
+	// work with expiration leases (the lease expires).
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
 						WallClock: manualClock,
@@ -581,8 +587,8 @@ func mergeCheckingTimestampCaches(
 	// Simulate a txn abort on the RHS from a node with a newer clock. Because
 	// the transaction record for the pushee was not yet written, this will bump
 	// the timestamp cache to record the abort.
-	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0, 0)
-	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0, 0)
+	pushee := roachpb.MakeTransaction("pushee", rhsKey, isolation.Serializable, roachpb.MinUserPriority, readTS, 0, 0)
+	pusher := roachpb.MakeTransaction("pusher", rhsKey, isolation.Serializable, roachpb.MaxUserPriority, readTS, 0, 0)
 	ba = &kvpb.BatchRequest{}
 	ba.Timestamp = readTS.Next()
 	ba.RangeID = rhsDesc.RangeID
@@ -658,7 +664,7 @@ func mergeCheckingTimestampCaches(
 		}
 
 		// Applied to leaseholder after the partition heals.
-		var truncIndex uint64
+		var truncIndex kvpb.RaftIndex
 		restoredLeaseholderFuncs := noopRaftHandlerFuncs()
 		restoredLeaseholderFuncs.dropReq = func(req *kvserverpb.RaftMessageRequest) bool {
 			// Make sure that even going forward no MsgApp for what we just
@@ -669,7 +675,7 @@ func mergeCheckingTimestampCaches(
 			//
 			// NB: the Index on the message is the log index that _precedes_ any of the
 			// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-			return req.Message.Type == raftpb.MsgApp && req.Message.Index < truncIndex
+			return req.Message.Type == raftpb.MsgApp && kvpb.RaftIndex(req.Message.Index) < truncIndex
 		}
 
 		// Because we enter a split leader-leaseholder state, none of the
@@ -724,13 +730,13 @@ func mergeCheckingTimestampCaches(
 			// largest log index on the leader, or it will panic. So we choose
 			// the minimum of these two and just pick the smallest "last index"
 			// in the range, which does the trick.
-			min := func(a, b uint64) uint64 {
+			min := func(a, b kvpb.RaftIndex) kvpb.RaftIndex {
 				if a < b {
 					return a
 				}
 				return b
 			}
-			minLastIndex := uint64(math.MaxUint64)
+			minLastIndex := kvpb.RaftIndex(math.MaxUint64)
 			for _, r := range lhsRepls {
 				lastIndex := r.GetLastIndex()
 				minLastIndex = min(minLastIndex, lastIndex)
@@ -1012,8 +1018,10 @@ func TestStoreRangeMergeTimestampCacheCausality(t *testing.T) {
 		if !lhsRepl1.OwnsValidLease(ctx, tc.Servers[1].Clock().NowAsClockTimestamp()) {
 			return errors.New("s2 does not own valid lease for lhs range")
 		}
-		if lhsRepl1.CurrentLeaseStatus(ctx).Lease.Type() != roachpb.LeaseEpoch {
-			return errors.Errorf("lease still an expiration based lease")
+		if !kvserver.ExpirationLeasesOnly.Get(&tc.Server(0).ClusterSettings().SV) { // metamorphic
+			if lhsRepl1.CurrentLeaseStatus(ctx).Lease.Type() != roachpb.LeaseEpoch {
+				return errors.Errorf("lease still an expiration based lease")
+			}
 		}
 		return nil
 	})
@@ -2530,7 +2538,7 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 
 	// Be extra paranoid and verify the exact value of the replica tombstone.
 	checkTombstone := func(eng storage.Engine) {
-		var rhsTombstone roachpb.RangeTombstone
+		var rhsTombstone kvserverpb.RangeTombstone
 		rhsTombstoneKey := keys.RangeTombstoneKey(rhsDesc.RangeID)
 		ok, err = storage.MVCCGetProto(ctx, eng, rhsTombstoneKey, hlc.Timestamp{},
 			&rhsTombstone, storage.MVCCGetOptions{})
@@ -3782,13 +3790,13 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 
 		type sstFileWriter struct {
 			span   roachpb.Span
-			file   *storage.MemFile
+			file   *storage.MemObject
 			writer storage.SSTWriter
 		}
 		keySpans := rditer.MakeReplicatedKeySpans(inSnap.Desc)
 		sstFileWriters := map[string]sstFileWriter{}
 		for _, span := range keySpans {
-			file := &storage.MemFile{}
+			file := &storage.MemObject{}
 			writer := storage.MakeIngestionSSTWriter(ctx, st, file)
 			if err := writer.ClearRawRange(span.Key, span.EndKey, true, true); err != nil {
 				return err
@@ -3850,7 +3858,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		// replicas (while absorbing their user keys into the LHS).
 		for _, k := range []roachpb.Key{keyB, keyC} {
 			rangeID := rangeIds[string(k)]
-			sstFile := &storage.MemFile{}
+			sstFile := &storage.MemObject{}
 			sst := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 			defer sst.Close()
 			{
@@ -3878,7 +3886,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			}
 
 			tombstoneKey := keys.RangeTombstoneKey(rangeID)
-			tombstoneValue := &roachpb.RangeTombstone{NextReplicaID: math.MaxInt32}
+			tombstoneValue := &kvserverpb.RangeTombstone{NextReplicaID: math.MaxInt32}
 			if err := storage.MVCCBlindPutProto(
 				context.Background(), &sst, nil, tombstoneKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, tombstoneValue, nil,
 			); err != nil {
@@ -3892,7 +3900,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		}
 
 		// Construct an SST for the user key range of the subsumed replicas.
-		sstFile := &storage.MemFile{}
+		sstFile := &storage.MemObject{}
 		sst := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 		defer sst.Close()
 		desc := roachpb.RangeDescriptor{
@@ -4018,7 +4026,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	}
 
 	// Truncate the logs of the LHS.
-	index := func() uint64 {
+	index := func() kvpb.RaftIndex {
 		repl := store0.LookupReplica(roachpb.RKey(keyA))
 		index := repl.GetLastIndex()
 		truncArgs := &kvpb.TruncateLogRequest{
@@ -4050,7 +4058,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 				//
 				// NB: the Index on the message is the log index that _precedes_ any of the
 				// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-				return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+				return req.Message.Type == raftpb.MsgApp && kvpb.RaftIndex(req.Message.Index) < index
 			},
 			// Don't drop heartbeats or responses.
 			dropHB:   func(*kvserverpb.RaftHeartbeat) bool { return false },
@@ -4944,8 +4952,7 @@ func sendWithTxn(
 	maxOffset time.Duration,
 	args kvpb.Request,
 ) error {
-	txn := roachpb.MakeTransaction("test txn", desc.StartKey.AsRawKey(),
-		0, ts, maxOffset.Nanoseconds(), 0)
+	txn := roachpb.MakeTransaction("test txn", desc.StartKey.AsRawKey(), 0, 0, ts, maxOffset.Nanoseconds(), 0)
 	_, pErr := kv.SendWrappedWith(context.Background(), store.TestSender(), kvpb.Header{Txn: &txn}, args)
 	return pErr.GoError()
 }
@@ -5139,7 +5146,7 @@ func setupClusterWithSubsumedRange(
 		})
 		require.NoError(t, tc.(*testcluster.TestCluster).WaitForFullReplication())
 		testutils.SucceedsSoon(t, func() error {
-			if count := len(replsForRange(ctx, t, tc, newDesc, numNodes)); count != 2 {
+			if count := len(replsForRange(ctx, t, tc, newDesc)); count != 2 {
 				return errors.Newf("expected %d replicas for range %d; found %d", 2, newDesc.RangeID, count)
 			}
 			return nil

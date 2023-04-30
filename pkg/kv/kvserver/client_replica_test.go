@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
@@ -476,7 +477,7 @@ func testTxnReadWithinUncertaintyInterval(t *testing.T, observedTS bool, readOp 
 	now := s.Clock().Now()
 	maxOffset := s.Clock().MaxOffset().Nanoseconds()
 	require.NotZero(t, maxOffset)
-	txn := roachpb.MakeTransaction("test", key, 1, now, maxOffset, int32(s.SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", key, isolation.Serializable, 1, now, maxOffset, int32(s.SQLInstanceID()))
 	require.True(t, txn.ReadTimestamp.Less(txn.GlobalUncertaintyLimit))
 	require.Len(t, txn.ObservedTimestamps, 0)
 
@@ -628,7 +629,7 @@ func testTxnReadWithinUncertaintyIntervalAfterIntentResolution(
 	// Create a new writer transaction.
 	maxOffset := clocks[0].MaxOffset().Nanoseconds()
 	require.NotZero(t, maxOffset)
-	writerTxn := roachpb.MakeTransaction("test_writer", keyA, 1, clocks[0].Now(), maxOffset, int32(tc.Servers[0].NodeID()))
+	writerTxn := roachpb.MakeTransaction("test_writer", keyA, isolation.Serializable, 1, clocks[0].Now(), maxOffset, int32(tc.Servers[0].NodeID()))
 
 	// Write to key A and key B in the writer transaction.
 	for _, key := range []roachpb.Key{keyA, keyB} {
@@ -673,7 +674,7 @@ func testTxnReadWithinUncertaintyIntervalAfterIntentResolution(
 	//
 	// NB: we use writerTxn.MinTimestamp instead of clocks[1].Now() so that a
 	// stray clock update doesn't influence the reader's read timestamp.
-	readerTxn := roachpb.MakeTransaction("test_reader", keyA, 1, writerTxn.MinTimestamp, maxOffset, int32(tc.Servers[1].NodeID()))
+	readerTxn := roachpb.MakeTransaction("test_reader", keyA, isolation.Serializable, 1, writerTxn.MinTimestamp, maxOffset, int32(tc.Servers[1].NodeID()))
 	require.True(t, readerTxn.ReadTimestamp.Less(writerTxn.WriteTimestamp))
 	require.False(t, readerTxn.GlobalUncertaintyLimit.Less(writerTxn.WriteTimestamp))
 
@@ -829,7 +830,7 @@ func TestTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	now := clocks[1].Now()
 	maxOffset := clocks[1].MaxOffset().Nanoseconds()
 	require.NotZero(t, maxOffset)
-	txn := roachpb.MakeTransaction("test", keyB, 1, now, maxOffset, int32(tc.Servers[1].SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", keyB, isolation.Serializable, 1, now, maxOffset, int32(tc.Servers[1].SQLInstanceID()))
 	require.True(t, txn.ReadTimestamp.Less(txn.GlobalUncertaintyLimit))
 	require.Len(t, txn.ObservedTimestamps, 0)
 
@@ -1016,8 +1017,8 @@ func TestTxnReadWithinUncertaintyIntervalAfterRangeMerge(t *testing.T) {
 
 		// Create two identical transactions. The first one will perform a read to a
 		// store before the merge, the second will only read after the merge.
-		txn := roachpb.MakeTransaction("txn1", keyA, 1, now, maxOffset, instanceId)
-		txn2 := roachpb.MakeTransaction("txn2", keyA, 1, now, maxOffset, instanceId)
+		txn := roachpb.MakeTransaction("txn1", keyA, isolation.Serializable, 1, now, maxOffset, instanceId)
+		txn2 := roachpb.MakeTransaction("txn2", keyA, isolation.Serializable, 1, now, maxOffset, instanceId)
 
 		// Simulate a read which will cause the observed time to be set to now
 		resp, pErr := kv.SendWrappedWith(ctx, tc.Servers[1].DistSender(), kvpb.Header{Txn: &txn}, getArgs(keyA))
@@ -1636,7 +1637,7 @@ func TestLeaseExpirationBasedRangeTransfer(t *testing.T) {
 
 	{
 		// An invalid target should result in an error.
-		const expected = "unable to find store .* in range"
+		const expected = "lease target replica not found in RangeDescriptor"
 		if err := l.replica0.AdminTransferLease(ctx, 1000, false /* bypassSafetyChecks */); !testutils.IsError(err, expected) {
 			t.Fatalf("expected %s, but found %v", expected, err)
 		}
@@ -1979,7 +1980,7 @@ func TestRangeLocalUncertaintyLimitAfterNewLease(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numNodes,
+	tc := testcluster.StartTestCluster(t, numServers,
 		base.TestClusterArgs{
 			ReplicationMode:   base.ReplicationManual,
 			ServerArgsPerNode: serverArgs,
@@ -1997,7 +1998,7 @@ func TestRangeLocalUncertaintyLimitAfterNewLease(t *testing.T) {
 	}
 
 	// Start a transaction using node2 as a gateway.
-	txn := roachpb.MakeTransaction("test", keyA, 1 /* userPriority */, tc.Servers[1].Clock().Now(), tc.Servers[1].Clock().MaxOffset().Nanoseconds() /* maxOffsetNs */, int32(tc.Servers[1].SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", keyA, isolation.Serializable, 1, tc.Servers[1].Clock().Now(), tc.Servers[1].Clock().MaxOffset().Nanoseconds(), int32(tc.Servers[1].SQLInstanceID()))
 	// Simulate a read to another range on node2 by setting the observed timestamp.
 	txn.UpdateObservedTimestamp(2, tc.Servers[1].Clock().NowAsClockTimestamp())
 
@@ -2060,11 +2061,14 @@ func TestLeaseMetricsOnSplitAndTransfer(t *testing.T) {
 		return nil
 	}
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, 2,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
@@ -2383,7 +2387,7 @@ func getLeaseInfoOrFatal(
 func TestRemoveLeaseholder(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	tc := testcluster.StartTestCluster(t, numNodes,
+	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
@@ -2682,6 +2686,8 @@ func TestChangeReplicasGeneration(t *testing.T) {
 func TestSystemZoneConfigs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.WithIssue(t, 98905)
 
 	// This test is relatively slow and resource intensive. When run under
 	// stressrace on a loaded machine (as in the nightly tests), sometimes the
@@ -3408,10 +3414,8 @@ func TestReplicaTombstone(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				RaftConfig: base.RaftConfig{
 					// Make the tick interval short so we don't need to wait too long for
-					// the partitioned node to time out but increase the lease timeout
-					// so expiration-based leases still work.
-					RaftTickInterval:                        time.Millisecond,
-					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+					// the partitioned node to time out.
+					RaftTickInterval: time.Millisecond,
 				},
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					DisableReplicaGCQueue: true,
@@ -3563,10 +3567,8 @@ func TestReplicaTombstone(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				RaftConfig: base.RaftConfig{
 					// Make the tick interval short so we don't need to wait too long
-					// for a heartbeat to be sent. Increase the election timeout so
-					// expiration based leases still work.
-					RaftTickInterval:                        time.Millisecond,
-					RangeLeaseRaftElectionTimeoutMultiplier: 10000,
+					// for a heartbeat to be sent.
+					RaftTickInterval: time.Millisecond,
 				},
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					DisableReplicaGCQueue: true,
@@ -3739,7 +3741,7 @@ func TestReplicaTombstone(t *testing.T) {
 			return nil
 		})
 		require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, key))
-		var tombstone roachpb.RangeTombstone
+		var tombstone kvserverpb.RangeTombstone
 		testutils.SucceedsSoon(t, func() (err error) {
 			// One of the two other stores better be the raft leader eventually.
 			// We keep trying to send snapshots until one takes.
@@ -4362,6 +4364,11 @@ func TestStrictGCEnforcement(t *testing.T) {
 		protectedts.PollInterval.Override(ctx, &tc.Server(0).ClusterSettings().SV, 500*time.Hour)
 		defer protectedts.PollInterval.Override(ctx, &tc.Server(0).ClusterSettings().SV, 2*time.Minute)
 
+		// Disable follower reads. When metamorphically enabling expiration-based
+		// leases, an expired lease will cause a follower read which bypasses the
+		// strict GC enforcement.
+		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = false")
+
 		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10 ms'")
 		defer sqlDB.Exec(t, `SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
 		setStrictGC(t, true)
@@ -4780,13 +4787,8 @@ func TestTenantID(t *testing.T) {
 	// We also configure the settings to be as robust as possible to problems
 	// during stressrace as the setup of the rpc connections seems to somehow
 	// fail sometimes when using secure connections.
-	raftConfig := base.RaftConfig{
-		// Prevent failures under stressrace.
-		RangeLeaseRaftElectionTimeoutMultiplier: 10000,
-	}
 	stickySpecTestServerArgs := base.TestServerArgs{
-		RaftConfig: raftConfig,
-		Insecure:   true,
+		Insecure: true,
 		StoreSpecs: []base.StoreSpec{
 			{
 				InMemory:               true,
@@ -4827,8 +4829,7 @@ func TestTenantID(t *testing.T) {
 		sawSnapshot := make(chan struct{}, 1)
 		blockSnapshot := make(chan struct{})
 		tc.AddAndStartServer(t, base.TestServerArgs{
-			RaftConfig: raftConfig,
-			Insecure:   true,
+			Insecure: true,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					BeforeSnapshotSSTIngestion: func(

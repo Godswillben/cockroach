@@ -16,6 +16,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -72,12 +73,18 @@ func InitEngine(ctx context.Context, eng storage.Engine, ident roachpb.StoreIden
 	if err := batch.Commit(true /* sync */); err != nil {
 		return errors.Wrap(err, "persisting engine initialization data")
 	}
+	// We will set the store ID during start, but we want to set it as quickly as
+	// possible after creating a store (to initialize the shared object creator
+	// ID).
+	if err := eng.SetStoreID(ctx, int32(ident.StoreID)); err != nil {
+		return errors.Wrap(err, "setting store ID")
+	}
 
 	return nil
 }
 
-// checkCanInitializeEngine ensures that the engine is empty except for a
-// cluster version, which must be present.
+// checkCanInitializeEngine ensures that the engine is empty except possibly for
+// cluster version or cached cluster settings.
 func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 	// See if this is an already-bootstrapped store.
 	ident, err := ReadStoreIdent(ctx, eng)
@@ -99,12 +106,10 @@ func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 	})
 	defer iter.Close()
 	valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
-	if !valid {
-		if err == nil {
-			return errors.New("no cluster version found on uninitialized engine")
-		}
+	if err != nil {
 		return err
 	}
+
 	getMVCCKey := func() (storage.MVCCKey, error) {
 		if _, hasRange := iter.HasPointAndRange(); hasRange {
 			bounds, err := iter.EngineRangeBounds()
@@ -123,24 +128,19 @@ func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 		}
 		return k.ToMVCCKey()
 	}
-	var k storage.MVCCKey
-	if k, err = getMVCCKey(); err != nil {
-		return err
-	}
-	if !k.Key.Equal(keys.DeprecatedStoreClusterVersionKey()) {
-		return errors.New("no cluster version found on uninitialized engine")
-	}
-	valid, err = iter.NextEngineKey()
+
 	for valid {
-		// Only allowed to find cached cluster settings on an uninitialized
-		// engine.
+		var k storage.MVCCKey
 		if k, err = getMVCCKey(); err != nil {
 			return err
 		}
-		if _, err := keys.DecodeStoreCachedSettingsKey(k.Key); err != nil {
-			return errors.Errorf("engine cannot be bootstrapped, contains key:\n%s", k.String())
+		// Only allowed to find cluster version and cached cluster settings on an
+		// uninitialized engine.
+		if !k.Key.Equal(keys.DeprecatedStoreClusterVersionKey()) {
+			if _, err := keys.DecodeStoreCachedSettingsKey(k.Key); err != nil {
+				return errors.Errorf("engine cannot be bootstrapped, contains key:\n%s", k.String())
+			}
 		}
-		// There may be more cached cluster settings, so continue iterating.
 		valid, err = iter.NextEngineKey()
 	}
 	return err
@@ -409,7 +409,7 @@ func loadReplicas(ctx context.Context, eng storage.Engine) ([]Replica, error) {
 	// This leads to the general desire to validate the internal consistency of the
 	// entire raft state (i.e. HardState, TruncatedState, Log).
 	{
-		var msg roachpb.RaftReplicaID
+		var msg kvserverpb.RaftReplicaID
 		if err := IterateIDPrefixKeys(ctx, eng, func(rangeID roachpb.RangeID) roachpb.Key {
 			return keys.RaftReplicaIDKey(rangeID)
 		}, &msg, func(rangeID roachpb.RangeID) error {

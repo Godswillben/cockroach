@@ -62,6 +62,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					"github.com/cockroachdb/cockroach/pkg/cli/exit": {
 						"Code": {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/config": {
+						"Field": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/kv/bulk/bulkpb": {
 						"sz":     {},
 						"timing": {},
@@ -74,11 +77,16 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"timing": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvpb": {
-						"Method": {},
+						"Method":            {},
+						"LeaseAppliedIndex": {},
+						"RaftIndex":         {},
+						"RaftTerm":          {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb": {
-						"LAI":    {},
 						"SeqNum": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation": {
+						"Level": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock": {
 						"Durability": {},
@@ -88,6 +96,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb": {
 						"SnapshotRequest_Type": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities": {
+						"ID": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/repstream/streampb": {
 						"StreamID": {},

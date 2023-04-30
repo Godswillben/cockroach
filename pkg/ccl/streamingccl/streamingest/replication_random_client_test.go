@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -50,7 +51,7 @@ import (
 func getHighWaterMark(ingestionJobID int, sqlDB *gosql.DB) (*hlc.Timestamp, error) {
 	var progressBytes []byte
 	if err := sqlDB.QueryRow(
-		`SELECT progress FROM system.jobs WHERE id = $1`, ingestionJobID,
+		`SELECT progress FROM crdb_internal.system_jobs WHERE id = $1`, ingestionJobID,
 	).Scan(&progressBytes); err != nil {
 		return nil, err
 	}
@@ -177,6 +178,8 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 	const oldTenantID = 10
 	oldTenantName := roachpb.TenantName("10")
 	// The destination tenant is going to be assigned ID 2.
+	// TODO(ssd,knz): This is a hack, we should really retrieve the tenant ID
+	// from beyond the point CREATE TENANT has run below.
 	const newTenantID = 2
 	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MustMakeTenantID(oldTenantID)),
 		nil /* tableRekeys */, []execinfrapb.TenantRekey{{
@@ -204,7 +207,13 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test hangs with test tenant. More investigation is required.
 			// Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
+			Knobs: base.TestingKnobs{
+				TenantTestingKnobs: &sql.TenantTestingKnobs{
+					// Needed to pin down the ID of the replication target.
+					EnableTenantIDReuse: true,
+				},
+			},
 		},
 	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
@@ -246,6 +255,13 @@ func TestStreamIngestionJobWithRandomClient(t *testing.T) {
 
 	_, err = conn.Exec(query)
 	require.NoError(t, err)
+
+	// Check that the tenant ID that was created is the one we expect.
+	var tenantID int
+	err = conn.QueryRow(`SELECT id FROM system.tenants WHERE name = '30'`).Scan(&tenantID)
+	require.NoError(t, err)
+	require.Equal(t, newTenantID, tenantID)
+
 	_, ingestionJobID := replicationtestutils.GetStreamJobIds(t, ctx, sqlDB, "30")
 
 	// Start the ingestion stream and wait for at least one AddSSTable to ensure the job is running.
@@ -329,18 +345,18 @@ func assertExactlyEqualKVs(
 			}
 			break
 		}
-		if maxKVTimestampSeen.Less(it.Key().Timestamp) {
-			maxKVTimestampSeen = it.Key().Timestamp
+		if maxKVTimestampSeen.Less(it.UnsafeKey().Timestamp) {
+			maxKVTimestampSeen = it.UnsafeKey().Timestamp
 		}
-		newKey := (prevKey != nil && !it.Key().Key.Equal(prevKey)) || prevKey == nil
-		prevKey = it.Key().Key
+		newKey := (prevKey != nil && !it.UnsafeKey().Key.Equal(prevKey)) || prevKey == nil
+		prevKey = it.UnsafeKey().Clone().Key
 
 		if newKey {
 			// All value ts should have been drained at this point, otherwise there is
 			// a mismatch between the streamed and ingested data.
 			require.Equal(t, 0, len(valueTimestampTuples))
 			valueTimestampTuples, err = streamValidator.getValuesForKeyBelowTimestamp(
-				string(it.Key().Key), frontierTimestamp)
+				string(it.UnsafeKey().Key), frontierTimestamp)
 			require.NoError(t, err)
 		}
 
@@ -357,10 +373,10 @@ func assertExactlyEqualKVs(
 		v, err := it.Value()
 		require.NoError(t, err)
 		require.Equal(t, roachpb.KeyValue{
-			Key: it.Key().Key,
+			Key: it.UnsafeKey().Key,
 			Value: roachpb.Value{
 				RawBytes:  v,
-				Timestamp: it.Key().Timestamp,
+				Timestamp: it.UnsafeKey().Timestamp,
 			},
 		}, latestVersionInChain)
 		matchingKVs++

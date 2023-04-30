@@ -40,6 +40,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/testserver"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers" // imported to register ExternalConnection providers
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -48,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -74,7 +74,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -82,6 +81,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/lib/pq"
@@ -193,7 +193,7 @@ import (
 // the test is run as the system tenant.
 //
 // The directives line looks like:
-// # tenant-capability-override-opt: capability_name1=capability_value1 capability_name2=capability_value2
+// # tenant-capability-override-opt: capability_id1=capability_value1 capability_id2=capability_value2
 //
 //
 // ###########################################
@@ -215,16 +215,6 @@ import (
 // - tracing-off: If specified, tracing defaults to being turned off. This is
 //   used to override the environment, which may ask for tracing to be on by
 //   default.
-// TODO(ecwall): We already have a tenant-capability-override-opt directive,
-// and ideally, this option would be better suited in that category. However,
-// that thing doesn't actually work. In particular, tenant capabilities are
-// checked against an eventually consistent, in-memory state. However, that
-// directive makes no attempt to ensure the in-memory state is sufficiently
-// caught up. We should probably get rid of this cluster option once that
-// directive is fixed.
-// - can-admin-split: If specified, allows secondary tenants to perform
-//   AdminSplit operations regardless of the underlying tenant capabilities
-//   state.
 //
 //
 // ###########################################
@@ -323,8 +313,7 @@ import (
 //            duration. If the test succeeds at any time during that period, it
 //            is considered successful. Otherwise, it is a failure. See
 //            testutils.SucceedsSoon for more information. If run with the
-//            -rewrite flag, inserts a 2s sleep before executing the query
-//            once.
+//            -rewrite flag, the query will be run only once after a 2s sleep.
 //      - async: runs the query asynchronously, marking it as a pending
 //            query using the label parameter as a unique name, to be completed
 //            and validated later with "awaitquery". This is intended for use
@@ -1193,6 +1182,13 @@ func (t *logicTest) getOrOpenClient(user string, nodeIdx int) *gosql.DB {
 	pgUser := strings.TrimPrefix(user, "host-cluster-")
 	if t.cfg.UseCockroachGoTestserver {
 		pgURL = *t.testserverCluster.PGURLForNode(nodeIdx)
+		_, port, err := net.SplitHostPort(pgURL.Host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The host needs to use 127.0.0.1 instead of localhost, since if the node
+		// is listening on port 0, then macs only listen on ipv4 and not ipv6.
+		pgURL.Host = net.JoinHostPort("127.0.0.1", port)
 		pgURL.User = url.User(pgUser)
 	} else {
 		addr := t.cluster.Server(nodeIdx).ServingSQLAddr()
@@ -1250,24 +1246,6 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 	return gosql.OpenDB(connector)
 }
 
-// getFreePort finds a port that is available for a server to listen on.
-func getFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	err = l.Close()
-	if err != nil {
-		return 0, err
-	}
-	return port, err
-}
-
 // Prevent a lint failure "this value is never used" in
 // `(*logicTest).setup` when bazel.BuiltWithBazel returns false.
 var _ = ((*logicTest)(nil)).newTestServerCluster
@@ -1278,24 +1256,12 @@ var _ = ((*logicTest)(nil)).newTestServerCluster
 // is the locally built version if CockroachGoUpgradeVersion was not specified.
 func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBinaryPath string) {
 	// During config initialization, NumNodes is required to be 3.
-	ports := make([]int, t.cfg.NumNodes)
-	for i := 0; i < len(ports); i++ {
-		port, err := getFreePort()
-		if err != nil {
-			t.Fatal(err)
-		}
-		ports[i] = port
-	}
-
 	opts := []testserver.TestServerOpt{
 		testserver.ThreeNodeOpt(),
 		testserver.StoreOnDiskOpt(),
 		testserver.CockroachBinaryPathOpt(bootstrapBinaryPath),
 		testserver.UpgradeCockroachBinaryPathOpt(upgradeBinaryPath),
 		testserver.PollListenURLTimeoutOpt(120),
-		testserver.AddListenAddrPortOpt(ports[0]),
-		testserver.AddListenAddrPortOpt(ports[1]),
-		testserver.AddListenAddrPortOpt(ports[2]),
 	}
 	if strings.Contains(upgradeBinaryPath, "cockroach-short") {
 		// If we're using a cockroach-short binary, that means it was locally
@@ -1329,6 +1295,26 @@ func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBina
 func (t *logicTest) newCluster(
 	serverArgs TestServerArgs, clusterOpts []clusterOpt, knobOpts []knobOpt, toa tenantOverrideArgs,
 ) {
+	makeClusterSettings := func(forSystemTenant bool) *cluster.Settings {
+		var st *cluster.Settings
+		if forSystemTenant {
+			// System tenants use the constructor that doesn't initialize the
+			// cluster version (see makeTestConfigFromParams). This is needed
+			// for local-mixed-22.2-23.1 config.
+			st = cluster.MakeClusterSettings()
+		} else {
+			// Regular tenants use the constructor that initializes the cluster
+			// version (see TestServer.StartTenant).
+			st = cluster.MakeTestingClusterSettings()
+		}
+		// Disable stats collection on system tables before the cluster is
+		// started, otherwise there is a race condition where stats may be
+		// collected before we can disable them with `SET CLUSTER SETTING`. We
+		// disable stats collection on system tables in order to have
+		// deterministic tests.
+		stats.AutomaticStatisticsOnSystemTables.Override(context.Background(), &st.SV, false)
+		return st
+	}
 	var corpusCollectionCallback func(p scplan.Plan, stageIdx int) error
 	if serverArgs.DeclarativeCorpusCollection && t.declarativeCorpusCollector != nil {
 		corpusCollectionCallback = t.declarativeCorpusCollector.GetBeforeStage(t.rootT.Name(), t.t())
@@ -1350,13 +1336,18 @@ func (t *logicTest) newCluster(
 	shouldUseMVCCRangeTombstonesForPointDeletes := useMVCCRangeTombstonesForPointDeletes && !serverArgs.DisableUseMVCCRangeTombstonesForPointDeletes
 	ignoreMVCCRangeTombstoneErrors := globalMVCCRangeTombstone || shouldUseMVCCRangeTombstonesForPointDeletes
 
+	defaultTestTenant := t.cfg.DefaultTestTenant
+	if defaultTestTenant == base.TestTenantEnabled {
+		// If the test tenant is explicitly enabled then `logic test` will handle
+		// the creation of a configured test tenant, thus for this case we disable
+		// the implicit creation of the default test tenant.
+		defaultTestTenant = base.TestTenantDisabled
+	}
+
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			SQLMemoryPoolSize: serverArgs.MaxSQLMemoryLimit,
-			TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(
-				cluster.MakeTestingClusterSettings(), tempStorageDiskLimit,
-			),
-			DisableDefaultTestTenant: t.cfg.UseTenant || t.cfg.DisableDefaultTestTenant,
+			DefaultTestTenant: defaultTestTenant,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					// The consistency queue makes a lot of noisy logs during logic tests.
@@ -1398,7 +1389,7 @@ func (t *logicTest) newCluster(
 	}
 
 	cfg := t.cfg
-	if cfg.UseTenant {
+	if cfg.DefaultTestTenant == base.TestTenantEnabled {
 		// In the tenant case we need to enable replication in order to split and
 		// relocate ranges correctly.
 		params.ReplicationMode = base.ReplicationAuto
@@ -1406,11 +1397,12 @@ func (t *logicTest) newCluster(
 	params.ServerArgs.Knobs.DistSQL = &execinfra.TestingKnobs{
 		ForceDiskSpill: cfg.SQLExecUseDisk,
 	}
-	if cfg.BootstrapVersion != (roachpb.Version{}) {
+	if cfg.BootstrapVersion != clusterversion.Key(0) {
 		if params.ServerArgs.Knobs.Server == nil {
 			params.ServerArgs.Knobs.Server = &server.TestingKnobs{}
 		}
-		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BootstrapVersionKeyOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = clusterversion.ByKey(cfg.BootstrapVersion)
 	}
 	if cfg.DisableUpgrade {
 		if params.ServerArgs.Knobs.Server == nil {
@@ -1442,35 +1434,10 @@ func (t *logicTest) newCluster(
 		} else {
 			require.Lenf(t.rootT, cfg.Localities, 0, "node %d does not have a locality set", i+1)
 		}
-
-		if cfg.BinaryVersion != (roachpb.Version{}) {
-			binaryMinSupportedVersion := cfg.BinaryVersion
-			if cfg.BootstrapVersion != (roachpb.Version{}) {
-				// If we want to run a specific server version, we assume that it
-				// supports at least the bootstrap version.
-				binaryMinSupportedVersion = cfg.BootstrapVersion
-			}
-			nodeParams.Settings = cluster.MakeTestingClusterSettingsWithVersions(
-				cfg.BinaryVersion,
-				binaryMinSupportedVersion,
-				false, /* initializeVersion */
-			)
-
-			// If we're injecting fake versions, hook up logic to simulate the end
-			// version existing.
-			if len(clusterversion.ListBetween(cfg.BootstrapVersion, cfg.BinaryVersion)) == 0 {
-				mm, ok := nodeParams.Knobs.UpgradeManager.(*upgradebase.TestingKnobs)
-				if !ok {
-					mm = &upgradebase.TestingKnobs{}
-					nodeParams.Knobs.UpgradeManager = mm
-				}
-				mm.ListBetweenOverride = func(
-					from, to roachpb.Version,
-				) []roachpb.Version {
-					return []roachpb.Version{to}
-				}
-			}
-		}
+		nodeParams.Settings = makeClusterSettings(true /* forSystemTenant */)
+		nodeParams.TempStorageConfig = base.DefaultTestTempStorageConfigWithSize(
+			nodeParams.Settings, tempStorageDiskLimit,
+		)
 		paramsPerNode[i] = nodeParams
 	}
 	params.ServerArgsPerNode = paramsPerNode
@@ -1489,11 +1456,14 @@ func (t *logicTest) newCluster(
 	}
 
 	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
-	if cfg.UseTenant {
+	if cfg.DefaultTestTenant == base.TestTenantEnabled {
 		t.tenantAddrs = make([]string, cfg.NumNodes)
 		for i := 0; i < cfg.NumNodes; i++ {
+			settings := makeClusterSettings(false /* forSystemTenant */)
+			tempStorageConfig := base.DefaultTestTempStorageConfigWithSize(settings, tempStorageDiskLimit)
 			tenantArgs := base.TestTenantArgs{
 				TenantID: serverutils.TestTenantID(),
+				Settings: settings,
 				TestingKnobs: base.TestingKnobs{
 					SQLExecutor: &sql.ExecutorTestingKnobs{
 						DeterministicExplain:            true,
@@ -1505,7 +1475,7 @@ func (t *logicTest) newCluster(
 					RangeFeed: paramsPerNode[i].Knobs.RangeFeed,
 				},
 				MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
-				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
+				TempStorageConfig: &tempStorageConfig,
 				Locality:          paramsPerNode[i].Locality,
 				TracingDefault:    params.ServerArgs.TracingDefault,
 				// Give every tenant its own ExternalIO directory.
@@ -1519,9 +1489,6 @@ func (t *logicTest) newCluster(
 
 			tenant, err := t.cluster.Server(i).StartTenant(context.Background(), tenantArgs)
 			if err != nil {
-				t.rootT.Fatalf("%+v", err)
-			}
-			if err := tenant.WaitForTenantEndKeySplit(context.Background()); err != nil {
 				t.rootT.Fatalf("%+v", err)
 			}
 			t.tenantAddrs[i] = tenant.SQLAddr()
@@ -1558,7 +1525,7 @@ func (t *logicTest) newCluster(
 	// If we've created a tenant (either explicitly, or probabilistically and
 	// implicitly) set any necessary cluster settings to override blocked
 	// behavior.
-	if cfg.UseTenant || t.cluster.StartedDefaultTestTenant() {
+	if cfg.DefaultTestTenant == base.TestTenantEnabled || t.cluster.StartedDefaultTestTenant() {
 
 		conn := t.cluster.StorageClusterConn()
 		clusterSettings := toa.clusterSettings
@@ -1578,19 +1545,32 @@ func (t *logicTest) newCluster(
 			}
 		}
 
-		tenantID := serverutils.TestTenantID().ToUint64()
+		tenantID := serverutils.TestTenantID()
 		for name, value := range clusterSettings {
 			query := fmt.Sprintf("ALTER TENANT [$1] SET CLUSTER SETTING %s = $2", name)
-			if _, err := conn.Exec(query, tenantID, value); err != nil {
+			if _, err := conn.Exec(query, tenantID.ToUint64(), value); err != nil {
 				t.Fatal(err)
 			}
 		}
 
-		for name, value := range toa.capabilities {
+		capabilities := toa.capabilities
+		for name, value := range capabilities {
 			query := fmt.Sprintf("ALTER TENANT [$1] GRANT CAPABILITY %s = $2", name)
-			if _, err := conn.Exec(query, tenantID, value); err != nil {
+			if _, err := conn.Exec(query, tenantID.ToUint64(), value); err != nil {
 				t.Fatal(err)
 			}
+		}
+		numCapabilities := len(capabilities)
+		if numCapabilities > 0 {
+			capabilityMap := make(map[tenantcapabilities.ID]string, numCapabilities)
+			for k, v := range capabilities {
+				capability, ok := tenantcapabilities.FromName(k)
+				if !ok {
+					t.Fatalf("cannot get capability from name %q", k)
+				}
+				capabilityMap[capability.ID()] = v
+			}
+			t.cluster.WaitForTenantCapabilities(t.t(), tenantID, capabilityMap)
 		}
 	}
 
@@ -1667,11 +1647,6 @@ func (t *logicTest) newCluster(
 		// See #37751 for details.
 		if _, err := conn.Exec(
 			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false",
-		); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := conn.Exec(
-			"SET CLUSTER SETTING sql.stats.system_tables_autostats.enabled = false",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1840,25 +1815,29 @@ func (t *logicTest) setup(
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
 	if cfg.UseCockroachGoTestserver {
-		skip.WithIssue(t.t(), 96387, "flakes with panic over connection string")
+		skip.UnderRace(t.t(), "test uses a different binary, so the race detector doesn't work")
 		skip.UnderStress(t.t(), "test takes a long time and downloads release artifacts")
-		if runtime.GOARCH == "arm64" && strings.HasPrefix(cfg.CockroachGoBootstrapVersion, "v22.1") {
-			skip.IgnoreLint(t.t(), "Skip under ARM64. There are no ARM release artifacts for v22.1.")
-		}
 		if !bazel.BuiltWithBazel() {
 			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be uzed in bazel builds")
 		}
 		if cfg.NumNodes != 3 {
 			t.Fatal("cockroach-go testserver tests must use 3 nodes")
 		}
-		if cfg.CockroachGoBootstrapVersion == "" {
-			t.Fatal("cockroach-go testserver tests must specify CockroachGoBootstrapVersion")
+
+		upgradeVersion, err := version.Parse(build.BinaryVersion())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bootstrapVersion, err := version.PredecessorVersion(*upgradeVersion)
+		if err != nil {
+			t.Fatal(err)
 		}
 		bootstrapBinaryPath, err := binfetcher.Download(context.Background(), binfetcher.Options{
 			Binary:  "cockroach",
 			Dir:     tempExternalIODir,
-			Version: cfg.CockroachGoBootstrapVersion,
+			Version: "v" + bootstrapVersion,
 			GOOS:    runtime.GOOS,
+			GOARCH:  runtime.GOARCH,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1867,22 +1846,9 @@ func (t *logicTest) setup(
 		// Prevent a lint failure "this value is never used" when
 		// bazel.BuiltWithBazel returns false above.
 		_ = bootstrapBinaryPath
-
-		localBinaryPath, found := bazel.FindBinary("pkg/cmd/cockroach-short/cockroach-short_/", "cockroach-short")
+		upgradeBinaryPath, found := bazel.FindBinary("pkg/cmd/cockroach-short/cockroach-short_/", "cockroach-short")
 		if !found {
 			t.Fatal(errors.New("cockroach binary not found"))
-		}
-		upgradeBinaryPath := localBinaryPath
-		if cfg.CockroachGoUpgradeVersion != "" {
-			upgradeBinaryPath, err = binfetcher.Download(context.Background(), binfetcher.Options{
-				Binary:  "cockroach",
-				Dir:     tempExternalIODir,
-				Version: cfg.CockroachGoUpgradeVersion,
-				GOOS:    runtime.GOOS,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
 		}
 		t.newTestServerCluster(bootstrapBinaryPath, upgradeBinaryPath)
 	} else {
@@ -1944,22 +1910,6 @@ var _ clusterOpt = clusterOptTracingOff{}
 func (c clusterOptTracingOff) apply(args *base.TestServerArgs) {
 	args.TracingDefault = tracing.TracingModeOnDemand
 }
-
-// clusterOptAllowAdminSplitsForSecondaryTenants overrides can_admin_split capability
-// checks using the AuthorizerOverrideCapabilities testing knob.
-type clusterOptAllowAdminSplitsForSecondaryTenants struct{}
-
-// apply implements the knobOpt interface.
-func (a clusterOptAllowAdminSplitsForSecondaryTenants) apply(args *base.TestServerArgs) {
-	_, ok := args.Knobs.TenantCapabilitiesTestingKnobs.(*tenantcapabilities.TestingKnobs)
-	if !ok {
-		args.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{}
-	}
-	args.Knobs.TenantCapabilitiesTestingKnobs.(*tenantcapabilities.TestingKnobs).
-		AuthorizerSkipAdminSplitCapabilityChecks = true
-}
-
-var _ clusterOpt = clusterOptAllowAdminSplitsForSecondaryTenants{}
 
 // knobOpt is implemented by options for configuring the testing knobs
 // for the cluster under which a test will run.
@@ -2143,8 +2093,6 @@ func readClusterOptions(t *testing.T, path string) []clusterOpt {
 			res = append(res, clusterOptTracingOff{})
 		case "ignore-tenant-strict-gc-enforcement":
 			res = append(res, clusterOptIgnoreStrictGCForTenants{})
-		case "can-admin-split":
-			res = append(res, clusterOptAllowAdminSplitsForSecondaryTenants{})
 		default:
 			t.Fatalf("unrecognized cluster option: %s", opt)
 		}
@@ -2999,7 +2947,7 @@ func (t *logicTest) processSubtest(
 			t.setUser(fields[1], nodeIdx)
 			// In multi-tenant tests, we may need to also create database test when
 			// we switch to a different tenant.
-			if t.cfg.UseTenant && strings.HasPrefix(fields[1], "host-cluster-") {
+			if t.cfg.DefaultTestTenant == base.TestTenantEnabled && strings.HasPrefix(fields[1], "host-cluster-") {
 				if _, err := t.db.Exec("CREATE DATABASE IF NOT EXISTS test; USE test;"); err != nil {
 					return errors.Wrapf(err, "error creating database on admin tenant")
 				}
@@ -3109,6 +3057,19 @@ func (t *logicTest) processSubtest(
 				if err := t.testserverCluster.WaitForInitFinishForNode(i); err != nil {
 					t.Fatal(err)
 				}
+			}
+			// The port may have changed, so we must remove all the cached connections
+			// to this node.
+			for _, m := range t.clients {
+				if c, ok := m[nodeIdx]; ok {
+					_ = c.Close()
+				}
+				delete(m, nodeIdx)
+			}
+			// If we upgraded the node we are currently on, we need to open a new
+			// connection since the previous one might now be invalid.
+			if t.nodeIdx == nodeIdx {
+				t.setUser(t.user, nodeIdx)
 			}
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
@@ -3916,7 +3877,15 @@ func (t *logicTest) validateAfterTestCompletion() error {
 		// If `useCockroachGoTestserver` is true and we do an upgrade,
 		// this may fail if we're in between migrations that
 		// upgrade the descriptors.
-		if !t.cfg.UseCockroachGoTestserver {
+		//
+		// We also want to skip this check for mixed-version configurations (which
+		// have DisableUpgrade=true and an old BootstrapVersion) in case new
+		// fields are added to the descriptor in the newer version. In mixed-version
+		// test configs, nodes are bootstraped with the older version of the system
+		// tables which don't include the new fields in the protobuf, so they will
+		// fail to round-trip.
+		if !t.cfg.UseCockroachGoTestserver &&
+			!(t.cfg.DisableUpgrade && t.cfg.BootstrapVersion != clusterversion.Key(0)) {
 			rows, err := t.db.Query(
 				`
 SELECT encode(descriptor, 'hex') AS descriptor

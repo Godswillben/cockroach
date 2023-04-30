@@ -98,7 +98,7 @@ func TestCanSendToFollower(t *testing.T) {
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
 	txn := func(ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0, 1)
+		txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 1)
 		return &txn
 	}
 	withWriteTimestamp := func(txn *roachpb.Transaction, ts hlc.Timestamp) *roachpb.Transaction {
@@ -704,16 +704,16 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				UseDatabase:              "t",
+				DefaultTestTenant: base.TestTenantDisabled,
+				UseDatabase:       "t",
 			},
 			// n4 pretends to have low latency to n2 and n3, so that it tries to use
 			// them for follower reads.
 			// Also, we're going to collect a trace of the test's final query.
 			ServerArgsPerNode: map[int]base.TestServerArgs{
 				3: {
-					DisableDefaultTestTenant: true,
-					UseDatabase:              "t",
+					DefaultTestTenant: base.TestTenantDisabled,
+					UseDatabase:       "t",
 					Knobs: base.TestingKnobs{
 						KVClient: &kvcoord.ClientTestingKnobs{
 							// Inhibit the checking of connection health done by the
@@ -834,7 +834,6 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 // where it needs to be estimated using node localities.
 func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 95338, "flaky test")
 	defer utilccl.TestingEnableEnterprise()()
 
 	skip.UnderStressRace(t, "times out")
@@ -857,8 +856,8 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 			}
 			localities[i] = locality
 			serverArgs[i] = base.TestServerArgs{
-				Locality:                 localities[i],
-				DisableDefaultTestTenant: true, // we'll create one ourselves below.
+				Locality:          localities[i],
+				DefaultTestTenant: base.TestTenantDisabled, // we'll create one ourselves below.
 			}
 		}
 		tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
@@ -973,6 +972,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 
 		startKey := keys.MakeSQLCodec(serverutils.TestTenantID()).TenantPrefix()
 		tc.AddVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
+		tc.WaitForVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
 		desc := tc.LookupRangeOrFatal(t, startKey)
 		require.Equal(t, []roachpb.ReplicaDescriptor{
 			{NodeID: 1, StoreID: 1, ReplicaID: 1},

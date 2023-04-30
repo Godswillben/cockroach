@@ -1,6 +1,6 @@
 # Legacy schema changer is also skipped because mutation IDs throughout log
 # entries will differ. "event_log_legacy" file is for the legacy schema changer.
-# LogicTest: !local-legacy-schema-changer
+# LogicTest: !local-legacy-schema-changer !local-mixed-22.2-23.1
 # knob-opt: sync-event-log
 
 # For some reason, some of the queries produce non-deterministic results if
@@ -149,11 +149,11 @@ ALTER TABLE a ADD CONSTRAINT foo UNIQUE(val)
 
 query IT
 SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' FROM system.eventlog
-WHERE "eventType" = 'alter_table'
+WHERE "eventType" in ('alter_table', 'create_index')
 ORDER BY "timestamp", info
 ----
 1  {"EventType": "alter_table", "MutationID": 1, "Statement": "ALTER TABLE test.public.a ADD COLUMN val INT8", "TableName": "test.public.a", "Tag": "ALTER TABLE", "User": "root"}
-1  {"EventType": "alter_table", "MutationID": 1, "Statement": "ALTER TABLE test.public.a ADD CONSTRAINT foo UNIQUE (val)", "TableName": "test.public.a", "Tag": "ALTER TABLE", "User": "root"}
+1  {"EventType": "create_index", "IndexName": "foo", "MutationID": 1, "Statement": "ALTER TABLE test.public.a ADD CONSTRAINT foo UNIQUE (val)", "TableName": "test.public.a", "Tag": "ALTER TABLE", "User": "root"}
 
 query IT
 SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID'  FROM system.eventlog
@@ -166,14 +166,13 @@ SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'Error'
   FROM system.eventlog
 WHERE "eventType" = 'reverse_schema_change'
 ----
-1  {"EventType": "reverse_schema_change", "InstanceID": 1, "MutationID": 1, "SQLSTATE": "23505"}
-
+1  {"EventType": "reverse_schema_change", "InstanceID": 1, "SQLSTATE": "23505"}
 
 query IT
 SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' FROM system.eventlog
 WHERE "eventType" = 'finish_schema_change_rollback'
 ----
-1  {"EventType": "finish_schema_change_rollback", "InstanceID": 1, "MutationID": 1}
+1  {"EventType": "finish_schema_change_rollback", "InstanceID": 1}
 
 # Create an Index on the table
 #################
@@ -526,6 +525,10 @@ WHERE "eventType" = 'set_zone_config'
 ORDER BY "timestamp", info
 ----
 1  {"ApplicationName": "$ internal-set-SpanStatsTenantBoundariesTable-TTL", "EventType": "set_zone_config", "Options": ["\"gc.ttlseconds\" = 3600"], "PlaceholderValues": ["3600"], "Statement": "ALTER TABLE \"\".system.span_stats_tenant_boundaries CONFIGURE ZONE USING \"gc.ttlseconds\" = $1", "Tag": "CONFIGURE ZONE", "Target": "TABLE system.public.span_stats_tenant_boundaries", "User": "root"}
+1  {"ApplicationName": "$ internal-set-SQLStatsTables-TTL", "EventType": "set_zone_config", "Options": ["\"gc.ttlseconds\" = 3600"], "PlaceholderValues": ["3600"], "Statement": "ALTER TABLE \"\".system.statement_statistics CONFIGURE ZONE USING \"gc.ttlseconds\" = $1", "Tag": "CONFIGURE ZONE", "Target": "TABLE system.public.statement_statistics", "User": "root"}
+1  {"ApplicationName": "$ internal-set-SQLStatsTables-TTL", "EventType": "set_zone_config", "Options": ["\"gc.ttlseconds\" = 3600"], "PlaceholderValues": ["3600"], "Statement": "ALTER TABLE \"\".system.transaction_statistics CONFIGURE ZONE USING \"gc.ttlseconds\" = $1", "Tag": "CONFIGURE ZONE", "Target": "TABLE system.public.transaction_statistics", "User": "root"}
+1  {"ApplicationName": "$ internal-set-SQLStatsTables-TTL", "EventType": "set_zone_config", "Options": ["\"gc.ttlseconds\" = 3600"], "PlaceholderValues": ["3600"], "Statement": "ALTER TABLE \"\".system.statement_activity CONFIGURE ZONE USING \"gc.ttlseconds\" = $1", "Tag": "CONFIGURE ZONE", "Target": "TABLE system.public.statement_activity", "User": "root"}
+1  {"ApplicationName": "$ internal-set-SQLStatsTables-TTL", "EventType": "set_zone_config", "Options": ["\"gc.ttlseconds\" = 3600"], "PlaceholderValues": ["3600"], "Statement": "ALTER TABLE \"\".system.transaction_activity CONFIGURE ZONE USING \"gc.ttlseconds\" = $1", "Tag": "CONFIGURE ZONE", "Target": "TABLE system.public.transaction_activity", "User": "root"}
 1  {"EventType": "set_zone_config", "Options": ["range_max_bytes = 67108865", "range_min_bytes = 16777216"], "Statement": "ALTER TABLE \"\".\"\".a CONFIGURE ZONE USING range_max_bytes = 67108865, range_min_bytes = 16777216", "Tag": "CONFIGURE ZONE", "Target": "TABLE test.public.a", "User": "root"}
 
 skipif config 3node-tenant-default-configs

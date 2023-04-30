@@ -11,9 +11,13 @@
 package sqlsmith
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -108,6 +112,7 @@ var (
 	}
 	nonMutatingStatements = []statementWeight{
 		{10, makeSelect},
+		{1, makeCreateFunc},
 	}
 	allStatements = append(mutatingStatements, nonMutatingStatements...)
 
@@ -870,21 +875,225 @@ func (s *Smither) makeSelectList(
 	return result, selectRefs, true
 }
 
+func makeCreateFunc(s *Smither) (tree.Statement, bool) {
+	if s.disableUDFs {
+		return nil, false
+	}
+	return s.makeCreateFunc()
+}
+
+func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
+	fname := s.name("func")
+	name := tree.MakeFunctionNameFromPrefix(tree.ObjectNamePrefix{}, fname)
+	// Return a record 50% of the time, which means the UDF can return any number
+	// or type in its final SQL statement. Otherwise, pick a random type from
+	// this smither's available types.
+	rtyp := types.AnyTuple
+	if s.coin() {
+		// Do not allow collated string types. These are not supported in UDFs.
+		rtyp = s.randType()
+		for rtyp.Family() == types.CollatedStringFamily {
+			rtyp = s.randType()
+		}
+	}
+	// Return multiple rows with the SETOF option about 33% of the time.
+	setof := false
+	if s.d6() < 3 {
+		setof = true
+	}
+	rtype := tree.FuncReturnType{
+		Type:  rtyp,
+		IsSet: setof,
+	}
+
+	paramCnt := s.rnd.Intn(10)
+	if s.types == nil || len(s.types.scalarTypes) == 0 {
+		paramCnt = 0
+	}
+	// TODO(100405): Add support for non-default param classes. Currently, only IN
+	// parameters are supported.
+	// TODO(100962): Set a param default value sometimes.
+	params := make(tree.FuncParams, paramCnt)
+	paramTypes := make(tree.ParamTypes, paramCnt)
+	refs := make(colRefs, paramCnt)
+	for i := 0; i < paramCnt; i++ {
+		// Do not allow collated string types. These are not supported in UDFs.
+		ptyp := s.randType()
+		for ptyp.Family() == types.CollatedStringFamily {
+			ptyp = s.randType()
+		}
+		pname := fmt.Sprintf("p%d", i)
+		params[i] = tree.FuncParam{
+			Name: tree.Name(pname),
+			Type: ptyp,
+		}
+		paramTypes[i] = tree.ParamType{
+			Name: pname,
+			Typ:  ptyp,
+		}
+		refs[i] = &colRef{
+			typ: ptyp,
+			item: &tree.ColumnItem{
+				ColumnName: tree.Name(pname),
+			},
+		}
+	}
+
+	// There are up to 5 function options that may be applied to UDFs.
+	var opts tree.FunctionOptions
+	opts = make(tree.FunctionOptions, 0, 5)
+
+	// FunctionNullInputBehavior
+	// 50%: Do not specify behavior (default is FunctionCalledOnNullInput).
+	// ~17%: FunctionCalledOnNullInput
+	// ~17%: FunctionReturnsNullOnNullInput
+	// ~17%: FunctionStrict
+	switch s.d6() {
+	case 1:
+		opts = append(opts, tree.FunctionCalledOnNullInput)
+	case 2:
+		opts = append(opts, tree.FunctionReturnsNullOnNullInput)
+	case 3:
+		opts = append(opts, tree.FunctionStrict)
+	}
+
+	// FunctionVolatility
+	// 50%: Do not specify behavior (default is volatile).
+	// ~17%: FunctionVolatile
+	// ~17%: FunctionImmutable
+	// ~17%: FunctionStable
+	funcVol := tree.FunctionVolatile
+	vol := volatility.Volatile
+	switch s.d6() {
+	case 1:
+		funcVol = tree.FunctionImmutable
+		vol = volatility.Immutable
+	case 2:
+		funcVol = tree.FunctionStable
+		vol = volatility.Stable
+	}
+	if funcVol != tree.FunctionVolatile || s.coin() {
+		opts = append(opts, funcVol)
+	}
+
+	// FunctionLeakproof
+	// Leakproof can only be used with immutable volatility. If the function is
+	// immutable, also specify leakproof 50% of the time. Otherwise, specify
+	// not leakproof 50% of the time (default is not leakproof).
+	leakproof := false
+	if funcVol == tree.FunctionImmutable {
+		leakproof = s.coin()
+	}
+	if leakproof || s.coin() {
+		if leakproof {
+			vol = volatility.Leakproof
+		}
+		opts = append(opts, tree.FunctionLeakproof(leakproof))
+	}
+
+	// FunctionLanguage
+	// Currently only SQL is supported.
+	opts = append(opts, tree.FunctionLangSQL)
+
+	// FunctionBodyStr
+	// Generate SQL statements for the function body. More than one may be
+	// generated, but only the result of the final statement will matter for
+	// the function return type. Use the FunctionBodyStr option so the statements
+	// are formatted correctly.
+	stmtCnt := s.rnd.Intn(11)
+	stmts := make([]string, 0, stmtCnt)
+	// Disable CTEs temporarily, since they are not currently supported in UDFs.
+	// TODO(92961): Allow CTEs in generated statements in UDF bodies.
+	// TODO(93049): Allow UDFs to call other UDFs, as well as create other UDFs.
+	oldDisableWith := s.disableWith
+	defer func() {
+		s.disableWith = oldDisableWith
+		s.disableUDFs = false
+	}()
+	s.disableWith = true
+	s.disableUDFs = true
+	for i := 0; i < stmtCnt; i++ {
+		// UDFs currently only support SELECT statements.
+		// TODO(87289): Add mutations to the generated statements.
+		var stmt tree.Statement
+		if i == stmtCnt-1 {
+			// The return type of the last statement should match the function return
+			// type.
+			if stmt, _, ok = s.makeSelect([]*types.T{rtyp}, refs); !ok {
+				return nil, false
+			}
+		} else {
+			if stmt, _, ok = s.makeSelect(nil /* desiredTypes */, refs); !ok {
+				continue
+			}
+		}
+		stmts = append(stmts, tree.AsStringWithFlags(stmt, tree.FmtParsable))
+	}
+	if len(stmts) > 0 {
+		opts = append(opts, tree.FunctionBodyStr(strings.Join(stmts, "\n")))
+	}
+
+	stmt := &tree.CreateFunction{
+		FuncName:   name,
+		ReturnType: rtype,
+		Params:     params,
+		Options:    opts,
+	}
+
+	// Add this function to the functions list so that we can use it in future
+	// queries. Unfortunately, if the function fails to be created, then any
+	// queries that reference it will also fail.
+	class := tree.NormalClass
+	if setof {
+		class = tree.GeneratorClass
+	}
+
+	// We only add overload fields that are necessary to generate functions.
+	ov := &tree.Overload{
+		Volatility: vol,
+		Types:      paramTypes,
+		Class:      class,
+		IsUDF:      true,
+	}
+
+	functions[class][rtyp.Oid()] = append(functions[class][rtyp.Oid()], function{
+		def:      tree.NewFunctionDefinition(name.String(), &tree.FunctionProperties{}, nil /* def */),
+		overload: ov,
+	})
+	return stmt, true
+}
+
 func makeDelete(s *Smither) (tree.Statement, bool) {
 	stmt, _, ok := s.makeDelete(nil)
 	return stmt, ok
 }
 
-func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
-	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, []*tableRef, bool) {
+	table, _, ref, cols, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
+	}
+	tRefs := []*tableRef{ref}
+
+	var hasJoinTable bool
+	var using tree.TableExprs
+	// With 50% probably add another table into the USING clause.
+	for s.coin() {
+		t, _, tRef, c, ok := s.getSchemaTable()
+		if !ok {
+			break
+		}
+		hasJoinTable = true
+		using = append(using, t)
+		tRefs = append(tRefs, tRef)
+		cols = append(cols, c...)
 	}
 
 	del := &tree.Delete{
 		Table:     table,
-		Where:     s.makeWhere(tableRefs, false /* hasJoinTable */),
-		OrderBy:   s.makeOrderBy(tableRefs),
+		Where:     s.makeWhere(cols, hasJoinTable),
+		OrderBy:   s.makeOrderBy(cols),
+		Using:     using,
 		Limit:     makeLimit(s),
 		Returning: &tree.NoReturningClause{},
 	}
@@ -892,7 +1101,7 @@ func (s *Smither) makeDelete(refs colRefs) (*tree.Delete, *tableRef, bool) {
 		del.OrderBy = nil
 	}
 
-	return del, tableRef, true
+	return del, tRefs, true
 }
 
 func makeDeleteReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -919,38 +1128,57 @@ func makeUpdate(s *Smither) (tree.Statement, bool) {
 	return stmt, ok
 }
 
-func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
-	table, _, tableRef, tableRefs, ok := s.getSchemaTable()
+func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, []*tableRef, bool) {
+	table, _, ref, cols, ok := s.getSchemaTable()
 	if !ok {
 		return nil, nil, false
 	}
-	cols := make(map[tree.Name]*tree.ColumnTableDef)
-	for _, c := range tableRef.Columns {
-		cols[c.Name] = c
+	tRefs := []*tableRef{ref}
+	// Each column can be set at most once. Copy colRefs to upRefs - we will
+	// remove elements from it as we use them below.
+	//
+	// Note that we need to make this copy before we append columns from other
+	// tables added into the FROM clause below.
+	upRefs := cols.extend()
+
+	var hasJoinTable bool
+	var from tree.TableExprs
+	// With 50% probably add another table into the FROM clause.
+	for s.coin() {
+		t, _, tRef, c, ok := s.getSchemaTable()
+		if !ok {
+			break
+		}
+		hasJoinTable = true
+		from = append(from, t)
+		tRefs = append(tRefs, tRef)
+		cols = append(cols, c...)
 	}
 
 	update := &tree.Update{
 		Table:     table,
-		Where:     s.makeWhere(tableRefs, false /* hasJoinTable */),
-		OrderBy:   s.makeOrderBy(tableRefs),
+		From:      from,
+		Where:     s.makeWhere(cols, hasJoinTable),
+		OrderBy:   s.makeOrderBy(cols),
 		Limit:     makeLimit(s),
 		Returning: &tree.NoReturningClause{},
 	}
-	// Each row can be set at most once. Copy tableRefs to upRefs and remove
-	// elements from it as we use them.
-	upRefs := tableRefs.extend()
+	colByName := make(map[tree.Name]*tree.ColumnTableDef)
+	for _, c := range ref.Columns {
+		colByName[c.Name] = c
+	}
 	for (len(update.Exprs) < 1 || s.coin()) && len(upRefs) > 0 {
 		n := s.rnd.Intn(len(upRefs))
 		ref := upRefs[n]
 		upRefs = append(upRefs[:n], upRefs[n+1:]...)
-		col := cols[ref.item.ColumnName]
+		col := colByName[ref.item.ColumnName]
 		// Ignore computed and hidden columns.
 		if col == nil || col.Computed.Computed || col.Hidden {
 			continue
 		}
 		var expr tree.TypedExpr
 		for {
-			expr = makeScalar(s, ref.typ, tableRefs)
+			expr = makeScalar(s, ref.typ, cols)
 			// Make sure expr isn't null if that's not allowed.
 			if col.Nullable.Nullability != tree.NotNull || expr != tree.DNull {
 				break
@@ -968,7 +1196,7 @@ func (s *Smither) makeUpdate(refs colRefs) (*tree.Update, *tableRef, bool) {
 		update.OrderBy = nil
 	}
 
-	return update, tableRef, true
+	return update, tRefs, true
 }
 
 func makeUpdateReturning(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool) {
@@ -1157,7 +1385,7 @@ func (s *Smither) makeInsertReturning(refs colRefs) (tree.TableExpr, colRefs, bo
 		return nil, nil, false
 	}
 	var returningRefs colRefs
-	insert.Returning, returningRefs = s.makeReturning(insertRef)
+	insert.Returning, returningRefs = s.makeReturning([]*tableRef{insertRef})
 	return &tree.StatementSource{
 		Statement: insert,
 	}, returningRefs, true
@@ -1315,14 +1543,16 @@ func makeLimit(s *Smither) *tree.Limit {
 	return nil
 }
 
-func (s *Smither) makeReturning(table *tableRef) (*tree.ReturningExprs, colRefs) {
+func (s *Smither) makeReturning(tables []*tableRef) (*tree.ReturningExprs, colRefs) {
 	desiredTypes := s.makeDesiredTypes()
 
-	refs := make(colRefs, len(table.Columns))
-	for i, c := range table.Columns {
-		refs[i] = &colRef{
-			typ:  tree.MustBeStaticallyKnownType(c.Type),
-			item: &tree.ColumnItem{ColumnName: c.Name},
+	var refs colRefs
+	for _, table := range tables {
+		for _, c := range table.Columns {
+			refs = append(refs, &colRef{
+				typ:  tree.MustBeStaticallyKnownType(c.Type),
+				item: &tree.ColumnItem{ColumnName: c.Name},
+			})
 		}
 	}
 

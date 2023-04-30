@@ -36,7 +36,10 @@ func registerSQLSmith(r registry.Registry) {
 		"seed":                      sqlsmith.Setups["seed"],
 		sqlsmith.RandTableSetupName: sqlsmith.Setups[sqlsmith.RandTableSetupName],
 		"tpch-sf1": func(r *rand.Rand) []string {
-			return []string{`RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`}
+			return []string{`
+RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`}
 		},
 		"tpcc": func(r *rand.Rand) []string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
@@ -54,7 +57,10 @@ func registerSQLSmith(r registry.Registry) {
 			} {
 				stmts = append(
 					stmts,
-					fmt.Sprintf("RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';",
+					fmt.Sprintf(`
+RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`,
 						t, version,
 					),
 				)
@@ -191,12 +197,8 @@ func registerSQLSmith(r registry.Registry) {
 						return
 					}
 
-					// At the moment, CockroachDB doesn't support pgwire query
-					// cancellation which is needed for correct handling of context
-					// cancellation, so instead of using a context with timeout, we opt
-					// in for using CRDB's 'statement_timeout'.
-					// TODO(yuzefovich): once #41335 is implemented, go back to using a
-					// context with timeout.
+					// TODO(yuzefovich): investigate why using the context with
+					// a timeout results in poisoning the connection (#101208).
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)

@@ -102,7 +102,7 @@ func maybeDropIndex(
 	}
 	// We don't support handling zone config related properties for tables, so
 	// throw an unsupported error.
-	fallBackIfZoneConfigExists(b, nil, sie.TableID)
+	fallBackIfSubZoneConfigExists(b, nil, sie.TableID)
 	// Cannot drop the index if not CASCADE and a unique constraint depends on it.
 	if dropBehavior != tree.DropCascade && sie.IsUnique && !sie.IsCreatedExplicitly {
 		panic(errors.WithHint(
@@ -111,6 +111,7 @@ func maybeDropIndex(
 			"use CASCADE if you really want to drop it.",
 		))
 	}
+	panicIfSchemaIsLocked(b.QueryByID(sie.TableID))
 	dropSecondaryIndex(b, indexName, dropBehavior, sie)
 	return sie
 }

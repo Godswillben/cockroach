@@ -30,19 +30,25 @@ const TimeFormat = "2006/01/02 15:04:05"
 var (
 	// These variables are initialized by Bazel via the linker -X flag
 	// when compiling release binaries.
-	utcTime         string // Build time in UTC (year/month/day hour:min:sec)
-	rev             string // SHA-1 of this build (git rev-parse)
-	cgoCompiler     = cgoVersion()
-	cgoTargetTriple string
-	platform        = fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
+	utcTime          string // Build time in UTC (year/month/day hour:min:sec)
+	rev              string // SHA-1 of this build (git rev-parse)
+	buildTagOverride string
+	cgoCompiler      = cgoVersion()
+	cgoTargetTriple  string
+	platform         = fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
 	// Distribution is changed by the CCL init-time hook in non-APL builds.
 	Distribution = "OSS"
 	typ          string // Type of this build: <empty>, "development", or "release"
-	channel      = "unknown"
+	channel      string
 	envChannel   = envutil.EnvOrDefaultString("COCKROACH_CHANNEL", "unknown")
 	//go:embed version.txt
 	cockroachVersion string
 	binaryVersion    = computeBinaryVersion(cockroachVersion, rev)
+)
+
+const (
+	DefaultTelemetryChannel = "official-binary"
+	FIPSTelemetryChannel    = "official-fips-binary"
 )
 
 // IsRelease returns true if the binary was produced by a "release" build.
@@ -53,10 +59,13 @@ func IsRelease() bool {
 // SeemsOfficial reports whether this binary is likely to have come from an
 // official release channel.
 func SeemsOfficial() bool {
-	return channel == "official-binary" || channel == "source-archive"
+	return channel == DefaultTelemetryChannel || channel == FIPSTelemetryChannel
 }
 
 func computeBinaryVersion(versionTxt, revision string) string {
+	if buildTagOverride != "" {
+		return buildTagOverride
+	}
 	txt := strings.TrimSuffix(versionTxt, "\n")
 	v, err := version.Parse(txt)
 	if err != nil {
@@ -65,7 +74,10 @@ func computeBinaryVersion(versionTxt, revision string) string {
 	if IsRelease() {
 		return v.String()
 	}
-	return fmt.Sprintf("%s-dev-%s", v.String(), revision)
+	if revision != "" {
+		return fmt.Sprintf("%s-dev-%s", v.String(), revision)
+	}
+	return fmt.Sprintf("%s-dev", v.String())
 }
 
 // BinaryVersion returns the version prefix, patch number and metadata of the current build.
@@ -140,6 +152,10 @@ func (b Info) Timestamp() (int64, error) {
 
 // GetInfo returns an Info struct populated with the build information.
 func GetInfo() Info {
+	ch := channel
+	if ch == "" {
+		ch = "unknown"
+	}
 	return Info{
 		GoVersion:       runtime.Version(),
 		Tag:             binaryVersion,
@@ -150,7 +166,7 @@ func GetInfo() Info {
 		Platform:        platform,
 		Distribution:    Distribution,
 		Type:            typ,
-		Channel:         channel,
+		Channel:         ch,
 		EnvChannel:      envChannel,
 	}
 }

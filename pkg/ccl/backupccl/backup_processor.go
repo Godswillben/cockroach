@@ -107,7 +107,6 @@ type backupDataProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.BackupDataSpec
-	output  execinfra.RowReceiver
 
 	// cancelAndWaitForWorker cancels the producer goroutine and waits for it to
 	// finish. It can be called multiple times.
@@ -134,7 +133,6 @@ func newBackupDataProcessor(
 	processorID int32,
 	spec execinfrapb.BackupDataSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	memMonitor := flowCtx.Cfg.BackupMonitor
 	if knobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
@@ -146,11 +144,10 @@ func newBackupDataProcessor(
 	bp := &backupDataProcessor{
 		flowCtx: flowCtx,
 		spec:    spec,
-		output:  output,
 		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
 		memAcc:  &ba,
 	}
-	if err := bp.Init(ctx, bp, post, backupOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := bp.Init(ctx, bp, post, backupOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// This processor doesn't have any inputs to drain.
 			InputsToDrain: nil,
@@ -220,8 +217,8 @@ func (bp *backupDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Producer
 
 func (bp *backupDataProcessor) close() {
 	bp.cancelAndWaitForWorker()
-	bp.agg.Close()
 	if bp.InternalClose() {
+		bp.agg.Close()
 		bp.memAcc.Close(bp.Ctx())
 	}
 }
@@ -399,8 +396,9 @@ func runBackupProcessor(
 						// We set the DistSender response target bytes field to a sentinel
 						// value. The sentinel value of 1 forces the ExportRequest to paginate
 						// after creating a single SST.
-						TargetBytes: 1,
-						Timestamp:   span.end,
+						TargetBytes:                 1,
+						Timestamp:                   span.end,
+						ReturnElasticCPUResumeSpans: true,
 					}
 					if priority {
 						// This re-attempt is reading far enough in the past that we just want

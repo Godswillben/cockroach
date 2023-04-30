@@ -10,7 +10,7 @@
 
 import React from "react";
 import { Anchor } from "src/anchor";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import { Tooltip } from "@cockroachlabs/ui-components";
 import {
@@ -23,6 +23,7 @@ import {
   statementsSql,
   writtenToDisk,
 } from "src/util";
+import { Timezone } from "src/timestamp";
 
 export type NodeNames = { [nodeId: string]: string };
 
@@ -37,7 +38,7 @@ export const statisticsColumnLabels = {
   database: "Database",
   diagnostics: "Diagnostics",
   executionCount: "Execution Count",
-  lastExecTimestamp: "Last Execution Time (UTC)",
+  lastExecTimestamp: "Last Execution Time",
   latencyMax: "Max Latency",
   latencyMin: "Min Latency",
   latencyP50: "P50 Latency",
@@ -56,10 +57,10 @@ export const statisticsColumnLabels = {
   rowsProcessed: "Rows Processed",
   sessionActiveDuration: "Session Active Duration",
   sessionDuration: "Session Duration",
-  sessionStart: "Session Start Time (UTC)",
+  sessionStart: "Session Start Time",
   sessionTxnCount: "Transaction Count",
   statementFingerprintId: "Statement Fingerprint ID",
-  statementStartTime: "Statement Start Time (UTC)",
+  statementStartTime: "Statement Start Time",
   statements: "Statements",
   statementsCount: "Statements",
   status: "Status",
@@ -129,7 +130,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         placement="bottom"
         content={"The timestamp at which the session started."}
       >
-        {getLabel("sessionStart")}
+        <>
+          {getLabel("sessionStart")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -201,7 +204,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         placement="bottom"
         content={"The timestamp at which the statement started."}
       >
-        {getLabel("statementStartTime")}
+        <>
+          {getLabel("statementStartTime")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -469,7 +474,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
           <p>Last time stamp on which the {contentModifier} was executed.</p>
         }
       >
-        {getLabel("lastExecTimestamp")}
+        <>
+          {getLabel("lastExecTimestamp")} <Timezone />
+        </>
       </Tooltip>
     );
   },
@@ -1024,18 +1031,3 @@ export const statisticsTableTitles: StatisticTableTitleType = {
     );
   },
 };
-
-export function formatAggregationIntervalColumn(
-  aggregatedTs: number,
-  interval: number,
-): string {
-  const formatStr = "MMM D, H:mm";
-  const formatStrWithoutDay = "H:mm";
-  const start = moment.unix(aggregatedTs).utc();
-  const end = moment.unix(aggregatedTs + interval).utc();
-  const isSameDay = start.isSame(end, "day");
-
-  return `${start.format(formatStr)} - ${end.format(
-    isSameDay ? formatStrWithoutDay : formatStr,
-  )}`;
-}

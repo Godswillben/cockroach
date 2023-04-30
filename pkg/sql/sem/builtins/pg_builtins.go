@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/errors"
@@ -147,11 +148,13 @@ func init() {
 		if !ok {
 			return
 		}
+		distSQLBlockList := toType.Family() == types.OidFamily
 		if _, ok := castBuiltins[toOID]; !ok {
 			castBuiltins[toOID] = &builtinDefinition{
 				props: tree.FunctionProperties{
-					Category:     builtinconstants.CategoryCast,
-					Undocumented: true,
+					Category:         builtinconstants.CategoryCast,
+					Undocumented:     true,
+					DistsqlBlocklist: distSQLBlockList,
 				},
 			}
 		}
@@ -305,7 +308,6 @@ func makePGGetViewDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
 		Types:      paramTypes,
 		ReturnType: tree.FixedReturnType(types.String),
-		IsUDF:      true,
 		Body: `SELECT definition
 		FROM pg_catalog.pg_views v
 		JOIN pg_catalog.pg_class c ON c.relname=v.viewname
@@ -325,7 +327,6 @@ func makePGGetConstraintDef(paramTypes tree.ParamTypes) tree.Overload {
 	return tree.Overload{
 		Types:      paramTypes,
 		ReturnType: tree.FixedReturnType(types.String),
-		IsUDF:      true,
 		Body:       `SELECT condef FROM pg_catalog.pg_constraint WHERE oid=$1 LIMIT 1`,
 		Info:       notUsableInfo,
 		Volatility: volatility.Stable,
@@ -693,7 +694,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body: fmt.Sprintf(
 				`SELECT COALESCE(create_statement, prosrc)
              FROM pg_catalog.pg_proc
@@ -714,7 +714,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (with defaults) necessary to identify a function, " +
 				"in the form it would need to appear in within CREATE FUNCTION.",
@@ -732,7 +731,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body: `SELECT t.typname
              FROM pg_catalog.pg_proc p
              JOIN pg_catalog.pg_type t
@@ -753,7 +751,6 @@ var pgBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
-			IsUDF:      true,
 			Body:       getFunctionArgStringQuery,
 			Info: "Returns the argument list (without defaults) necessary to identify a function, " +
 				"in the form it would need to appear in within ALTER FUNCTION, for instance.",
@@ -767,7 +764,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	"pg_get_indexdef": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo, DistsqlBlocklist: true},
 		tree.Overload{
-			IsUDF:             true,
 			Types:             tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}},
 			ReturnType:        tree.FixedReturnType(types.String),
 			Body:              `SELECT indexdef FROM pg_catalog.pg_indexes WHERE crdb_oid = $1`,
@@ -776,7 +772,6 @@ var pgBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "index_oid", Typ: types.Oid}, {Name: "column_no", Typ: types.Int}, {Name: "pretty_bool", Typ: types.Bool}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT CASE
@@ -791,8 +786,8 @@ var pgBuiltins = map[string]builtinDefinition{
 						ELSE a.attname
 					END as pg_get_indexdef
 					FROM pg_catalog.pg_index i
-					LEFT JOIN pg_attribute a ON (a.attrelid = i.indexrelid AND a.attnum = $2)
-					LEFT JOIN pg_indexes defs ON ($2 = 0 AND defs.crdb_oid = i.indexrelid)
+					LEFT JOIN pg_catalog.pg_attribute a ON (a.attrelid = i.indexrelid AND a.attnum = $2)
+					LEFT JOIN pg_catalog.pg_indexes defs ON ($2 = 0 AND defs.crdb_oid = i.indexrelid)
 					WHERE i.indexrelid = $1`,
 			Info:       "Gets the CREATE INDEX command for index, or definition of just one index column when given a non-zero column number",
 			Volatility: volatility.Stable,
@@ -948,7 +943,6 @@ var pgBuiltins = map[string]builtinDefinition{
 				{Name: "role_oid", Typ: types.Oid},
 			},
 			ReturnType:        tree.FixedReturnType(types.String),
-			IsUDF:             true,
 			Body:              `SELECT COALESCE((SELECT rolname FROM pg_catalog.pg_roles WHERE oid=$1 LIMIT 1), 'unknown (OID=' || $1 || ')')`,
 			Info:              notUsableInfo,
 			Volatility:        volatility.Stable,
@@ -968,7 +962,6 @@ var pgBuiltins = map[string]builtinDefinition{
 				[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Bool, types.Int, types.Oid},
 				[]string{"start_value", "minimum_value", "maxmimum_value", "increment", "cycle_option", "cache_size", "data_type"},
 			)),
-			IsUDF: true,
 			Body: `SELECT COALESCE ((SELECT (seqstart, seqmin, seqmax, seqincrement, seqcycle, seqcache, seqtypid)
              FROM pg_catalog.pg_sequence WHERE seqrelid=$1 LIMIT 1),
              CASE WHEN crdb_internal.force_error('42P01', 'relation with OID ' || $1 || ' does not exist') > 0 THEN NULL ELSE NULL END)`,
@@ -998,12 +991,10 @@ var pgBuiltins = map[string]builtinDefinition{
 					typ, err = evalCtx.Planner.ResolveTypeByOID(ctx, oid)
 					if err != nil {
 						// If the error is a descriptor does not exist error, then swallow it.
-						unknown := tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg))
 						switch {
-						case errors.Is(err, catalog.ErrDescriptorNotFound):
-							return unknown, nil
-						case pgerror.GetPGCode(err) == pgcode.UndefinedObject:
-							return unknown, nil
+						case sqlerrors.IsMissingDescriptorError(err),
+							errors.Is(err, catalog.ErrDescriptorNotFound):
+							return tree.NewDString(fmt.Sprintf("unknown (OID=%s)", oidArg)), nil
 						default:
 							return nil, err
 						}
@@ -1027,7 +1018,6 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"col_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "table_oid", Typ: types.Oid}, {Name: "column_number", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.String),
 			// Note: the following is equivalent to:
@@ -1039,7 +1029,7 @@ var pgBuiltins = map[string]builtinDefinition{
 			// on pg_description and let predicate push-down do its job.
 			Body: fmt.Sprintf(
 				`SELECT comment
-         FROM system.comments c
+				 FROM system.public.comments c
 				 WHERE c.type=%[1]d
 				 AND c.object_id=$1::int
 				 AND c.sub_id=$2::int
@@ -1058,7 +1048,6 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"obj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT description
@@ -1073,7 +1062,6 @@ var pgBuiltins = map[string]builtinDefinition{
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
@@ -1096,7 +1084,6 @@ var pgBuiltins = map[string]builtinDefinition{
 
 	"shobj_description": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "object_oid", Typ: types.Oid}, {Name: "catalog_name", Typ: types.String}},
 			ReturnType: tree.FixedReturnType(types.String),
 			Body: `SELECT d.description
@@ -1201,7 +1188,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_function_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -1219,7 +1205,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_table_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -1241,7 +1226,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://www.postgresql.org/docs/9.6/static/functions-info.html
 	"pg_type_is_visible": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF:      true,
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
 			Body: `SELECT n.nspname = any current_schemas(true)
@@ -2038,7 +2022,6 @@ var pgBuiltins = map[string]builtinDefinition{
 	// https://github.com/postgres/postgres/blob/master/src/backend/catalog/information_schema.sql
 	"information_schema._pg_index_position": makeBuiltin(defProps(),
 		tree.Overload{
-			IsUDF: true,
 			Types: tree.ParamTypes{
 				{Name: "oid", Typ: types.Oid},
 				{Name: "col", Typ: types.Int2},

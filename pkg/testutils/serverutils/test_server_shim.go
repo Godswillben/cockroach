@@ -38,11 +38,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
+
+// DefaultTestTenantMessage is a message that is printed when a test is run
+// with the default test tenant. This is useful for debugging test failures.
+const DefaultTestTenantMessage = "Running test with the default test tenant. " +
+	"If you are only seeing a test case failure when this message appears, there may be a " +
+	"problem with your test case running within tenants."
 
 // TenantModeFlagName is the exported name of the tenantMode flag, for use
 // in other packages.
@@ -60,13 +67,25 @@ const (
 	tenantModeDefault       = "default"
 )
 
+var PreventStartTenantError = errors.New("attempting to manually start a tenant while " +
+	"DefaultTestTenant is set to TestTenantProbabilisticOnly")
+
 // ShouldStartDefaultTestTenant determines whether a default test tenant
 // should be started for test servers or clusters, to serve SQL traffic by
 // default. It defaults to 50% probability, but can be overridden by the
 // tenantMode test flag or the COCKROACH_TEST_TENANT_MODE environment variable.
 // If both the environment variable and the test flag are set, the environment
 // variable wins out.
-func ShouldStartDefaultTestTenant(t testing.TB) bool {
+func ShouldStartDefaultTestTenant(t testing.TB, serverArgs base.TestServerArgs) bool {
+	// Explicit cases for enabling or disabling the default test tenant.
+	if serverArgs.DefaultTestTenant == base.TestTenantDisabled {
+		return false
+	}
+	if serverArgs.DefaultTestTenant == base.TestTenantEnabled {
+		return true
+	}
+
+	// Probabilistic cases for enabling or disabling the default test tenant.
 	var defaultProbabilityOfStartingTestTenant = 0.5
 	if skip.UnderBench() {
 		// Until #83461 is resolved, we want to make sure that we don't use the
@@ -250,6 +269,10 @@ type TestServerInterface interface {
 	// StartSharedProcessTenant() for a tenant simulating a shared-memory server.
 	StartTenant(ctx context.Context, params base.TestTenantArgs) (TestTenantInterface, error)
 
+	// DisableStartTenant prevents manual starting of tenants. If an attempt at
+	// starting a tenant is made, the server will return the specified error.
+	DisableStartTenant(reason error)
+
 	// ScratchRange splits off a range suitable to be used as KV scratch space.
 	// (it doesn't overlap system spans or SQL tables).
 	//
@@ -275,6 +298,18 @@ type TestServerInterface interface {
 
 	// TestTenants returns the test tenants associated with the server
 	TestTenants() []TestTenantInterface
+
+	// StartedDefaultTestTenant returns true if the server has started the default
+	// test tenant.
+	StartedDefaultTestTenant() bool
+
+	// TenantOrServer returns the default test tenant, if it was started or this
+	// server if not.
+	TenantOrServer() TestTenantInterface
+
+	// BinaryVersionOverride returns the value of an override if set using
+	// TestingKnobs.
+	BinaryVersionOverride() roachpb.Version
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
@@ -299,28 +334,45 @@ func InitTestServerFactory(impl TestServerFactory) {
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
 ) (TestServerInterface, *gosql.DB, *kv.DB) {
-	if !params.DisableDefaultTestTenant {
-		// Determine if we should probabilistically start a test tenant
-		// for this server.
-		startDefaultSQLServer := ShouldStartDefaultTestTenant(t)
-		if !startDefaultSQLServer {
-			// If we're told not to start a test tenant, set the
-			// disable flag explicitly.
-			params.DisableDefaultTestTenant = true
-		}
+	preventFurtherTenants := params.DefaultTestTenant == base.TestTenantProbabilisticOnly
+	// Determine if we should probabilistically start a test tenant
+	// for this server.
+	startDefaultSQLServer := ShouldStartDefaultTestTenant(t, params)
+	if !startDefaultSQLServer {
+		// If we're told not to start a test tenant, set the
+		// disable flag explicitly.
+		params.DefaultTestTenant = base.TestTenantDisabled
 	}
 
-	server, err := NewServer(params)
+	s, err := NewServer(params)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if err := server.Start(context.Background()); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("%+v", err)
 	}
+
+	if s.StartedDefaultTestTenant() {
+		t.Log(DefaultTestTenantMessage)
+	}
+
+	if preventFurtherTenants {
+		s.DisableStartTenant(PreventStartTenantError)
+	}
+
 	goDB := OpenDBConn(
-		t, server.ServingSQLAddr(), params.UseDatabase, params.Insecure, server.Stopper())
-	return server, goDB, server.DB()
+		t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+
+	// Now that we have started the server on the bootstrap version, let us run
+	// the migrations up to the overridden BinaryVersion.
+	if v := s.BinaryVersionOverride(); v != (roachpb.Version{}) {
+		if _, err := goDB.Exec(`SET CLUSTER SETTING version = $1`, v.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return s, goDB, s.DB()
 }
 
 // NewServer creates a test server.
@@ -376,15 +428,18 @@ func OpenDBConn(
 }
 
 // StartServerRaw creates and starts a TestServer.
-// Generally StartServer() should be used. However this function can be used
+// Generally StartServer() should be used. However, this function can be used
 // directly when opening a connection to the server is not desired.
-func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
+func StartServerRaw(t testing.TB, args base.TestServerArgs) (TestServerInterface, error) {
 	server, err := NewServer(args)
 	if err != nil {
 		return nil, err
 	}
 	if err := server.Start(context.Background()); err != nil {
 		return nil, err
+	}
+	if server.StartedDefaultTestTenant() {
+		t.Log(DefaultTestTenantMessage)
 	}
 	return server, nil
 }
@@ -399,6 +454,7 @@ func StartServerRaw(args base.TestServerArgs) (TestServerInterface, error) {
 func StartTenant(
 	t testing.TB, ts TestServerInterface, params base.TestTenantArgs,
 ) (TestTenantInterface, *gosql.DB) {
+
 	tenant, err := ts.StartTenant(context.Background(), params)
 	if err != nil {
 		t.Fatalf("%+v", err)
@@ -411,6 +467,16 @@ func StartTenant(
 
 	goDB := OpenDBConn(
 		t, tenant.SQLAddr(), params.UseDatabase, false /* insecure */, stopper)
+	return tenant, goDB
+}
+
+func StartSharedProcessTenant(
+	t testing.TB, ts TestServerInterface, params base.TestSharedProcessTenantArgs,
+) (TestTenantInterface, *gosql.DB) {
+	tenant, goDB, err := ts.StartSharedProcessTenant(context.Background(), params)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
 	return tenant, goDB
 }
 
@@ -450,7 +516,9 @@ func GetJSONProtoWithAdminOption(
 	if err != nil {
 		return err
 	}
-	return httputil.GetJSON(httpClient, ts.AdminURL()+path, response)
+	fullURL := ts.AdminURL() + path
+	log.Infof(context.Background(), "test retrieving protobuf over HTTP: %s", fullURL)
+	return httputil.GetJSON(httpClient, fullURL, response)
 }
 
 // PostJSONProto uses the supplied client to POST the URL specified by the parameters
@@ -469,5 +537,7 @@ func PostJSONProtoWithAdminOption(
 	if err != nil {
 		return err
 	}
-	return httputil.PostJSON(httpClient, ts.AdminURL()+path, request, response)
+	fullURL := ts.AdminURL() + path
+	log.Infof(context.Background(), "test retrieving protobuf over HTTP: %s", fullURL)
+	return httputil.PostJSON(httpClient, fullURL, request, response)
 }

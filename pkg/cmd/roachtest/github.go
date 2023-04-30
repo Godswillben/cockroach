@@ -111,27 +111,30 @@ func (g *githubIssues) createPostRequest(
 	var mention []string
 	var projColID int
 
-	issueOwner := t.Spec().(*registry.TestSpec).Owner
+	spec := t.Spec().(*registry.TestSpec)
+	issueOwner := spec.Owner
 	issueName := t.Name()
 
 	messagePrefix := ""
+	var infraFlake bool
 	// Overrides to shield eng teams from potential flakes
 	if cat == clusterCreationErr {
 		issueOwner = registry.OwnerDevInf
 		issueName = "cluster_creation"
 		messagePrefix = fmt.Sprintf("test %s was skipped due to ", t.Name())
+		infraFlake = true
 	} else if cat == sshErr {
 		issueOwner = registry.OwnerTestEng
 		issueName = "ssh_problem"
 		messagePrefix = fmt.Sprintf("test %s failed due to ", t.Name())
+		infraFlake = true
 	}
 
 	// Issues posted from roachtest are identifiable as such and
 	// they are also release blockers (this label may be removed
 	// by a human upon closer investigation).
-	spec := t.Spec().(*registry.TestSpec)
 	labels := []string{"O-roachtest"}
-	if !spec.NonReleaseBlocker {
+	if !spec.NonReleaseBlocker && !infraFlake {
 		labels = append(labels, "release-blocker")
 	}
 
@@ -174,12 +177,16 @@ func (g *githubIssues) createPostRequest(
 		clusterParams[roachtestPrefix("encrypted")] = fmt.Sprintf("%v", g.cluster.encAtRest)
 	}
 
+	issueMessage := messagePrefix + message
+	if spec.RedactResults {
+		issueMessage = "The details about this test failure have been omitted; consult the log for more details"
+	}
 	return issues.PostRequest{
 		MentionOnCreate: mention,
 		ProjectColumnID: projColID,
 		PackageName:     "roachtest",
 		TestName:        issueName,
-		Message:         messagePrefix + message,
+		Message:         issueMessage,
 		Artifacts:       artifacts,
 		ExtraLabels:     labels,
 		ExtraParams:     clusterParams,

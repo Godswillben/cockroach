@@ -51,6 +51,7 @@ go_library(
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/lex",
         "//pkg/sql/parser",
@@ -80,6 +81,7 @@ go_library(
         "//pkg/util/hlc",
         "//pkg/util/json",
         "//pkg/util/mon",
+        "//pkg/util/rangedesc",
         "//pkg/util/ring",
         "//pkg/util/timeofday",
         "//pkg/util/timeutil",
@@ -115,6 +117,7 @@ go_test(
     deps = [
         "//pkg/kv",
         "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/sql/faketreeeval",

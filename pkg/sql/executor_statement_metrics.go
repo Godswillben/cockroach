@@ -184,6 +184,14 @@ func (ex *connExecutor) recordStatementSummary(
 	if err != nil {
 		log.Warningf(ctx, "failed to convert node ID to int: %s", err)
 	}
+
+	nodes := util.CombineUnique(getNodesFromPlanner(planner), []int64{nodeID})
+
+	regions := []string{}
+	if region, ok := ex.server.cfg.Locality.Find("region"); ok {
+		regions = append(regions, region)
+	}
+
 	recordedStmtStats := sqlstats.RecordedStmtStats{
 		SessionID:            ex.sessionID,
 		StatementID:          stmt.QueryID,
@@ -199,7 +207,8 @@ func (ex *connExecutor) recordStatementSummary(
 		BytesRead:            stats.bytesRead,
 		RowsRead:             stats.rowsRead,
 		RowsWritten:          stats.rowsWritten,
-		Nodes:                util.CombineUniqueInt64(getNodesFromPlanner(planner), []int64{nodeID}),
+		Nodes:                nodes,
+		Regions:              regions,
 		StatementType:        stmt.AST.StatementType(),
 		Plan:                 planner.instrumentation.PlanForStats(ctx),
 		PlanGist:             planner.instrumentation.planGist.String(),
@@ -317,6 +326,5 @@ func getNodesFromPlanner(planner *planner) []int64 {
 			nodes = append(nodes, int64(i))
 		})
 	}
-
 	return nodes
 }

@@ -153,6 +153,11 @@ message MergeTrigger {
     (gogoproto.nullable) = false
   ];
 
+  storage.enginepb.MVCCStats right_range_id_local_mvcc_stats = 9 [
+    (gogoproto.customname) = "RightRangeIDLocalMVCCStats",
+    (gogoproto.nullable) = false
+  ];
+
   // FreezeStart is a timestamp that is guaranteed to be greater than the
   // timestamps at which any requests were serviced by the right-hand side range
   // before it stopped responding to requests altogether (in anticipation of
@@ -649,7 +654,7 @@ message Lease {
   // (see Lease.Equivalent). Two adjacent leases that are equivalent will have
   // the same sequence number and two adjacent leases that are not equivalent
   // will have different sequence numbers.
-  int64 sequence = 7 [(gogoproto.casttype) = "LeaseSequence"];
+  uint64 sequence = 7 [(gogoproto.casttype) = "LeaseSequence"];
 
   // The type of acquisition event that result in this lease (transfer or
   // request).
@@ -702,7 +707,7 @@ message LeafTxnInputState {
   // Current read seqnum. When stepping_mode_enabled is true,
   // this field becomes the sequence number used for reads,
   // regardless of the current seqnum generated for writes. This is
-  // updated via the (client.TxnSender).Step() operation.
+  // updated via the (kv.TxnSender).Step() operation.
   int32 read_seq_num = 10 [
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/storage/enginepb.TxnSeq"];
 }

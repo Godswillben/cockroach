@@ -24,7 +24,7 @@ import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import {
   TimestampToMoment,
   idAttr,
-  DATE_FORMAT_24_UTC,
+  DATE_FORMAT_24_TZ,
   getMatchParamByName,
 } from "src/util";
 
@@ -37,6 +37,7 @@ import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
 import jobStyles from "src/jobs/jobs.module.scss";
 
 import classNames from "classnames/bind";
+import { Timestamp } from "../../timestamp";
 
 const cardCx = classNames.bind(summaryCardStyles);
 const jobCx = classNames.bind(jobStyles);
@@ -99,7 +100,11 @@ export class JobDetails extends React.Component<JobDetailsProps> {
       <>
         <Row gutter={24}>
           <Col className="gutter-row" span={24}>
-            <SqlBox value={job.description} size={SqlBoxSize.custom} />
+            <SqlBox
+              value={job.description}
+              size={SqlBoxSize.custom}
+              format={true}
+            />
           </Col>
         </Row>
         <Row gutter={24}>
@@ -112,7 +117,7 @@ export class JobDetails extends React.Component<JobDetailsProps> {
                   <h3 className={jobCx("summary--card--title", "secondary")}>
                     Next Planned Execution Time:
                   </h3>
-                  {nextRun.format(DATE_FORMAT_24_UTC)}
+                  <Timestamp time={nextRun} format={DATE_FORMAT_24_TZ} />
                 </>
               )}
             </SummaryCard>
@@ -121,15 +126,21 @@ export class JobDetails extends React.Component<JobDetailsProps> {
             <SummaryCard className={cardCx("summary-card")}>
               <SummaryCardItem
                 label="Creation Time"
-                value={TimestampToMoment(job.created).format(
-                  DATE_FORMAT_24_UTC,
-                )}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(job.created)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               <SummaryCardItem
                 label="Last Execution Time"
-                value={TimestampToMoment(job.last_run).format(
-                  DATE_FORMAT_24_UTC,
-                )}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(job.last_run)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               <SummaryCardItem
                 label="Execution Count"

@@ -227,8 +227,8 @@ type Descriptor interface {
 	// was changed after running RunPostDeserializationChanges.
 	GetPostDeserializationChanges() PostDeserializationChanges
 
-	// HasConcurrentSchemaChanges returns true if declarative schema
-	// changes are currently in progress.
+	// HasConcurrentSchemaChanges returns true if it has a schema changer
+	// in progress, either legacy or declarative.
 	HasConcurrentSchemaChanges() bool
 
 	// SkipNamespace is true when a descriptor should not have a namespace record.
@@ -722,12 +722,24 @@ type TableDescriptor interface {
 	// enabled or disabled for this table. If ok is true, then the enabled value
 	// is valid, otherwise this has not been set at the table level.
 	ForecastStatsEnabled() (enabled bool, ok bool)
+	// HistogramSamplesCount indicates the number of rows to sample when building
+	// a histogram for this table. If ok is true, then the histogramSamplesCount
+	// value is valid, otherwise this has not been set at the table level.
+	HistogramSamplesCount() (histogramSamplesCount uint32, ok bool)
+	// HistogramBucketsCount indicates the number of buckets to build when
+	// constructing a histogram for this table. If ok is true, then the
+	// histogramBucketsCount value is valid, otherwise this has not been set at
+	// the table level.
+	HistogramBucketsCount() (histogramBucketsCount uint32, ok bool)
 	// IsRefreshViewRequired indicates if a REFRESH VIEW operation needs to be called
 	// on a materialized view.
 	IsRefreshViewRequired() bool
 	// GetInProgressImportStartTime returns the start wall time of the in progress import,
 	// if it exists.
 	GetInProgressImportStartTime() int64
+	// IsSchemaLocked returns true if we don't allow performing schema changes
+	// on this table descriptor.
+	IsSchemaLocked() bool
 }
 
 // MutableTableDescriptor is both a MutableDescriptor and a TableDescriptor.

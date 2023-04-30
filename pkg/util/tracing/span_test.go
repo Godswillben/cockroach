@@ -446,6 +446,28 @@ func (t testTrace) equalToTrace(tr Trace) bool {
 		return false
 	}
 
+	// _dropped_indirect_children tag should only be added to the true root span
+	if tr.DroppedIndirectChildren {
+		tg := tr.Root.FindTagGroup(tracingpb.AnonymousTagGroupName)
+		if tg == nil {
+			return false
+		}
+		if _, foundTag := tg.FindTag("_dropped_indirect_children"); !foundTag {
+			return false
+		}
+	}
+
+	// _dropped_children tag should only be added to the true root span
+	if tr.DroppedDirectChildren {
+		tg := tr.Root.FindTagGroup(tracingpb.AnonymousTagGroupName)
+		if tg == nil {
+			return false
+		}
+		if _, foundTag := tg.FindTag("_dropped_children"); !foundTag {
+			return false
+		}
+	}
+
 	sort.Slice(tr.Children, func(i, j int) bool {
 		return strings.Compare(tr.Children[i].Root.Operation, tr.Children[j].Root.Operation) == -1
 	})
@@ -453,7 +475,48 @@ func (t testTrace) equalToTrace(tr Trace) bool {
 		return strings.Compare(t.children[i].op, t.children[j].op) == -1
 	})
 	for i, c := range t.children {
-		if !c.equalToTrace(tr.Children[i]) {
+		if !c.equalToTraceRecursive(tr.Children[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (t testTrace) equalToTraceRecursive(tr Trace) bool {
+	if t.op != "" && t.op != tr.Root.Operation {
+		return false
+	}
+	if len(t.children) != len(tr.Children) {
+		return false
+	}
+	// _dropped_indirect_children tag should not be added to child spans
+	if tr.DroppedIndirectChildren {
+		tg := tr.Root.FindTagGroup(tracingpb.AnonymousTagGroupName)
+		if tg != nil {
+			if _, foundTag := tg.FindTag("_dropped_indirect_children"); foundTag {
+				return false
+			}
+		}
+	}
+
+	// _dropped_children tag should not be added to child spans
+	if tr.DroppedDirectChildren {
+		tg := tr.Root.FindTagGroup(tracingpb.AnonymousTagGroupName)
+		if tg != nil {
+			if _, foundTag := tg.FindTag("_dropped_children"); foundTag {
+				return false
+			}
+		}
+	}
+
+	sort.Slice(tr.Children, func(i, j int) bool {
+		return strings.Compare(tr.Children[i].Root.Operation, tr.Children[j].Root.Operation) == -1
+	})
+	sort.Slice(t.children, func(i, j int) bool {
+		return strings.Compare(t.children[i].op, t.children[j].op) == -1
+	})
+	for i, c := range t.children {
+		if !c.equalToTraceRecursive(tr.Children[i]) {
 			return false
 		}
 	}
@@ -1310,14 +1373,16 @@ func TestWithRemoteParentFromTraceInfo(t *testing.T) {
 
 type mockEventListener struct {
 	eventsSeen int
-	notifyImpl func()
+	// If set, then the events are "consumed" by this listener.
+	consuming bool
 }
 
-func (f *mockEventListener) Notify(_ Structured) {
+func (f *mockEventListener) Notify(_ Structured) EventConsumptionStatus {
 	f.eventsSeen++
-	if f.notifyImpl != nil {
-		f.notifyImpl()
+	if f.consuming {
+		return EventConsumed
 	}
+	return EventNotConsumed
 }
 
 var _ EventListener = &mockEventListener{}
@@ -1349,6 +1414,14 @@ func TestEventListener(t *testing.T) {
 	require.Equal(t, 5, rootEventListener.eventsSeen)
 	require.Equal(t, 2, childEventListener.eventsSeen)
 
+	// Make the child event listener "consume" the event and ensure that the
+	// parent doesn't get notified about it.
+	childEventListener.consuming = true
+	childSp.RecordStructured(&types.Int32Value{Value: 9})
+	require.Equal(t, 5, rootEventListener.eventsSeen)
+	require.Equal(t, 3, childEventListener.eventsSeen)
+	childEventListener.consuming = false
+
 	// Finish the child span, and ensure the Structured events aren't re-seen by
 	// the listener when the child deposits them with the parent.
 	childSp.Finish()
@@ -1356,7 +1429,7 @@ func TestEventListener(t *testing.T) {
 
 	// Create a remote child, and the root listener should not be inherited.
 	remoteSp := tr.StartSpan("remote-child", WithRemoteParentFromSpanMeta(sp.Meta()))
-	remoteSp.RecordStructured(&types.Int32Value{Value: 9})
+	remoteSp.RecordStructured(&types.Int32Value{Value: 10})
 	require.Equal(t, 5, rootEventListener.eventsSeen)
 
 	// But, when we import the recording in the root span, the root listener
@@ -1366,35 +1439,16 @@ func TestEventListener(t *testing.T) {
 
 	// Create another child.
 	childSp2 := tr.StartSpan("child2", WithParent(sp))
-	childSp2.RecordStructured(&types.Int32Value{Value: 10})
+	childSp2.RecordStructured(&types.Int32Value{Value: 11})
 	require.Equal(t, 7, rootEventListener.eventsSeen)
 
 	// Now Finish() the parent before the child and ensure that the root event
 	// listener does not see events from the child once the parent has been
 	// Finish()ed.
 	sp.Finish()
-	childSp2.RecordStructured(&types.Int32Value{Value: 11})
+	childSp2.RecordStructured(&types.Int32Value{Value: 12})
 	require.Equal(t, 7, rootEventListener.eventsSeen)
 	childSp2.Finish()
-}
-
-func TestEventListenerNotifiedWithoutHoldingSpanMutex(t *testing.T) {
-	tr := NewTracer()
-	rootEventListener := &mockEventListener{}
-	sp := tr.StartSpan("root", WithRecording(tracingpb.RecordingStructured),
-		WithEventListeners(rootEventListener))
-	defer sp.Finish()
-
-	// Set the EventListeners Notify() method to acquire the span's mutex.
-	rootEventListener.notifyImpl = func() {
-		sp.i.crdb.mu.Lock()
-		defer sp.i.crdb.mu.Unlock()
-	}
-
-	// Record a StructuredEvent, if Notify() were called holding the span's mutex
-	// this would deadlock.
-	sp.RecordStructured(&types.Int32Value{Value: 5})
-	require.Equal(t, 1, rootEventListener.eventsSeen)
 }
 
 // TestFinishedChildrenMetadata tests that on Finish() the parent span's
@@ -1509,4 +1563,23 @@ func TestFinishGetRecordingRace(t *testing.T) {
 		root.GetConfiguredRecording()
 		root.Finish()
 	}
+}
+
+// TestWithEventListenersAndVerboseParent verifies that if the parent has
+// verbose recording and the child uses WithEventListeners option but without
+// explicitly specifying the recording type, the child still has verbose
+// recording.
+func TestWithEventListenersAndVerboseParent(t *testing.T) {
+	tr := NewTracer()
+	parent := tr.StartSpan("parent", WithRecording(tracingpb.RecordingVerbose))
+	defer parent.Finish()
+	_, child := EnsureChildSpan(context.Background(), tr, "child", WithParent(parent), WithEventListeners())
+	defer child.Finish()
+	child.Record("foo")
+	require.NoError(t, CheckRecording(parent.GetConfiguredRecording(), `
+     === operation:parent _unfinished:1 _verbose:1
+     [child]
+         === operation:child _unfinished:1 _verbose:1
+         event:foo
+`))
 }

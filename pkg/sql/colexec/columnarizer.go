@@ -160,7 +160,6 @@ func newColumnarizer(
 		// from being mutated.
 		flowCtx.NewEvalCtx(),
 		processorID,
-		nil, /* output */
 		execinfra.ProcStateOpts{
 			// We append input to inputs to drain below in order to reuse the same
 			// underlying slice from the pooled columnarizer.
@@ -169,7 +168,7 @@ func newColumnarizer(
 	)
 	c.AddInputToDrain(input)
 	c.typs = c.input.OutputTypes()
-	c.helper.Init(batchAllocator, execinfra.GetWorkMemLimit(flowCtx), c.typs)
+	c.helper.Init(batchAllocator, execinfra.GetWorkMemLimit(flowCtx), c.typs, false /* alwaysReallocate */)
 	return c
 }
 

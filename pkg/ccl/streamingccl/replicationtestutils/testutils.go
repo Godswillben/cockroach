@@ -127,6 +127,27 @@ func (c *TenantStreamingClusters) CompareResult(query string) {
 	require.Equal(c.T, sourceData, destData)
 }
 
+func (c *TenantStreamingClusters) RequireFingerprintMatchAtTimestamp(timestamp string) string {
+	expected := FingerprintTenantAtTimestampNoHistory(c.T, c.SrcSysSQL, c.Args.SrcTenantID.ToUint64(), timestamp)
+	actual := FingerprintTenantAtTimestampNoHistory(c.T, c.DestSysSQL, c.Args.DestTenantID.ToUint64(), timestamp)
+	require.Equal(c.T, expected, actual)
+	return actual
+}
+
+func (c *TenantStreamingClusters) RequireDestinationFingerprintAtTimestamp(
+	fingerprint string, timestamp string,
+) {
+	actual := FingerprintTenantAtTimestampNoHistory(c.T, c.DestSysSQL, c.Args.DestTenantID.ToUint64(), timestamp)
+	require.Equal(c.T, fingerprint, actual)
+}
+
+func FingerprintTenantAtTimestampNoHistory(
+	t sqlutils.Fataler, db *sqlutils.SQLRunner, tenantID uint64, timestamp string,
+) string {
+	fingerprintQuery := fmt.Sprintf("SELECT * FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), 0::TIMESTAMPTZ, false) AS OF SYSTEM TIME %s", timestamp)
+	return db.QueryStr(t, fingerprintQuery, tenantID)[0][0]
+}
+
 // WaitUntilHighWatermark waits for the ingestion job high watermark to reach the given high watermark.
 func (c *TenantStreamingClusters) WaitUntilHighWatermark(
 	highWatermark hlc.Timestamp, ingestionJobID jobspb.JobID,
@@ -149,7 +170,7 @@ func (c *TenantStreamingClusters) WaitUntilHighWatermark(
 // Cutover sets the cutover timestamp on the replication job causing the job to
 // stop eventually.
 func (c *TenantStreamingClusters) Cutover(
-	producerJobID, ingestionJobID int, cutoverTime time.Time,
+	producerJobID, ingestionJobID int, cutoverTime time.Time, async bool,
 ) {
 	// Cut over the ingestion job and the job will stop eventually.
 	var cutoverStr string
@@ -157,8 +178,10 @@ func (c *TenantStreamingClusters) Cutover(
 		c.Args.DestTenantName, cutoverTime).Scan(&cutoverStr)
 	cutoverOutput := DecimalTimeToHLC(c.T, cutoverStr)
 	require.Equal(c.T, cutoverTime, cutoverOutput.GoTime())
-	jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-	jobutils.WaitForJobToSucceed(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
+	if !async {
+		jobutils.WaitForJobToSucceed(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
+		jobutils.WaitForJobToSucceed(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
+	}
 }
 
 // StartStreamReplication producer job ID and ingestion job ID.
@@ -202,7 +225,7 @@ func CreateTenantStreamingClusters(
 	serverArgs := base.TestServerArgs{
 		// Test fails because it tries to set a cluster setting only accessible
 		// to system tenants. Tracked with #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
@@ -210,6 +233,11 @@ func CreateTenantStreamingClusters(
 			},
 			Streaming:                      args.TestingKnobs,
 			TenantCapabilitiesTestingKnobs: args.TenantCapabilitiesTestingKnobs,
+			TenantTestingKnobs: &sql.TenantTestingKnobs{
+				// The streaming tests want tenant ID stability. So we want
+				// easy-to-predict IDs when we create a tenant after a drop.
+				EnableTenantIDReuse: true,
+			},
 		},
 	}
 

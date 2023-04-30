@@ -131,7 +131,6 @@ func newChangeAggregatorProcessor(
 	processorID int32,
 	spec execinfrapb.ChangeAggregatorSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "changeagg-mem")
 	ca := &changeAggregator{
@@ -146,7 +145,6 @@ func newChangeAggregatorProcessor(
 		changefeedResultTypes,
 		flowCtx,
 		processorID,
-		output,
 		memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -566,10 +564,17 @@ func (ca *changeAggregator) tick() error {
 			return ca.noteResolvedSpan(resolved)
 		}
 	case kvevent.TypeFlush:
-		return ca.sink.Flush(ca.Ctx())
+		return ca.flushBufferedEvents()
 	}
 
 	return nil
+}
+
+func (ca *changeAggregator) flushBufferedEvents() error {
+	if err := ca.eventConsumer.Flush(ca.Ctx()); err != nil {
+		return err
+	}
+	return ca.sink.Flush(ca.Ctx())
 }
 
 // noteResolvedSpan periodically flushes Frontier progress from the current
@@ -623,7 +628,7 @@ func (ca *changeAggregator) flushFrontier() error {
 	// otherwise, we could lose buffered messages and violate the
 	// at-least-once guarantee. This is also true for checkpointing the
 	// resolved spans in the job progress.
-	if err := ca.sink.Flush(ca.Ctx()); err != nil {
+	if err := ca.flushBufferedEvents(); err != nil {
 		return err
 	}
 
@@ -870,7 +875,6 @@ func newChangeFrontierProcessor(
 	spec execinfrapb.ChangeFrontierSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "changefntr-mem")
 	sf, err := makeSchemaChangeFrontier(hlc.Timestamp{}, spec.TrackedSpans...)
@@ -898,7 +902,6 @@ func newChangeFrontierProcessor(
 		input.OutputTypes(),
 		flowCtx,
 		processorID,
-		output,
 		memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -931,7 +934,16 @@ func newChangeFrontierProcessor(
 	if err != nil {
 		return nil, err
 	}
-	if cf.encoder, err = getEncoder(encodingOpts, AllTargets(spec.Feed)); err != nil {
+
+	sliMertics, err := flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
+	if err != nil {
+		return nil, err
+	}
+
+	if cf.encoder, err = getEncoder(
+		encodingOpts, AllTargets(spec.Feed), spec.Feed.Select != "",
+		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMertics,
+	); err != nil {
 		return nil, err
 	}
 

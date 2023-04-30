@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/kylelemons/godebug/diff"
 	"github.com/stretchr/testify/require"
@@ -47,16 +48,17 @@ import (
 func WithBuilderDependenciesFromTestServer(
 	s serverutils.TestServerInterface, fn func(scbuild.Dependencies),
 ) {
+	ctx := context.Background()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	sd := sql.NewInternalSessionData(ctx, execCfg.Settings, "test")
+	sd.Database = "defaultdb"
 	ip, cleanup := sql.NewInternalPlanner(
 		"test",
-		kv.NewTxn(context.Background(), s.DB(), s.NodeID()),
+		kv.NewTxn(ctx, s.DB(), s.NodeID()),
 		username.RootUserName(),
 		&sql.MemoryMetrics{},
 		&execCfg,
-		// Setting the database on the session data to "defaultdb" in the obvious
-		// way doesn't seem to do what we want.
-		sessiondatapb.SessionData{},
+		sd,
 	)
 	defer cleanup()
 	planner := ip.(interface {
@@ -70,7 +72,7 @@ func WithBuilderDependenciesFromTestServer(
 	})
 
 	refProviderFactory, refCleanup := sql.NewReferenceProviderFactoryForTest(
-		"test", planner.InternalSQLTxn().KV(), username.RootUserName(), &execCfg, "defaultdb",
+		ctx, "test", planner.InternalSQLTxn().KV(), username.RootUserName(), &execCfg, "defaultdb",
 	)
 	defer refCleanup()
 
@@ -176,11 +178,15 @@ func ProtoDiff(a, b protoutil.Message, args DiffArgs, rewrites ...func(interface
 }
 
 // MakePlan is a convenient alternative to calling scplan.MakePlan in tests.
-func MakePlan(t *testing.T, state scpb.CurrentState, phase scop.Phase) scplan.Plan {
+func MakePlan(
+	t *testing.T, state scpb.CurrentState, phase scop.Phase, memAcc *mon.BoundAccount,
+) scplan.Plan {
 	plan, err := scplan.MakePlan(context.Background(), state, scplan.Params{
+		Ctx:                        context.Background(),
 		ActiveVersion:              clusterversion.TestingClusterVersion,
 		ExecutionPhase:             phase,
 		SchemaChangerJobIDSupplier: func() jobspb.JobID { return 1 },
+		MemAcc:                     memAcc,
 	})
 	require.NoError(t, err)
 	return plan
@@ -204,7 +210,7 @@ func TruncateJobOps(plan *scplan.Plan) {
 }
 
 // TableNameFromStmt fetch table name from a statement.
-func TableNameFromStmt(stmt parser.Statement) string {
+func TableNameFromStmt(stmt statements.Statement[tree.Statement]) string {
 	tableName := ""
 	switch node := stmt.AST.(type) {
 	case *tree.CreateTable:

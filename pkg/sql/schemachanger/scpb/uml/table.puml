@@ -151,6 +151,12 @@ object TableZoneConfig
 
 TableZoneConfig :  TableID
 
+object IndexZoneConfig
+
+IndexZoneConfig :  TableID
+IndexZoneConfig :  IndexID
+IndexZoneConfig :  PartitionName
+
 object TableData
 
 TableData :  TableID
@@ -159,6 +165,10 @@ TableData :  DatabaseID
 object TablePartitioning
 
 TablePartitioning :  TableID
+
+object TableSchemaLocked
+
+TableSchemaLocked :  TableID
 
 object TableLocalityGlobal
 
@@ -327,10 +337,10 @@ object SchemaComment
 SchemaComment :  SchemaID
 SchemaComment :  Comment
 
-object ObjectParent
+object SchemaChild
 
-ObjectParent :  ObjectID
-ObjectParent :  ParentSchemaID
+SchemaChild :  ChildObjectID
+SchemaChild :  SchemaID
 
 object EnumTypeValue
 
@@ -405,10 +415,12 @@ Sequence <|-- TableComment
 Table <|-- RowLevelTTL
 Table <|-- TableZoneConfig
 View <|-- TableZoneConfig
+Index <|-- IndexZoneConfig
 Table <|-- TableData
 View <|-- TableData
 Sequence <|-- TableData
 Table <|-- TablePartitioning
+Table <|-- TableSchemaLocked
 Table <|-- TableLocalityGlobal
 Table <|-- TableLocalityPrimaryRegion
 Table <|-- TableLocalitySecondaryRegion
@@ -469,11 +481,11 @@ Database <|-- DatabaseComment
 Database <|-- DatabaseData
 Schema <|-- SchemaParent
 Schema <|-- SchemaComment
-AliasType <|-- ObjectParent
-EnumType <|-- ObjectParent
-Table <|-- ObjectParent
-View <|-- ObjectParent
-Sequence <|-- ObjectParent
+AliasType <|-- SchemaChild
+EnumType <|-- SchemaChild
+Table <|-- SchemaChild
+View <|-- SchemaChild
+Sequence <|-- SchemaChild
 EnumType <|-- EnumTypeValue
 CompositeType <|-- CompositeTypeAttrType
 CompositeType <|-- CompositeTypeAttrName

@@ -166,7 +166,7 @@ func TestCloudStorageSink(t *testing.T) {
 		// NB: compression added in single-node subtest.
 	}
 	ts := func(i int64) hlc.Timestamp { return hlc.Timestamp{WallTime: i} }
-	e, err := makeJSONEncoder(opts)
+	e, err := makeJSONEncoder(jsonEncoderOptions{EncodingOptions: opts})
 	require.NoError(t, err)
 
 	clientFactory := blobs.TestBlobServiceClient(settings.ExternalIODir)
@@ -184,7 +184,7 @@ func TestCloudStorageSink(t *testing.T) {
 	user := username.RootUserName()
 
 	sinkURI := func(t *testing.T, maxFileSize int64) sinkURL {
-		u, err := url.Parse(fmt.Sprintf("nodelocal://0/%s", testDir(t)))
+		u, err := url.Parse(fmt.Sprintf("nodelocal://1/%s", testDir(t)))
 		require.NoError(t, err)
 		sink := sinkURL{URL: u}
 		if maxFileSize != unlimitedFileSize {

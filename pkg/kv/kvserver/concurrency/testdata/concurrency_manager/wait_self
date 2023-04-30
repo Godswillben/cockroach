@@ -99,14 +99,13 @@ on-txn-updated txn=txnOld status=committed
 
 debug-lock-table
 ----
-global: num=1
+num=1
  lock: "k"
   res: req: 2, txn: 00000001-0000-0000-0000-000000000000, ts: 10.000000000,1, seq: 0
    queued writers:
     active: true req: 3, txn: 00000003-0000-0000-0000-000000000000
     active: true req: 4, txn: 00000001-0000-0000-0000-000000000000
    distinguished req: 3
-local: num=0
 
 
 # This is the interesting step - we see reqTxn2 announce that it conflicted with
@@ -118,12 +117,12 @@ finish req=reqTxn1
 ----
 [-] finish reqTxn1: finishing request
 [3] sequence reqTxnMiddle: lock wait-queue event: done waiting
-[3] sequence reqTxnMiddle: conflicted with 00000001-0000-0000-0000-000000000000 on "k" for 123.000s
+[3] sequence reqTxnMiddle: conflicted with 00000001-0000-0000-0000-000000000000 on "k" for 0.000s
 [3] sequence reqTxnMiddle: acquiring latches
 [3] sequence reqTxnMiddle: scanning lock table for conflicting locks
 [3] sequence reqTxnMiddle: sequencing complete, returned guard
 [4] sequence reqTxn2: lock wait-queue event: wait for (distinguished) txn 00000003 running request @ key "k" (queuedWriters: 1, queuedReaders: 0)
-[4] sequence reqTxn2: conflicted with 00000001-0000-0000-0000-000000000000 on "k" for 123.000s
+[4] sequence reqTxn2: conflicted with 00000001-0000-0000-0000-000000000000 on "k" for 0.000s
 [4] sequence reqTxn2: pushing after 0s for: liveness detection = false, deadlock detection = true, timeout enforcement = false, priority enforcement = false
 [4] sequence reqTxn2: pushing txn 00000003 to detect request deadlock
 [4] sequence reqTxn2: blocked on select in concurrency_test.(*cluster).PushTransaction
@@ -132,7 +131,7 @@ finish req=reqTxnMiddle
 ----
 [-] finish reqTxnMiddle: finishing request
 [4] sequence reqTxn2: lock wait-queue event: done waiting
-[4] sequence reqTxn2: conflicted with 00000003-0000-0000-0000-000000000000 on "k" for 123.000s
+[4] sequence reqTxn2: conflicted with 00000003-0000-0000-0000-000000000000 on "k" for 0.000s
 [4] sequence reqTxn2: acquiring latches
 [4] sequence reqTxn2: scanning lock table for conflicting locks
 [4] sequence reqTxn2: sequencing complete, returned guard

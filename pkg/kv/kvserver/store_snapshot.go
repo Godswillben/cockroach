@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -77,6 +76,15 @@ var snapshotPrioritizationEnabled = settings.RegisterBoolSetting(
 	true,
 )
 
+// snapshotMetrics contains metrics on the number and size of snapshots in
+// progress or in the snapshot queue.
+type snapshotMetrics struct {
+	QueueLen        *metric.Gauge
+	QueueSize       *metric.Gauge
+	InProgress      *metric.Gauge
+	TotalInProgress *metric.Gauge
+}
+
 // incomingSnapshotStream is the minimal interface on a GRPC stream required
 // to receive a snapshot over the network.
 type incomingSnapshotStream interface {
@@ -105,6 +113,7 @@ type snapshotStrategy interface {
 	// constructs an IncomingSnapshot.
 	Receive(
 		context.Context,
+		*Store,
 		incomingSnapshotStream,
 		kvserverpb.SnapshotRequest_Header,
 		snapshotRecordMetrics,
@@ -149,7 +158,7 @@ type kvBatchSnapshotStrategy struct {
 	// Limiter for sending KV batches. Only used on the sender side.
 	limiter *rate.Limiter
 	// Only used on the sender side.
-	newBatch func() storage.Batch
+	newWriteBatch func() storage.WriteBatch
 
 	// The approximate size of the SST chunk to buffer in memory on the receiver
 	// before flushing to disk. Only used on the receiver side.
@@ -367,6 +376,7 @@ func (tag *snapshotTimingTag) Render() []attribute.KeyValue {
 // key space across to the next key span.
 func (kvSS *kvBatchSnapshotStrategy) Receive(
 	ctx context.Context,
+	s *Store,
 	stream incomingSnapshotStream,
 	header kvserverpb.SnapshotRequest_Header,
 	recordBytesReceived snapshotRecordMetrics,
@@ -410,7 +420,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 		}
 		if req.Header != nil {
 			err := errors.New("client error: provided a header mid-stream")
-			return noSnap, sendSnapshotError(stream, err)
+			return noSnap, sendSnapshotError(ctx, s, stream, err)
 		}
 
 		if req.KVBatch != nil {
@@ -476,7 +486,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 			if err != nil {
 				err = errors.Wrap(err, "client error: invalid snapshot")
-				return noSnap, sendSnapshotError(stream, err)
+				return noSnap, sendSnapshotError(ctx, s, stream, err)
 			}
 
 			inSnap := IncomingSnapshot{
@@ -535,7 +545,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 
 	// Iterate over all keys (point keys and range keys) and stream out batches of
 	// key-values.
-	var b storage.Batch
+	var b storage.WriteBatch
 	defer func() {
 		if b != nil {
 			b.Close()
@@ -572,7 +582,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 				for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
 					kvs++
 					if b == nil {
-						b = kvSS.newBatch()
+						b = kvSS.newWriteBatch()
 					}
 					key, err := iter.UnsafeEngineKey()
 					if err != nil {
@@ -599,7 +609,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 					for _, rkv := range iter.EngineRangeKeys() {
 						rangeKVs++
 						if b == nil {
-							b = kvSS.newBatch()
+							b = kvSS.newWriteBatch()
 						}
 						err := b.PutEngineRangeKey(bounds.Key, bounds.EndKey, rkv.Version, rkv.Value)
 						if err != nil {
@@ -635,7 +645,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 func (kvSS *kvBatchSnapshotStrategy) sendBatch(
 	ctx context.Context,
 	stream outgoingSnapshotStream,
-	batch storage.Batch,
+	batch storage.WriteBatch,
 	timerTag *snapshotTimingTag,
 ) error {
 	timerTag.start("rateLimit")
@@ -678,13 +688,19 @@ func (s *Store) reserveReceiveSnapshot(
 	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "reserveReceiveSnapshot")
 	defer sp.Finish()
 
-	return s.throttleSnapshot(ctx, s.snapshotApplyQueue,
-		int(header.SenderQueueName), header.SenderQueuePriority,
+	return s.throttleSnapshot(ctx,
+		s.snapshotApplyQueue,
+		int(header.SenderQueueName),
+		header.SenderQueuePriority,
 		-1,
 		header.RangeSize,
 		header.RaftMessageRequest.RangeID,
-		s.metrics.RangeSnapshotRecvQueueLength,
-		s.metrics.RangeSnapshotRecvInProgress, s.metrics.RangeSnapshotRecvTotalInProgress,
+		snapshotMetrics{
+			s.metrics.RangeSnapshotRecvQueueLength,
+			s.metrics.RangeSnapshotRecvQueueSize,
+			s.metrics.RangeSnapshotRecvInProgress,
+			s.metrics.RangeSnapshotRecvTotalInProgress,
+		},
 	)
 }
 
@@ -698,14 +714,19 @@ func (s *Store) reserveSendSnapshot(
 		fn()
 	}
 
-	return s.throttleSnapshot(ctx, s.snapshotSendQueue,
+	return s.throttleSnapshot(ctx,
+		s.snapshotSendQueue,
 		int(req.SenderQueueName),
 		req.SenderQueuePriority,
 		req.QueueOnDelegateLen,
 		rangeSize,
 		req.RangeID,
-		s.metrics.RangeSnapshotSendQueueLength,
-		s.metrics.RangeSnapshotSendInProgress, s.metrics.RangeSnapshotSendTotalInProgress,
+		snapshotMetrics{
+			s.metrics.RangeSnapshotSendQueueLength,
+			s.metrics.RangeSnapshotSendQueueSize,
+			s.metrics.RangeSnapshotSendInProgress,
+			s.metrics.RangeSnapshotSendTotalInProgress,
+		},
 	)
 }
 
@@ -720,7 +741,7 @@ func (s *Store) throttleSnapshot(
 	maxQueueLength int64,
 	rangeSize int64,
 	rangeID roachpb.RangeID,
-	waitingSnapshotMetric, inProgressSnapshotMetric, totalInProgressSnapshotMetric *metric.Gauge,
+	snapshotMetrics snapshotMetrics,
 ) (cleanup func(), funcErr error) {
 
 	tBegin := timeutil.Now()
@@ -742,8 +763,13 @@ func (s *Store) throttleSnapshot(
 			}
 		}()
 
-		waitingSnapshotMetric.Inc(1)
-		defer waitingSnapshotMetric.Dec(1)
+		// Total bytes of snapshots waiting in the snapshot queue
+		snapshotMetrics.QueueSize.Inc(rangeSize)
+		defer snapshotMetrics.QueueSize.Dec(rangeSize)
+		// Total number of snapshots waiting in the snapshot queue
+		snapshotMetrics.QueueLen.Inc(1)
+		defer snapshotMetrics.QueueLen.Dec(1)
+
 		queueCtx := ctx
 		if deadline, ok := queueCtx.Deadline(); ok {
 			// Enforce a more strict timeout for acquiring the snapshot reservation to
@@ -778,10 +804,10 @@ func (s *Store) throttleSnapshot(
 		}
 
 		// Counts non-empty in-progress snapshots.
-		inProgressSnapshotMetric.Inc(1)
+		snapshotMetrics.InProgress.Inc(1)
 	}
 	// Counts all in-progress snapshots.
-	totalInProgressSnapshotMetric.Inc(1)
+	snapshotMetrics.TotalInProgress.Inc(1)
 
 	// The choice here is essentially arbitrary, but with a default range size of 128mb-512mb and the
 	// Raft snapshot rate limiting of 32mb/s, we expect to spend less than 16s per snapshot.
@@ -804,10 +830,10 @@ func (s *Store) throttleSnapshot(
 	return func() {
 		s.metrics.ReservedReplicaCount.Dec(1)
 		s.metrics.Reserved.Dec(rangeSize)
-		totalInProgressSnapshotMetric.Dec(1)
+		snapshotMetrics.TotalInProgress.Dec(1)
 
 		if rangeSize != 0 || s.cfg.TestingKnobs.ThrottleEmptySnapshots {
-			inProgressSnapshotMetric.Dec(1)
+			snapshotMetrics.InProgress.Dec(1)
 			snapshotQueue.Release(permit)
 		}
 	}, nil
@@ -950,8 +976,6 @@ func (s *Store) checkSnapshotOverlapLocked(
 func (s *Store) receiveSnapshot(
 	ctx context.Context, header *kvserverpb.SnapshotRequest_Header, stream incomingSnapshotStream,
 ) error {
-	sp := tracing.SpanFromContext(ctx)
-
 	// Draining nodes will generally not be rebalanced to (see the filtering that
 	// happens in getStoreListFromIDsLocked()), but in case they are, they should
 	// reject the incoming rebalancing snapshots.
@@ -966,7 +990,7 @@ func (s *Store) receiveSnapshot(
 			// getStoreListFromIDsLocked(). Is that sound? Don't we want to
 			// upreplicate to draining nodes if there are no other candidates?
 		case kvserverpb.SnapshotRequest_REBALANCE:
-			return sendSnapshotError(stream, errors.New(storeDrainingMsg))
+			return sendSnapshotError(ctx, s, stream, errors.New(storeDrainingMsg))
 		default:
 			// If this a new snapshot type that this cockroach version does not know
 			// about, we let it through.
@@ -977,7 +1001,7 @@ func (s *Store) receiveSnapshot(
 		if err := fn(header); err != nil {
 			// NB: we intentionally don't mark this error as errMarkSnapshotError so
 			// that we don't end up retrying injected errors in tests.
-			return sendSnapshotError(stream, err)
+			return sendSnapshotError(ctx, s, stream, err)
 		}
 	}
 
@@ -1017,7 +1041,7 @@ func (s *Store) receiveSnapshot(
 			return nil
 		}); pErr != nil {
 		log.Infof(ctx, "cannot accept snapshot: %s", pErr)
-		return sendSnapshotError(stream, pErr.GoError())
+		return sendSnapshotError(ctx, s, stream, pErr.GoError())
 	}
 
 	defer func() {
@@ -1039,7 +1063,7 @@ func (s *Store) receiveSnapshot(
 		snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 		if err != nil {
 			err = errors.Wrap(err, "invalid snapshot")
-			return sendSnapshotError(stream, err)
+			return sendSnapshotError(ctx, s, stream, err)
 		}
 
 		ss = &kvBatchSnapshotStrategy{
@@ -1049,7 +1073,7 @@ func (s *Store) receiveSnapshot(
 		}
 		defer ss.Close(ctx)
 	default:
-		return sendSnapshotError(stream,
+		return sendSnapshotError(ctx, s, stream,
 			errors.Errorf("%s,r%d: unknown snapshot strategy: %s",
 				s, header.State.Desc.RangeID, header.Strategy),
 		)
@@ -1078,13 +1102,11 @@ func (s *Store) receiveSnapshot(
 	}
 	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
 	defer rSp.Finish() // Ensure that the tracing span is closed, even if ss.Receive errors
-	inSnap, err := ss.Receive(ctx, stream, *header, recordBytesReceived)
+	inSnap, err := ss.Receive(ctx, s, stream, *header, recordBytesReceived)
 	if err != nil {
 		return err
 	}
 	inSnap.placeholder = placeholder
-
-	rec := sp.GetConfiguredRecording()
 
 	// Use a background context for applying the snapshot, as handleRaftReady is
 	// not prepared to deal with arbitrary context cancellation. Also, we've
@@ -1097,23 +1119,24 @@ func (s *Store) receiveSnapshot(
 		// sender as this being a retriable error, see isSnapshotError().
 		err = errors.Mark(err, errMarkSnapshotError)
 		err = errors.Wrap(err, "failed to apply snapshot")
-		return sendSnapshotErrorWithTrace(stream, err, rec)
+		return sendSnapshotError(ctx, s, stream, err)
 	}
 	return stream.Send(&kvserverpb.SnapshotResponse{
 		Status:         kvserverpb.SnapshotResponse_APPLIED,
-		CollectedSpans: rec,
+		CollectedSpans: tracing.SpanFromContext(ctx).GetConfiguredRecording(),
 	})
 }
 
-func sendSnapshotError(stream incomingSnapshotStream, err error) error {
-	return sendSnapshotErrorWithTrace(stream, err, nil /* trace */)
-}
-
-func sendSnapshotErrorWithTrace(
-	stream incomingSnapshotStream, err error, trace tracingpb.Recording,
+// sendSnapshotError sends an error response back to the sender of this snapshot
+// to signify that it can not accept this snapshot. Internally it increments the
+// statistic tracking how many invalid snapshots it received.
+func sendSnapshotError(
+	ctx context.Context, s *Store, stream incomingSnapshotStream, err error,
 ) error {
+	s.metrics.RangeSnapshotRecvFailed.Inc(1)
 	resp := snapRespErr(err)
-	resp.CollectedSpans = trace
+	resp.CollectedSpans = tracing.SpanFromContext(ctx).GetConfiguredRecording()
+
 	return stream.Send(resp)
 }
 
@@ -1468,7 +1491,7 @@ func SendEmptySnapshot(
 		noopStorePool{},
 		header,
 		&outgoingSnap,
-		eng.NewBatch,
+		eng.NewWriteBatch,
 		func() {},
 		nil, /* recordBytesSent */
 	)
@@ -1488,7 +1511,7 @@ func sendSnapshot(
 	storePool SnapshotStorePool,
 	header kvserverpb.SnapshotRequest_Header,
 	snap *OutgoingSnapshot,
-	newBatch func() storage.Batch,
+	newWriteBatch func() storage.WriteBatch,
 	sent func(),
 	recordBytesSent snapshotRecordMetrics,
 ) error {
@@ -1555,10 +1578,10 @@ func sendSnapshot(
 	switch header.Strategy {
 	case kvserverpb.SnapshotRequest_KV_BATCH:
 		ss = &kvBatchSnapshotStrategy{
-			batchSize: batchSize,
-			limiter:   limiter,
-			newBatch:  newBatch,
-			st:        st,
+			batchSize:     batchSize,
+			limiter:       limiter,
+			newWriteBatch: newWriteBatch,
+			st:            st,
 		}
 	default:
 		log.Fatalf(ctx, "unknown snapshot strategy: %s", header.Strategy)

@@ -4,7 +4,7 @@ CREATE TABLE ab (
   b INT
 )
 
-statement error pgcode 0A000 unimplemented: PL/pgSQL is not yet supported
+statement error pq: plpgsql not supported in user-defined functions
 CREATE FUNCTION populate() RETURNS integer AS $$
 DECLARE
     -- declarations
@@ -12,6 +12,9 @@ BEGIN
     PERFORM my_function();
 END;
 $$ LANGUAGE plpgsql
+
+statement error pgcode 0A000 unimplemented: C is not yet supported
+CREATE FUNCTION populate() RETURNS integer AS 'dir/funcs', 'populate' LANGUAGE C
 
 statement error pgcode 42704 language \"made_up_language\" does not exist
 CREATE FUNCTION populate() RETURNS integer AS $$
@@ -78,6 +81,10 @@ CREATE FUNCTION err(b BOOL) RETURNS INT LANGUAGE SQL AS 'SELECT b'
 
 statement error return type mismatch in function declared to return bool\nDETAIL: Actual return type is int
 CREATE FUNCTION err(i INT, j INT) RETURNS BOOL LANGUAGE SQL AS 'SELECT i - j'
+
+# TODO(#100962): Add support for default parameters.
+statement error pgcode 0A000 unimplemented: default value
+CREATE FUNCTION err(i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT i - j'
 
 # Make sure using table name as tuple type name works properly.
 # It should pass the return type validation and stored as a tuple type.
@@ -588,13 +595,13 @@ subtest disallow_udf_in_views_and_udf
 statement ok
 CREATE FUNCTION test_vf_f() RETURNS STRING LANGUAGE SQL AS $$ SELECT lower('hello') $$;
 
-statement error pq: unknown function: test_vf_f\(\): function undefined
+statement error pq: unknown function: test_vf_f\(\): function undefined\nHINT:.*intention was to use a user-defined function in the function body, which is currently not supported.
 CREATE FUNCTION test_vf_g() RETURNS STRING LANGUAGE SQL AS $$ SELECT test_vf_f() $$;
 
 statement ok
 CREATE FUNCTION test_vf_g() RETURNS STRING LANGUAGE SQL AS $$ SELECT lower('hello') $$;
 
-statement error pq: unknown function: test_vf_f\(\): function undefined
+statement error pq: unknown function: test_vf_f\(\): function undefined\nHINT:.*intention was to use a user-defined function in the view query, which is currently not supported.
 CREATE VIEW v AS SELECT test_vf_f();
 
 statement ok
@@ -1609,6 +1616,7 @@ DROP FUNCTION sc2.f_tbl()
 
 statement ok
 ALTER DATABASE rename_db1 RENAME TO rename_db2;
+USE rename_db2;
 
 # Make sure that db renaming does not affect types and sequences in UDF.
 query T
@@ -1661,7 +1669,7 @@ Mon
 query I
 SELECT sc1.f_seq()
 ----
-5
+1
 
 query T
 SELECT sc2.f_type()
@@ -1671,7 +1679,7 @@ Mon
 query I
 SELECT sc2.f_seq()
 ----
-6
+2
 
 statement error pq: cannot rename schema because relation "rename_sc1.sc1.f_tbl" depends on relation "rename_sc1.sc1.tbl"
 ALTER SCHEMA sc1 RENAME TO sc1_new
@@ -1688,16 +1696,23 @@ DROP FUNCTION sc2.f_tbl()
 statement ok
 ALTER SCHEMA sc1 RENAME TO sc1_new
 
-# Make sure that db renaming does not affect types and sequences in UDF.
-query T
+# Cannot refer to the old schema name.
+statement error pq: schema "sc1" does not exist
 SELECT sc1.f_type()
+
+statement error pq: schema "sc1" does not exist
+SELECT sc1.f_seq()
+
+# Make sure that schema renaming does not affect types and sequences in UDF.
+query T
+SELECT sc1_new.f_type()
 ----
 Mon
 
 query I
-SELECT sc1.f_seq()
+SELECT sc1_new.f_seq()
 ----
-7
+3
 
 query T
 SELECT sc2.f_type()
@@ -1707,7 +1722,7 @@ Mon
 query I
 SELECT sc2.f_seq()
 ----
-8
+4
 
 statement ok
 SET DATABASE = test
@@ -2812,6 +2827,150 @@ SELECT a, sub_two() FROM sub_all
 5  2
 6  2
 
+subtest any_subquery
+
+statement ok
+CREATE TABLE any_tab (
+  a INT,
+  b INT
+)
+
+statement ok
+CREATE FUNCTION any_fn(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i = ANY(SELECT a FROM any_tab)
+$$
+
+statement ok
+CREATE FUNCTION any_fn_lt(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i < ANY(SELECT a FROM any_tab)
+$$
+
+statement ok
+CREATE FUNCTION any_fn_tuple(i INT, j INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT (i, j) = ANY(SELECT a, b FROM any_tab)
+$$
+
+# If the subquery returns no rows, the result should always be false.
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+false  false  false
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+false  false  false
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+false  false  false
+
+statement ok
+INSERT INTO any_tab VALUES (1, 10), (3, 30)
+
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+true  false  NULL
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+true  false  NULL
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+true  false  NULL
+
+statement ok
+INSERT INTO any_tab VALUES (NULL, NULL)
+
+query BBB
+SELECT any_fn(1), any_fn(4), any_fn(NULL::INT)
+----
+true  NULL  NULL
+
+query BBB
+SELECT any_fn_lt(1), any_fn_lt(4), any_fn_lt(NULL::INT)
+----
+true  NULL  NULL
+
+query BBB
+SELECT any_fn_tuple(1, 10), any_fn_tuple(1, 20), any_fn_tuple(NULL::INT, NULL::INT)
+----
+true  NULL  NULL
+
+statement ok
+CREATE FUNCTION any_fn2(i INT) RETURNS SETOF INT LANGUAGE SQL AS $$
+  SELECT b FROM (VALUES (1), (2), (3), (NULL)) v(b)
+  WHERE b = ANY (SELECT a FROM any_tab WHERE a <= i)
+$$
+
+query I
+SELECT any_fn2(2)
+----
+1
+
+query I rowsort
+SELECT any_fn2(3)
+----
+1
+3
+
+subtest all_subquery
+
+statement ok
+CREATE TABLE all_tab (a INT)
+
+statement ok
+CREATE FUNCTION all_fn(i INT) RETURNS BOOL LANGUAGE SQL AS $$
+  SELECT i = ALL(SELECT a FROM all_tab)
+$$
+
+# If the subquery returns no rows, the result should always be true.
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+true  true  true
+
+statement ok
+INSERT INTO all_tab VALUES (1), (1);
+
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+true  false  NULL
+
+statement ok
+INSERT INTO all_tab VALUES (NULL);
+
+query BBB
+SELECT all_fn(1), all_fn(2), all_fn(NULL::INT)
+----
+NULL  false  NULL
+
+
+subtest array_flatten
+
+statement ok
+CREATE FUNCTION arr(x INT) RETURNS INT[] LANGUAGE SQL AS $$
+  SELECT ARRAY(VALUES (1), (2), (x));
+$$
+
+query T
+SELECT arr(10)
+----
+{1,2,10}
+
+query T
+SELECT arr(i) FROM generate_series(1, 3) g(i)
+----
+{1,2,1}
+{1,2,2}
+{1,2,3}
+
 
 subtest variadic
 
@@ -2851,11 +3010,13 @@ NULL
 # Regression test for #93314
 subtest regression_93314
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE TYPE e_93314 AS ENUM ('a', 'b');
 CREATE TABLE t_93314 (i INT, e e_93314);
 INSERT INTO t_93314 VALUES (1, 'a');
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE OR REPLACE FUNCTION f_93314 () RETURNS t_93314 AS
 $$
@@ -2865,15 +3026,18 @@ $$
   LIMIT 1;
 $$ LANGUAGE SQL;
 
+skipif config local-mixed-22.2-23.1
 query T
 SELECT f_93314();
 ----
 (1,a)
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE TABLE t_93314_alias (i INT, e _e_93314);
 INSERT INTO t_93314_alias VALUES (1, ARRAY['a', 'b']::_e_93314);
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE OR REPLACE FUNCTION f_93314_alias () RETURNS t_93314_alias AS
 $$
@@ -2883,49 +3047,57 @@ $$
   LIMIT 1;
 $$ LANGUAGE SQL;
 
+skipif config local-mixed-22.2-23.1
 query T
 SELECT f_93314_alias();
 ----
 (1,"{a,b}")
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE TYPE comp_93314 AS (a INT, b INT);
 CREATE TABLE t_93314_comp (a INT, c comp_93314, FAMILY (a, c));
 
+skipif config local-mixed-22.2-23.1
 statement ok
 INSERT INTO t_93314_comp VALUES (1, (2,3));
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE FUNCTION f_93314_comp() RETURNS comp_93314 AS
 $$
   SELECT (1, 2);
 $$ LANGUAGE SQL;
 
+skipif config local-mixed-22.2-23.1
 query T
 SELECT f_93314_comp()
 ----
 (1,2)
 
+skipif config local-mixed-22.2-23.1
 statement ok
 CREATE FUNCTION f_93314_comp_t() RETURNS t_93314_comp AS
 $$
   SELECT a, c FROM t_93314_comp LIMIT 1;
 $$ LANGUAGE SQL;
 
+skipif config local-mixed-22.2-23.1
 query T
 SELECT f_93314_comp_t()
 ----
 (1,"(2,3)")
 
+skipif config local-mixed-22.2-23.1
 query TTTTTBBBTITTTTT
 SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict, proretset, provolatile, pronargs, prorettype, proargtypes, proargmodes, proargnames, prosrc
 FROM pg_catalog.pg_proc WHERE proname IN ('f_93314', 'f_93314_alias', 'f_93314_comp', 'f_93314_comp_t')
 ORDER BY oid;
 ----
-100264  f_93314         105  1546506610  14  false  false  false  v  0  100263  ·  {}  NULL  SELECT i, e FROM test.public.t_93314 ORDER BY i LIMIT 1;
-100266  f_93314_alias   105  1546506610  14  false  false  false  v  0  100265  ·  {}  NULL  SELECT i, e FROM test.public.t_93314_alias ORDER BY i LIMIT 1;
-100270  f_93314_comp    105  1546506610  14  false  false  false  v  0  100267  ·  {}  NULL  SELECT (1, 2);
-100271  f_93314_comp_t  105  1546506610  14  false  false  false  v  0  100269  ·  {}  NULL  SELECT a, c FROM test.public.t_93314_comp LIMIT 1;
+100272  f_93314         105  1546506610  14  false  false  false  v  0  100271  ·  {}  NULL  SELECT i, e FROM test.public.t_93314 ORDER BY i LIMIT 1;
+100274  f_93314_alias   105  1546506610  14  false  false  false  v  0  100273  ·  {}  NULL  SELECT i, e FROM test.public.t_93314_alias ORDER BY i LIMIT 1;
+100278  f_93314_comp    105  1546506610  14  false  false  false  v  0  100275  ·  {}  NULL  SELECT (1, 2);
+100279  f_93314_comp_t  105  1546506610  14  false  false  false  v  0  100277  ·  {}  NULL  SELECT a, c FROM test.public.t_93314_comp LIMIT 1;
 
 # Regression test for #95240. Strict UDFs that are inlined should result in NULL
 # when presented with NULL arguments.
@@ -3152,3 +3324,145 @@ query I
 SELECT public.abs(-1)
 ----
 99
+
+subtest regression_97854
+
+# Regression test for #97854.
+statement ok
+CREATE FUNCTION f_97854 (i INT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'i' $$;
+CREATE FUNCTION f_97854 (f FLOAT) RETURNS CHAR LANGUAGE SQL AS $$ SELECT 'f' $$;
+
+# TODO(#88318): In Postgres, the float overload is chosen.
+statement error pgcode 42725 ambiguous call: f_97854\(decimal\).*
+SELECT f_97854(1.0)
+
+# Regression test for #93861 - non-strict UDFs should be evaluated with NULL
+# arguments.
+subtest regression_93861
+
+statement ok
+CREATE TABLE t93861(x INT);
+INSERT INTO t93861 VALUES (1), (2), (NULL);
+CREATE FUNCTION f93861_scalar (i INT) RETURNS INT CALLED ON NULL INPUT
+  LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f93861_strict_scalar (i INT) RETURNS INT STRICT
+  LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE FUNCTION f93861_setof (i INT) RETURNS SETOF INT CALLED ON NULL INPUT
+  LANGUAGE SQL AS $$ SELECT * FROM generate_series(1, 3) $$;
+CREATE FUNCTION f93861_strict_setof (i INT) RETURNS SETOF INT STRICT
+  LANGUAGE SQL AS $$ SELECT * FROM generate_series(1, 3) $$;
+
+query III rowsort
+SELECT x, f93861_scalar(x), f93861_strict_scalar(x) FROM t93861;
+----
+1     1  1
+2     1  1
+NULL  1  NULL
+
+query II rowsort
+SELECT x, f93861_setof(x) FROM t93861;
+----
+1     1
+1     2
+1     3
+2     1
+2     2
+2     3
+NULL  1
+NULL  2
+NULL  3
+
+query II rowsort
+SELECT x, f93861_strict_setof(x) FROM t93861;
+----
+1  1
+1  2
+1  3
+2  1
+2  2
+2  3
+
+# Regression test for #93082 - invalidate a cached query with a UDF if the UDF
+# has been dropped.
+subtest regression_93082
+
+statement ok
+CREATE FUNCTION fn(a INT) RETURNS INT LANGUAGE SQL AS 'SELECT a';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+DROP FUNCTION fn;
+
+statement error pq: unknown function: fn\(\): function undefined
+SELECT fn(1);
+
+# Regression test for #93321 - invalidate a cached query with an unqualified UDF
+# reference after the database is switched.
+subtest regression_93321
+
+statement ok
+CREATE FUNCTION fn(a INT) RETURNS INT LANGUAGE SQL AS 'SELECT a';
+
+query I
+SELECT fn(1);
+----
+1
+
+statement ok
+CREATE DATABASE d;
+USE d;
+
+statement error pq: unknown function: fn\(\): function undefined
+SELECT fn(1);
+
+statement ok
+USE test;
+DROP DATABASE d CASCADE;
+DROP FUNCTION fn;
+
+# Regression test for #100923. Do not attempt to inline an empty UDF and error.
+statement ok
+CREATE FUNCTION f100923() RETURNS BOOL STABLE LANGUAGE SQL AS ''
+
+query B rowsort
+SELECT f100923() FROM (VALUES (10), (20)) v(i)
+----
+NULL
+NULL
+
+# Regression test for #101253. UDF bodies may contain dollar signs.
+subtest regression_101253
+
+statement error pq: at or near "sfv": syntax error
+CREATE FUNCTION f_101253() RETURNS RECORD VOLATILE NOT LEAKPROOF LANGUAGE SQL AS $$
+  SELECT * FROM (VALUES (e'\x1b'), ('y$$sFV'), (e'\x06'));
+$$;
+
+statement ok
+CREATE FUNCTION f_101253() RETURNS RECORD VOLATILE NOT LEAKPROOF LANGUAGE SQL AS $func$
+  SELECT * FROM (VALUES (e'\x1b'), ('y$$sFV'), (e'\x06'));
+$func$;
+
+# Regression test for #100915. Do not error when attempting to inline a UDF when
+# it has a subquery argument that corresponds to a parameter that is referenced
+# multiple times in the UDF body.
+statement ok
+CREATE FUNCTION f100915(i INT) RETURNS BOOL STABLE LANGUAGE SQL AS $$
+  SELECT i = 0 OR i = 10
+$$
+
+query B rowsort
+SELECT f100915((SELECT y FROM (VALUES (10), (20)) y(y) WHERE x=y)) FROM (VALUES (10), (20)) x(x)
+----
+true
+false
+
+query B rowsort
+SELECT f100915(20-(SELECT y FROM (VALUES (10), (20)) y(y) WHERE x=y)) FROM (VALUES (10), (20)) x(x)
+----
+true
+true

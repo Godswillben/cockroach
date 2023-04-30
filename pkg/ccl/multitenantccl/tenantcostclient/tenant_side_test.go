@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl" // ccl init hooks
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostclient"
@@ -40,9 +39,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -809,7 +808,7 @@ func TestWaitingRU(t *testing.T) {
 	req := tenantcostmodel.TestingRequestInfo(1, 1, 1021952, 1)
 	resp := tenantcostmodel.TestingResponseInfo(false, 0, 0, 0)
 
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		tenantcostclient.TestingSetRate(ctrl, fillRate)
 
 		var doneCount int64
@@ -861,7 +860,7 @@ func TestWaitingRU(t *testing.T) {
 		}
 
 		return errors.Errorf("RUs did not drop below 1K: %0.2f", available)
-	})
+	}, 2*time.Minute)
 }
 
 // TestConsumption verifies consumption reporting from a tenant server process.
@@ -869,7 +868,7 @@ func TestConsumption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled})
 	defer hostServer.Stopper().Stop(context.Background())
 
 	st := cluster.MakeTestingClusterSettings()
@@ -939,7 +938,7 @@ func TestSQLLivenessExemption(t *testing.T) {
 
 	// This test fails when run with the default test tenant. Disabling and
 	// tracking with #76378.
-	hostServer, hostDB, hostKV := serverutils.StartServer(t, base.TestServerArgs{DisableDefaultTestTenant: true})
+	hostServer, hostDB, hostKV := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled})
 	defer hostServer.Stopper().Stop(context.Background())
 
 	tenantID := serverutils.TestTenantID()
@@ -947,7 +946,7 @@ func TestSQLLivenessExemption(t *testing.T) {
 	// Create a tenant with ridiculously low resource limits.
 	host := sqlutils.MakeSQLRunner(hostDB)
 	host.Exec(t, "SELECT crdb_internal.create_tenant($1::INT)", tenantID.ToUint64())
-	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
+	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1::INT, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
 
 	st := cluster.MakeTestingClusterSettings()
 	// Make the tenant heartbeat like crazy.
@@ -963,7 +962,8 @@ func TestSQLLivenessExemption(t *testing.T) {
 	_ = r
 
 	codec := keys.MakeSQLCodec(tenantID)
-	key := codec.IndexPrefix(keys.SqllivenessID, 1)
+	indexID := uint32(systemschema.SqllivenessTable().GetPrimaryIndexID())
+	key := codec.IndexPrefix(keys.SqllivenessID, indexID)
 
 	// livenessValue returns the KV value for the one row in the
 	// system.sqlliveness table. The value contains the session expiration time
@@ -1005,7 +1005,7 @@ func TestScheduledJobsConsumption(t *testing.T) {
 	stats.AutomaticStatisticsOnSystemTables.Override(ctx, &st.SV, false)
 	tenantcostclient.TargetPeriodSetting.Override(ctx, &st.SV, time.Millisecond*20)
 
-	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
+	hostServer, _, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled, Settings: st})
 	defer hostServer.Stopper().Stop(ctx)
 
 	testProvider := newTestProvider()
@@ -1089,7 +1089,7 @@ func TestConsumptionChangefeeds(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled})
 	defer hostServer.Stopper().Stop(context.Background())
 	if _, err := hostDB.Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
 		t.Fatalf("changefeed setup failed: %s", err.Error())
@@ -1158,11 +1158,10 @@ func TestConsumptionExternalStorage(t *testing.T) {
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
-	blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(dir)
 	hostServer, hostDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Test fails when run within the default tenant. Tracked with #76378.
-		DisableDefaultTestTenant: true,
-		ExternalIODir:            dir,
+		DefaultTestTenant: base.TestTenantDisabled,
+		ExternalIODir:     dir,
 	})
 	defer hostServer.Stopper().Stop(context.Background())
 	hostSQL := sqlutils.MakeSQLRunner(hostDB)
@@ -1177,9 +1176,6 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		Settings:      st,
 		ExternalIODir: dir,
 		TestingKnobs: base.TestingKnobs{
-			Server: &server.TestingKnobs{
-				BlobClientFactory: blobClientFactory,
-			},
 			TenantTestingKnobs: &sql.TenantTestingKnobs{
 				OverrideTokenBucketProvider: func(kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider {
 					return testProvider
@@ -1245,7 +1241,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		r.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/tenant'")
+		r.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/tenant'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.NotEqual(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1256,7 +1252,7 @@ func TestConsumptionExternalStorage(t *testing.T) {
 		nodelocal.LocalRequiresExternalIOAccounting = true
 		defer func() { nodelocal.LocalRequiresExternalIOAccounting = false }()
 		before := testProvider.waitForConsumption(t)
-		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://0/backups/host'")
+		hostSQL.Exec(t, "BACKUP t INTO 'nodelocal://1/backups/host'")
 		c := testProvider.waitForConsumption(t)
 		c.Sub(&before)
 		require.Equal(t, uint64(0), c.ExternalIOEgressBytes)
@@ -1270,7 +1266,7 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 
 	hostServer, hostSQL, _ := serverutils.StartServer(b,
 		base.TestServerArgs{
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
 		})
 	defer hostServer.Stopper().Stop(context.Background())
 

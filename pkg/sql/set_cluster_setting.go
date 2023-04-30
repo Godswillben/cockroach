@@ -67,18 +67,28 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 
 	// First check system privileges.
 	hasModify := false
+	hasSqlModify := false
 	hasView := false
-	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING); err == nil {
-		hasModify = true
-		hasView = true
-	} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+	if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
 		return err
+	} else if ok {
+		hasModify = true
+		hasSqlModify = true
+		hasView = true
+	}
+	if !hasSqlModify {
+		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User()); err != nil {
+			return err
+		} else if ok {
+			hasSqlModify = true
+			hasView = true
+		}
 	}
 	if !hasView {
-		if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING); err == nil {
-			hasView = true
-		} else if pgerror.GetPGCode(err) != pgcode.InsufficientPrivilege {
+		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING, p.User()); err != nil {
 			return err
+		} else if ok {
+			hasView = true
 		}
 	}
 
@@ -89,14 +99,24 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 			return err
 		}
 		hasModify = hasModify || ok
+		hasSqlModify = hasSqlModify || ok
 		hasView = hasView || ok
 	}
 
-	// The "set" action requires MODIFYCLUSTERSETTING.
+	// The "set" action requires MODIFYCLUSTERSETTING or at least MODIFYSQLCLUSTERSETTING if
+	// the setting is a sql.defaults setting.
 	if action == "set" && !hasModify {
+		isSqlSetting := strings.HasPrefix(name, "sql.defaults")
+		if hasSqlModify && isSqlSetting {
+			return nil
+		} else if !isSqlSetting {
+			return pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the %s privilege are allowed to %s cluster setting '%s'",
+				privilege.MODIFYCLUSTERSETTING, action, name)
+		}
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
-			"only users with the %s privilege are allowed to %s cluster setting '%s'",
-			privilege.MODIFYCLUSTERSETTING, action, name)
+			"only users with the %s or %s privilege are allowed to %s cluster setting '%s'",
+			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, action, name)
 	}
 
 	if !hasView {
@@ -110,8 +130,8 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 	// The "show" action requires either either MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING privileges.
 	if action == "show" && !hasView {
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
-			"only users with either %s or %s privileges are allowed to %s cluster setting '%s'",
-			privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
+			"only users with %s, %s or %s privileges are allowed to %s cluster setting '%s'",
+			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
 	}
 	return nil
 }
@@ -123,18 +143,13 @@ func (p *planner) SetClusterSetting(
 ) (planNode, error) {
 	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
-	v, ok := settings.Lookup(name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant())
+	setting, ok := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
 	}
 
 	if err := checkPrivilegesForSetting(ctx, p, name, "set"); err != nil {
 		return nil, err
-	}
-
-	setting, ok := v.(settings.NonMaskedSetting)
-	if !ok {
-		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
 	if !p.execCfg.Codec.ForSystemTenant() {
@@ -316,7 +331,10 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			telemetry.Inc(sqltelemetry.HashAggregationDiskSpillingDisabled)
 		}
 	}
-
+	// Don't bother waiting if we're ignoring the values; just say so now.
+	if settings.IsIgnoringAllUpdates() {
+		return errors.New("setting updated but will not take effect in this process due to manual override")
+	}
 	return waitForSettingUpdate(params.ctx, params.extendedEvalCtx.ExecCfg,
 		n.setting, n.value == nil /* reset */, n.name, expectedEncodedValue)
 }
@@ -501,7 +519,7 @@ func setVersionSetting(
 	// Updates the version inside the system.settings table.
 	// If we are already at or above the target version, then this
 	// function is idempotent.
-	updateVersionSystemSetting := func(ctx context.Context, version clusterversion.ClusterVersion) error {
+	updateVersionSystemSetting := func(ctx context.Context, version clusterversion.ClusterVersion, postSettingValidate func(ctx context.Context) error) error {
 		rawValue, err := protoutil.Marshal(&version)
 		if err != nil {
 			return err
@@ -557,6 +575,16 @@ func setVersionSetting(
 					return err
 				}
 			}
+
+			// Perform any necessary post-setting validation. This is used in
+			// the tenant upgrade interlock to ensure that the set of sql
+			// servers present at the time of the settings update, matches the
+			// set that was present when the fence bump occurred (see comment in
+			// upgrademanager.Migrate() for more details).
+			if err = postSettingValidate(ctx); err != nil {
+				return err
+			}
+
 			return err
 		})
 	}

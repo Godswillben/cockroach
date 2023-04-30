@@ -216,9 +216,9 @@ func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
 	} else {
 		panic(errors.AssertionFailedf("unsupported type kind %q", typ.GetKind()))
 	}
-	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
-		ObjectID:       typ.GetID(),
-		ParentSchemaID: typ.GetParentSchemaID(),
+	w.ev(scpb.Status_PUBLIC, &scpb.SchemaChild{
+		ChildObjectID: typ.GetID(),
+		SchemaID:      typ.GetParentSchemaID(),
 	})
 	for i := 0; i < typ.NumReferencingDescriptors(); i++ {
 		w.backRefs.Add(typ.GetReferencingDescriptorID(i))
@@ -286,9 +286,9 @@ func (w *walkCtx) walkRelation(tbl catalog.TableDescriptor) {
 		})
 	}
 
-	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
-		ObjectID:       tbl.GetID(),
-		ParentSchemaID: tbl.GetParentSchemaID(),
+	w.ev(scpb.Status_PUBLIC, &scpb.SchemaChild{
+		ChildObjectID: tbl.GetID(),
+		SchemaID:      tbl.GetParentSchemaID(),
 	})
 	if tbl.IsPartitionAllBy() {
 		w.ev(descriptorStatus(tbl), &scpb.TablePartitioning{
@@ -360,10 +360,21 @@ func (w *walkCtx) walkRelation(tbl catalog.TableDescriptor) {
 				&scpb.TableZoneConfig{
 					TableID: tbl.GetID(),
 				})
+			for _, subZoneCfg := range zoneCfg.ZoneConfigProto().Subzones {
+				w.ev(scpb.Status_PUBLIC,
+					&scpb.IndexZoneConfig{
+						TableID:       tbl.GetID(),
+						IndexID:       catid.IndexID(subZoneCfg.IndexID),
+						PartitionName: subZoneCfg.PartitionName,
+					})
+			}
 		}
 	}
 	if tbl.IsPhysicalTable() {
 		w.ev(scpb.Status_PUBLIC, &scpb.TableData{TableID: tbl.GetID(), DatabaseID: tbl.GetParentID()})
+	}
+	if tbl.IsSchemaLocked() {
+		w.ev(scpb.Status_PUBLIC, &scpb.TableSchemaLocked{TableID: tbl.GetID()})
 	}
 }
 
@@ -419,8 +430,11 @@ func (w *walkCtx) walkColumn(tbl catalog.TableDescriptor, col catalog.Column) {
 		IsInaccessible:                    col.IsInaccessible(),
 		GeneratedAsIdentityType:           col.GetGeneratedAsIdentityType(),
 		GeneratedAsIdentitySequenceOption: col.GetGeneratedAsIdentitySequenceOptionStr(),
-		PgAttributeNum:                    col.GetPGAttributeNum(),
 		IsSystemColumn:                    col.IsSystemColumn(),
+	}
+	// Only set PgAttributeNum if it differs from ColumnID.
+	if pgAttNum := col.GetPGAttributeNum(); pgAttNum != catid.PGAttributeNum(col.GetID()) {
+		column.PgAttributeNum = pgAttNum
 	}
 	w.ev(maybeMutationStatus(col), column)
 	w.ev(scpb.Status_PUBLIC, &scpb.ColumnName{
@@ -514,7 +528,8 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 			IsInverted:          idx.GetType() == descpb.IndexDescriptor_INVERTED,
 			IsCreatedExplicitly: idx.IsCreatedExplicitly(),
 			ConstraintID:        idx.GetConstraintID(),
-			IsNotVisible:        idx.IsNotVisible(),
+			IsNotVisible:        idx.GetInvisibility() != 0.0,
+			Invisibility:        idx.GetInvisibility(),
 		}
 		if geoConfig := idx.GetGeoConfig(); !geoConfig.IsEmpty() {
 			index.GeoConfig = protoutil.Clone(&geoConfig).(*geoindex.Config)
@@ -761,9 +776,9 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 	}
 
 	w.ev(descriptorStatus(fnDesc), fn)
-	w.ev(scpb.Status_PUBLIC, &scpb.ObjectParent{
-		ObjectID:       fnDesc.GetID(),
-		ParentSchemaID: fnDesc.GetParentSchemaID(),
+	w.ev(scpb.Status_PUBLIC, &scpb.SchemaChild{
+		ChildObjectID: fnDesc.GetID(),
+		SchemaID:      fnDesc.GetParentSchemaID(),
 	})
 	w.ev(scpb.Status_PUBLIC, &scpb.FunctionName{
 		FunctionID: fnDesc.GetID(),

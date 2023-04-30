@@ -110,7 +110,7 @@ func TestRotateCerts(t *testing.T) {
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	firstClient, err := firstSCtx.GetHTTPClient()
 	if err != nil {
@@ -147,7 +147,7 @@ func TestRotateCerts(t *testing.T) {
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	secondClient, err := secondSCtx.GetHTTPClient()
 	if err != nil {
@@ -201,7 +201,7 @@ func TestRotateCerts(t *testing.T) {
 	// the moment the structured logging event is actually
 	// written to the log file.
 	testutils.SucceedsSoon(t, func() error {
-		log.Flush()
+		log.FlushFileSinks()
 		entries, err := log.FetchEntriesFromFiles(beforeReload.UnixNano(),
 			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
 		if err != nil {
@@ -261,7 +261,7 @@ func TestRotateCerts(t *testing.T) {
 		clientContext,
 		security.CommandTLSSettings{},
 		roachpb.SystemTenantID,
-		tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
+		tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 	)
 	thirdClient, err := thirdSCtx.GetHTTPClient()
 	if err != nil {

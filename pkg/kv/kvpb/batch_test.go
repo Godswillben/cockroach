@@ -11,10 +11,12 @@
 package kvpb
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -386,7 +388,7 @@ func TestBatchResponseCombine(t *testing.T) {
 	br := &BatchResponse{}
 	{
 		txn := roachpb.MakeTransaction(
-			"test", nil /* baseKey */, roachpb.NormalUserPriority,
+			"test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
 			hlc.Timestamp{WallTime: 123}, 0 /* baseKey */, 99, /* coordinatorNodeID */
 		)
 		brTxn := &BatchResponse{
@@ -394,7 +396,7 @@ func TestBatchResponseCombine(t *testing.T) {
 				Txn: &txn,
 			},
 		}
-		if err := br.Combine(brTxn, nil); err != nil {
+		if err := br.Combine(context.Background(), brTxn, nil, &BatchRequest{}); err != nil {
 			t.Fatal(err)
 		}
 		if br.Txn.Name != "test" {
@@ -421,7 +423,7 @@ func TestBatchResponseCombine(t *testing.T) {
 	// Combine twice with a single scan result: first one should simply copy over, second
 	// one should add on top. Slightly different code paths internally, hence the distinction.
 	for i := 0; i < 2; i++ {
-		if err := br.Combine(singleScanBR(), []int{0}); err != nil {
+		if err := br.Combine(context.Background(), singleScanBR(), []int{0}, &BatchRequest{}); err != nil {
 			t.Fatal(err)
 		}
 		scan := br.Responses[0].GetInner().(*ScanResponse)
@@ -439,7 +441,7 @@ func TestBatchResponseCombine(t *testing.T) {
 
 	// Now we have br = [Put, Scan]. Combine should use the position to
 	// combine singleScanBR on top of the Scan at index one.
-	if err := br.Combine(singleScanBR(), []int{1}); err != nil {
+	if err := br.Combine(context.Background(), singleScanBR(), []int{1}, &BatchRequest{}); err != nil {
 		t.Fatal(err)
 	}
 	scan := br.Responses[1].GetInner().(*ScanResponse)
@@ -450,7 +452,7 @@ func TestBatchResponseCombine(t *testing.T) {
 	if len(scan.IntentRows) != expRows {
 		t.Fatalf("expected %d intent rows, got %s", expRows, pretty.Sprint(scan))
 	}
-	if err := br.Combine(singleScanBR(), []int{0}); err.Error() !=
+	if err := br.Combine(context.Background(), singleScanBR(), []int{0}, &BatchRequest{}); err.Error() !=
 		`can not combine *kvpb.PutResponse and *kvpb.ScanResponse` {
 		t.Fatal(err)
 	}

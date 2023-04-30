@@ -13,6 +13,7 @@ package persistedsqlstats
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
@@ -27,7 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Flush flushes in-memory sql stats into system table. Any errors encountered
+// Flush flushes in-memory sql stats into a system table. Any errors encountered
 // during the flush will be logged as warning.
 func (s *PersistedSQLStats) Flush(ctx context.Context) {
 	now := s.getTimeNow()
@@ -74,8 +75,20 @@ func (s *PersistedSQLStats) Flush(ctx context.Context) {
 	if s.stmtsLimitSizeReached(ctx) || s.txnsLimitSizeReached(ctx) {
 		log.Infof(ctx, "unable to flush fingerprints because table limit was reached.")
 	} else {
-		s.flushStmtStats(ctx, aggregatedTs)
-		s.flushTxnStats(ctx, aggregatedTs)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			s.flushStmtStats(ctx, aggregatedTs)
+		}()
+
+		go func() {
+			defer wg.Done()
+			s.flushTxnStats(ctx, aggregatedTs)
+		}()
+
+		wg.Wait()
 	}
 }
 

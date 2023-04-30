@@ -16,6 +16,7 @@ package lint
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -40,6 +41,9 @@ import (
 )
 
 const cockroachDB = "github.com/cockroachdb/cockroach"
+
+//go:embed gcassert_paths.txt
+var rawGcassertPaths string
 
 func dirCmd(
 	dir string, name string, args ...string,
@@ -123,6 +127,7 @@ func TestLint(t *testing.T) {
 	pkgVar, pkgSpecified := os.LookupEnv("PKG")
 
 	t.Run("TestLowercaseFunctionNames", func(t *testing.T) {
+		skip.UnderShort(t)
 		t.Parallel()
 		reSkipCasedFunction, err := regexp.Compile(`^(Binary file.*|[^:]+:\d+:(` +
 			`query error .*` + // OK when in logic tests
@@ -242,6 +247,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`opentelemetry-proto/.*.proto$`),
 			// These files are copied from bazel upstream with its own license.
 			stream.GrepNot(`build/bazel/bes/.*.proto$`),
+			// Generated files for plpgsql.
+			stream.GrepNot(`sql/plpgsql/parser/plpgsqllexbase/.*.go`),
 		), func(filename string) {
 			file, err := os.Open(filepath.Join(pkgDir, filename))
 			if err != nil {
@@ -476,6 +483,7 @@ func TestLint(t *testing.T) {
 					":!util/grpcutil",                     // GRPC_GO_* variables
 					":!roachprod",                         // roachprod requires AWS environment variables
 					":!cli/env.go",                        // The CLI needs the PGHOST variable.
+					":!cli/start.go",                      // The CLI needs the GOMEMLIMIT variable.
 					":!internal/codeowners/codeowners.go", // For BAZEL_TEST.
 					":!internal/team/team.go",             // For BAZEL_TEST.
 				},
@@ -1561,12 +1569,14 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`cockroach/pkg/testutils/lint: log$`),
 			stream.GrepNot(`cockroach/pkg/util/sysutil: syscall$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/util/grpcutil: github\.com/cockroachdb\/errors\/errbase$`),
+			stream.GrepNot(`cockroachdb/cockroach/pkg/util/future: github\.com/cockroachdb\/errors\/errbase$`),
 			stream.GrepNot(`cockroach/pkg/roachprod/install: syscall$`), // TODO: switch to sysutil
 			stream.GrepNot(`cockroach/pkg/util/log: github\.com/pkg/errors$`),
 			stream.GrepNot(`cockroach/pkg/(base|release|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/rpc: github\.com/golang/protobuf/proto$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/sql/lexbase/allkeywords: log$`),
+			stream.GrepNot(`cockroachdb/cockroach/pkg/sql/plpgsql/parser/plpgsqllexbase/allkeywords: log$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/util/timeutil/gen: log$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/kv/kvpb/gen: log$`),
 			stream.GrepNot(`cockroachdb/cockroach/pkg/util/log/gen: log$`),
@@ -1583,6 +1593,7 @@ func TestLint(t *testing.T) {
 			// Test that the settings package does not import CRDB dependencies.
 			if importingPkg == settingsPkgPrefix && strings.HasPrefix(importedPkg, cockroachDB) {
 				switch {
+				case strings.HasSuffix(s, "envutil"):
 				case strings.HasSuffix(s, "humanizeutil"):
 				case strings.HasSuffix(s, "protoutil"):
 				case strings.HasSuffix(s, "testutils"):
@@ -1791,6 +1802,8 @@ func TestLint(t *testing.T) {
 				stream.GrepNot(`pkg/sql/row/expr_walker_test.go:.* evalCtx.SetDeprecatedContext is deprecated: .*`),
 				stream.GrepNot(`pkg/sql/schemachanger/scbuild/tree_context_builder.go:.* evalCtx.SetDeprecatedContext is deprecated: .*`),
 				stream.GrepNot(`pkg/sql/schemachanger/scplan/internal/rules/.*/.*go:.* should not use dot imports \(ST1001\)`),
+				// TODO(yuzefovich): remove this exclusion (#100438).
+				stream.GrepNot(`pkg/util/bulk/tracing_aggregator.go:.*SetLazyTagLocked is deprecated: .*`),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -2036,46 +2049,23 @@ func TestLint(t *testing.T) {
 
 	t.Run("TestGCAssert", func(t *testing.T) {
 		skip.UnderShort(t)
-		skip.UnderBazelWithIssue(t, 65485, "Doesn't work in Bazel -- not really sure why yet")
 
 		t.Parallel()
 
-		gcassertPaths := []string{
-			"../../col/coldata",
-			"../../col/colserde",
-			"../../keys",
-			"../../kv/kvclient/rangecache",
-			"../../kv/kvpb",
-			"../../roachpb",
-			"../../sql/catalog/descs",
-			"../../sql/colcontainer",
-			"../../sql/colconv",
-			"../../sql/colexec",
-			"../../sql/colexec/colexecagg",
-			"../../sql/colexec/colexecbase",
-			"../../sql/colexec/colexechash",
-			"../../sql/colexec/colexecjoin",
-			"../../sql/colexec/colexecproj",
-			"../../sql/colexec/colexecprojconst",
-			"../../sql/colexec/colexecsel",
-			"../../sql/colexec/colexecspan",
-			"../../sql/colexec/colexecwindow",
-			"../../sql/colfetcher",
-			"../../sql/opt",
-			"../../sql/row",
-			"../../storage",
-			"../../storage/enginepb",
-			"../../storage/pebbleiter",
-			"../../util",
-			"../../util/admission",
-			"../../util/hlc",
-			"../../util/intsets",
+		var gcassertPaths []string
+		for _, path := range strings.Split(rawGcassertPaths, "\n") {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			gcassertPaths = append(gcassertPaths, fmt.Sprintf("../../%s", path))
 		}
 
 		// Ensure that all packages that have '//gcassert' or '// gcassert'
 		// assertions are included into gcassertPaths.
 		t.Run("Coverage", func(t *testing.T) {
 			t.Parallel()
+
 			cmd, stderr, filter, err := dirCmd(
 				pkgDir,
 				"git",
@@ -2120,13 +2110,15 @@ func TestLint(t *testing.T) {
 			}
 		})
 
-		var buf strings.Builder
-		if err := gcassert.GCAssert(&buf, gcassertPaths...); err != nil {
-			t.Fatal(err)
-		}
-		output := buf.String()
-		if len(output) > 0 {
-			t.Fatalf("failed gcassert:\n%s", output)
+		if !bazel.BuiltWithBazel() {
+			var buf strings.Builder
+			if err := gcassert.GCAssert(&buf, gcassertPaths...); err != nil {
+				t.Fatal(err)
+			}
+			output := buf.String()
+			if len(output) > 0 {
+				t.Fatalf("failed gcassert:\n%s", output)
+			}
 		}
 	})
 
@@ -2301,6 +2293,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`pkg/sql/pgwire/pgerror/pgcode\.go:.*invalid direct cast on error object`),
 			// Cast in decode handler.
 			stream.GrepNot(`pkg/util/contextutil/timeout_error\.go:.*invalid direct cast on error object`),
+			// Direct error cast OK in this case for a low-dependency helper binary.
+			stream.GrepNot(`pkg/cmd/github-pull-request-make/main\.go:.*invalid direct cast on error object`),
 			// The logging package translates log.Fatal calls into errors.
 			// We can't use the regular exception mechanism via functions.go
 			// because addStructured takes its positional argument as []interface{},

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -79,7 +78,7 @@ func TestDeclareKeysResolveIntent(t *testing.T) {
 	}
 	ctx := context.Background()
 	engine := storage.NewDefaultInMemForTesting()
-	st := makeClusterSettingsUsingEngineIntentsSetting(engine)
+	st := cluster.MakeTestingClusterSettings()
 	defer engine.Close()
 	testutils.RunTrueAndFalse(t, "ranged", func(t *testing.T, ranged bool) {
 		for _, test := range tests {
@@ -150,7 +149,7 @@ func TestResolveIntentAfterPartialRollback(t *testing.T) {
 	ts := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
 	endKey := roachpb.Key("z")
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1)
 	desc := roachpb.RangeDescriptor{
 		RangeID:  99,
 		StartKey: roachpb.RKey(k),
@@ -162,7 +161,7 @@ func TestResolveIntentAfterPartialRollback(t *testing.T) {
 		defer db.Close()
 		batch := db.NewBatch()
 		defer batch.Close()
-		st := makeClusterSettingsUsingEngineIntentsSetting(db)
+		st := cluster.MakeTestingClusterSettings()
 
 		var v roachpb.Value
 		// Write a first value at key.
@@ -294,14 +293,14 @@ func TestResolveIntentWithTargetBytes(t *testing.T) {
 		}
 		values[i] = roachpb.MakeValueFromBytes([]byte{b})
 	}
-	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, 0, ts, 0, 1)
 
 	testutils.RunTrueAndFalse(t, "ranged", func(t *testing.T, ranged bool) {
 		db := storage.NewDefaultInMemForTesting()
 		defer db.Close()
 		batch := db.NewBatch()
 		defer batch.Close()
-		st := makeClusterSettingsUsingEngineIntentsSetting(db)
+		st := cluster.MakeTestingClusterSettings()
 
 		for i, testKey := range testKeys {
 			err := storage.MVCCPut(ctx, batch, nil, testKey, ts, hlc.ClockTimestamp{}, values[i], &txn)
@@ -476,9 +475,4 @@ func TestResolveIntentWithTargetBytes(t *testing.T) {
 			}
 		}
 	})
-}
-
-func makeClusterSettingsUsingEngineIntentsSetting(engine storage.Engine) *cluster.Settings {
-	version := clusterversion.TestingBinaryVersion
-	return cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
 }

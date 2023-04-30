@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
@@ -742,6 +743,7 @@ type clusterConfig struct {
 	localCluster bool
 	useIOBarrier bool
 	alloc        *quotapool.IntAlloc
+	enableFIPS   bool
 }
 
 // clusterFactory is a creator of clusters.
@@ -822,6 +824,9 @@ func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 		if flags.Changed("geo") {
 			opts.GeoDistributed = overrideOpts.GeoDistributed
 		}
+		if flags.Changed("label") {
+			opts.CustomLabels = overrideOpts.CustomLabels
+		}
 	}
 }
 
@@ -875,7 +880,7 @@ func (f *clusterFactory) newCluster(
 	providerOptsContainer := vm.CreateProviderOptionsContainer()
 	// The ClusterName is set below in the retry loop to ensure
 	// that each create attempt gets a unique cluster name.
-	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts("", cfg.useIOBarrier)
+	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts("", cfg.useIOBarrier, cfg.enableFIPS)
 	if err != nil {
 		// We must release the allocation because cluster creation is not possible at this point.
 		cfg.alloc.Release()
@@ -1083,7 +1088,7 @@ func (c *clusterImpl) validate(
 	// Perform validation on the existing cluster.
 	c.status("checking that existing cluster matches spec")
 	pattern := "^" + regexp.QuoteMeta(c.name) + "$"
-	cloudClusters, err := roachprod.List(l, false /* listMine */, pattern)
+	cloudClusters, err := roachprod.List(l, false /* listMine */, pattern, vm.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -1210,6 +1215,7 @@ func (c *clusterImpl) CopyRoachprodState(ctx context.Context) error {
 //
 // `COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob ./cockroach start-single-node --insecure --store=$(mktemp -d)`
 func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger) error {
+	l.Printf("fetching timeseries data\n")
 	return contextutil.RunWithTimeout(ctx, "fetch tsdata", 5*time.Minute, func(ctx context.Context) error {
 		node := 1
 		for ; node <= c.spec.NodeCount; node++ {
@@ -1324,21 +1330,38 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger) error
 	})
 }
 
-// checkNoDeadNode reports an error (via `t.Error`) if nodes that have a populated
+// checkNoDeadNode returns an error if at least one of the nodes that have a populated
 // data dir are found to be not running. It prints both to t.L() and the test
 // output.
-func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) {
+func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) error {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
-		return
+		return nil
 	}
 
-	_, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
-	// If there's an error, it means either that the monitor command failed
-	// completely, or that it found a dead node worth complaining about.
+	t.L().Printf("checking for dead nodes")
+	ch, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
+
+	// An error here means there was a problem initialising a SyncedCluster.
 	if err != nil {
-		t.Errorf("dead node detection: %s", err)
+		return err
 	}
+
+	deadNodes := 0
+	for n := range ch {
+		// If there's an error, it means either that the monitor command failed
+		// completely, or that it found a dead node worth complaining about.
+		if n.Err != nil || strings.HasPrefix(n.Msg, "dead") {
+			deadNodes++
+		}
+
+		t.L().Printf("node %d: err=%v,msg=%s", n.Node, n.Err, n.Msg)
+	}
+
+	if deadNodes > 0 {
+		return errors.Newf("%d dead node(s) detected", deadNodes)
+	}
+	return nil
 }
 
 // ConnectToLiveNode returns a connection to a live node in the cluster. If no
@@ -1377,10 +1400,11 @@ func (c *clusterImpl) ConnectToLiveNode(ctx context.Context, t *testImpl) (*gosq
 // FailOnInvalidDescriptors fails the test if there exists any descriptors in
 // the crdb_internal.invalid_objects virtual table.
 func (c *clusterImpl) FailOnInvalidDescriptors(ctx context.Context, db *gosql.DB, t *testImpl) {
+	t.L().Printf("checking for invalid descriptors")
 	if err := contextutil.RunWithTimeout(
-		ctx, "invalid descriptors check", 5*time.Minute,
+		ctx, "invalid descriptors check", 1*time.Minute,
 		func(ctx context.Context) error {
-			return roachtestutil.CheckInvalidDescriptors(db)
+			return roachtestutil.CheckInvalidDescriptors(ctx, db)
 		},
 	); err != nil {
 		t.Errorf("invalid descriptors check failed: %v", err)
@@ -1391,6 +1415,7 @@ func (c *clusterImpl) FailOnInvalidDescriptors(ctx context.Context, db *gosql.DB
 // crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
 // replicas are inconsistent with each other.
 func (c *clusterImpl) FailOnReplicaDivergence(ctx context.Context, db *gosql.DB, t *testImpl) {
+	t.L().Printf("checking for replica divergence")
 	if err := contextutil.RunWithTimeout(
 		ctx, "consistency check", 5*time.Minute,
 		func(ctx context.Context) error {
@@ -1727,7 +1752,7 @@ func (c *clusterImpl) Get(
 	}
 	c.status(fmt.Sprintf("getting %v", src))
 	defer c.status("")
-	return errors.Wrap(roachprod.Get(l, c.MakeNodes(opts...), src, dest), "cluster.Get")
+	return errors.Wrap(roachprod.Get(ctx, l, c.MakeNodes(opts...), src, dest), "cluster.Get")
 }
 
 // Put a string into the specified file on the remote(s).
@@ -1836,6 +1861,14 @@ func (c *clusterImpl) StartE(
 		settings.Env = append(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH=true")
 	}
 
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	if !envExists(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR") {
+		// This makes all roachtest use the new SHOW RANGES behavior,
+		// regardless of cluster settings.
+		settings.Env = append(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR=false")
+	}
+
 	clusterSettingsOpts := []install.ClusterSettingOption{
 		install.TagOption(settings.Tag),
 		install.PGUrlCertsDirOption(settings.PGUrlCertsDir),
@@ -1931,6 +1964,33 @@ func (c *clusterImpl) Stop(
 		return
 	}
 	if err := c.StopE(ctx, l, stopOpts, opts...); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+// SignalE sends a signal to the given nodes.
+func (c *clusterImpl) SignalE(
+	ctx context.Context, l *logger.Logger, sig int, nodes ...option.Option,
+) error {
+	if ctx.Err() != nil {
+		return errors.Wrap(ctx.Err(), "cluster.Signal")
+	}
+	if c.spec.NodeCount == 0 {
+		return nil // unit tests
+	}
+	return errors.Wrap(roachprod.Signal(ctx, l, c.MakeNodes(nodes...), sig), "cluster.Signal")
+}
+
+// Signal is like SignalE, except instead of returning an error, it does
+// c.t.Fatal(). c.t needs to be set.
+func (c *clusterImpl) Signal(
+	ctx context.Context, l *logger.Logger, sig int, nodes ...option.Option,
+) {
+	if c.t.Failed() {
+		// If the test has failed, don't try to limp along.
+		return
+	}
+	if err := c.SignalE(ctx, l, sig, nodes...); err != nil {
 		c.t.Fatal(err)
 	}
 }
@@ -2364,6 +2424,13 @@ func (c *clusterImpl) ConnE(
 		u.User = url.User(connOptions.User)
 		dataSourceName = u.String()
 	}
+	if len(connOptions.Options) > 0 {
+		vals := make(url.Values)
+		for k, v := range connOptions.Options {
+			vals.Add(k, v)
+		}
+		dataSourceName = dataSourceName + "&" + vals.Encode()
+	}
 	db, err := gosql.Open("postgres", dataSourceName)
 	if err != nil {
 		return nil, err
@@ -2382,8 +2449,7 @@ func (c *clusterImpl) MakeNodes(opts ...option.Option) string {
 }
 
 func (c *clusterImpl) IsLocal() bool {
-	// FIXME: I think radu made local more flexible and local is a prefix?
-	return c.name == "local"
+	return config.IsLocalClusterName(c.name)
 }
 
 func (c *clusterImpl) IsSecure() bool {
@@ -2405,6 +2471,12 @@ func (c *clusterImpl) Extend(ctx context.Context, d time.Duration, l *logger.Log
 	return nil
 }
 
+// NewMonitor creates a monitor that can watch for unexpected crdb node deaths on m.Wait()
+// and provide roachtest safe goroutines.
+//
+// As a general rule, if the user has a workload node, do not monitor it. A
+// monitor's semantics around handling expected node deaths breaks down if it's
+// monitoring a workload node.
 func (c *clusterImpl) NewMonitor(ctx context.Context, opts ...option.Option) cluster.Monitor {
 	return newMonitor(ctx, c.t, c, opts...)
 }

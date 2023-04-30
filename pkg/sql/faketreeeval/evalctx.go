@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -134,12 +135,6 @@ func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForTable(
 func (so *DummyRegionOperator) ResetMultiRegionZoneConfigsForDatabase(
 	_ context.Context, id int64,
 ) error {
-	return errors.WithStack(errRegionOperator)
-}
-
-// OptimizeSystemDatabase is part of the eval.RegionOperator
-// interface.
-func (so *DummyRegionOperator) OptimizeSystemDatabase(_ context.Context) error {
 	return errors.WithStack(errRegionOperator)
 }
 
@@ -469,6 +464,18 @@ func (ep *DummyEvalPlanner) IsANSIDML() bool {
 	return false
 }
 
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) EnforceHomeRegion() bool {
+	return false
+}
+
+// GetRangeDescIterator is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) GetRangeDescIterator(
+	context.Context, roachpb.Span,
+) (_ rangedesc.Iterator, _ error) {
+	return
+}
+
 // GetRangeDescByID is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) GetRangeDescByID(
 	context.Context, roachpb.RangeID,
@@ -478,7 +485,7 @@ func (ep *DummyEvalPlanner) GetRangeDescByID(
 
 // SpanStats is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) SpanStats(
-	context.Context, roachpb.RKey, roachpb.RKey,
+	context.Context, roachpb.Spans,
 ) (stats *roachpb.SpanStatsResponse, err error) {
 	return
 }
@@ -488,6 +495,10 @@ func (ep *DummyEvalPlanner) GetDetailsForSpanStats(
 	context.Context, int, int,
 ) (it eval.InternalRows, err error) {
 	return
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
@@ -537,6 +548,13 @@ func (ep *DummySessionAccessor) SetSessionVar(
 // HasAdminRole is part of the eval.SessionAccessor interface.
 func (ep *DummySessionAccessor) HasAdminRole(_ context.Context) (bool, error) {
 	return false, errors.WithStack(errEvalSessionVar)
+}
+
+// CheckPrivilege is part of the eval.SessionAccessor interface.
+func (ep *DummySessionAccessor) CheckPrivilege(
+	_ context.Context, _ privilege.Object, _ privilege.Kind,
+) error {
+	return errors.WithStack(errEvalSessionVar)
 }
 
 // HasRoleOption is part of the eval.SessionAccessor interface.

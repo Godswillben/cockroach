@@ -16,29 +16,26 @@ import {
   DatabaseDetailsPageData,
   defaultFilters,
   Filters,
-  util,
   ViewMode,
 } from "@cockroachlabs/cluster-ui";
 
-import { cockroach } from "src/js/protos";
 import {
   generateTableID,
   refreshDatabaseDetails,
   refreshTableDetails,
-  refreshTableStats,
 } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
 import { databaseNameAttr } from "src/util/constants";
-import { FixLong } from "src/util/fixLong";
 import { getMatchParamByName } from "src/util/query";
 import {
   nodeRegionsByIDSelector,
   selectIsMoreThanOneNode,
 } from "src/redux/nodes";
-import { getNodesByRegionString, normalizePrivileges } from "../utils";
-
-const { DatabaseDetailsRequest, TableDetailsRequest, TableStatsRequest } =
-  cockroach.server.serverpb;
+import {
+  combineLoadingErrors,
+  getNodesByRegionString,
+  normalizePrivileges,
+} from "../utils";
 
 function normalizeRoles(raw: string[]): string[] {
   const rolePrecedence: Record<string, number> = {
@@ -94,7 +91,6 @@ export const mapStateToProps = createSelector(
 
   state => state.cachedData.databaseDetails,
   state => state.cachedData.tableDetails,
-  state => state.cachedData.tableStats,
   state => nodeRegionsByIDSelector(state),
   state => selectIsMoreThanOneNode(state),
   state => viewModeLocalSetting.selector(state),
@@ -107,7 +103,6 @@ export const mapStateToProps = createSelector(
     database,
     databaseDetails,
     tableDetails,
-    tableStats,
     nodeRegions,
     showNodeRegionsColumn,
     viewMode,
@@ -120,7 +115,11 @@ export const mapStateToProps = createSelector(
     return {
       loading: !!databaseDetails[database]?.inFlight,
       loaded: !!databaseDetails[database]?.valid,
-      lastError: databaseDetails[database]?.lastError,
+      lastError: combineLoadingErrors(
+        databaseDetails[database]?.lastError,
+        databaseDetails[database]?.data?.maxSizeReached,
+        null,
+      ),
       name: database,
       showNodeRegionsColumn,
       viewMode,
@@ -130,74 +129,71 @@ export const mapStateToProps = createSelector(
       search: searchLocalTables,
       nodeRegions: nodeRegions,
       isTenant: isTenant,
-      tables: _.map(databaseDetails[database]?.data?.table_names, table => {
-        const tableId = generateTableID(database, table);
+      tables: _.map(
+        databaseDetails[database]?.data?.results.tablesResp.tables,
+        table => {
+          const tableId = generateTableID(database, table);
+          const details = tableDetails[tableId];
 
-        const details = tableDetails[tableId];
-        const stats = tableStats[tableId];
-
-        const roles = normalizeRoles(_.map(details?.data?.grants, "user"));
-        const grants = normalizePrivileges(
-          _.flatMap(details?.data?.grants, "privileges"),
-        );
-        const nodes = stats?.data?.node_ids || [];
-        const numIndexes = _.uniq(
-          _.map(details?.data?.indexes, index => index.name),
-        ).length;
-        return {
-          name: table,
-          details: {
+          const roles = normalizeRoles(
+            _.map(details?.data?.results.grantsResp.grants, "user"),
+          );
+          const grants = normalizePrivileges(
+            _.flatMap(details?.data?.results.grantsResp.grants, "privileges"),
+          );
+          const nodes = details?.data?.results.stats.replicaData.nodeIDs || [];
+          const numIndexes = _.uniq(
+            details?.data?.results.schemaDetails.indexes,
+          ).length;
+          return {
+            name: table,
             loading: !!details?.inFlight,
             loaded: !!details?.valid,
             lastError: details?.lastError,
-            columnCount: details?.data?.columns?.length || 0,
-            indexCount: numIndexes,
-            userCount: roles.length,
-            roles: roles,
-            grants: grants,
-            statsLastUpdated: details?.data?.stats_last_created_at
-              ? util.TimestampToMoment(details?.data?.stats_last_created_at)
-              : null,
-            hasIndexRecommendations:
-              details?.data?.has_index_recommendations || false,
-            totalBytes: FixLong(
-              details?.data?.data_total_bytes || 0,
-            ).toNumber(),
-            liveBytes: FixLong(details?.data?.data_live_bytes || 0).toNumber(),
-            livePercentage: details?.data?.data_live_percentage || 0,
-          },
-          stats: {
-            loading: !!stats?.inFlight,
-            loaded: !!stats?.valid,
-            lastError: stats?.lastError,
-            replicationSizeInBytes: FixLong(
-              stats?.data?.approximate_disk_bytes || 0,
-            ).toNumber(),
-            nodes: nodes,
-            rangeCount: FixLong(stats?.data?.range_count || 0).toNumber(),
-            nodesByRegionString: getNodesByRegionString(
-              nodes,
-              nodeRegions,
-              isTenant,
-            ),
-          },
-        };
-      }),
+            details: {
+              columnCount:
+                details?.data?.results.schemaDetails.columns?.length || 0,
+              indexCount: numIndexes,
+              userCount: roles.length,
+              roles: roles,
+              grants: grants,
+              statsLastUpdated:
+                details?.data?.results.heuristicsDetails
+                  .stats_last_created_at || null,
+              hasIndexRecommendations:
+                details?.data?.results.stats.indexStats
+                  .has_index_recommendations || false,
+              totalBytes:
+                details?.data?.results.stats.spanStats.total_bytes || 0,
+              liveBytes: details?.data?.results.stats.spanStats.live_bytes || 0,
+              livePercentage:
+                details?.data?.results.stats.spanStats.live_percentage || 0,
+              replicationSizeInBytes:
+                details?.data?.results.stats.spanStats.approximate_disk_bytes ||
+                0,
+              nodes: nodes,
+              rangeCount:
+                details?.data?.results.stats.spanStats.range_count || 0,
+              nodesByRegionString: getNodesByRegionString(
+                nodes,
+                nodeRegions,
+                isTenant,
+              ),
+            },
+          };
+        },
+      ),
     };
   },
 );
 
 export const mapDispatchToProps = {
-  refreshDatabaseDetails: (database: string) => {
-    return refreshDatabaseDetails(
-      new DatabaseDetailsRequest({ database, include_stats: true }),
-    );
-  },
+  refreshDatabaseDetails,
   refreshTableDetails: (database: string, table: string) => {
-    return refreshTableDetails(new TableDetailsRequest({ database, table }));
-  },
-  refreshTableStats: (database: string, table: string) => {
-    return refreshTableStats(new TableStatsRequest({ database, table }));
+    return refreshTableDetails({
+      database,
+      table,
+    });
   },
   onViewModeChange: (viewMode: ViewMode) => viewModeLocalSetting.set(viewMode),
   onSortingTablesChange: (columnName: string, ascending: boolean) =>

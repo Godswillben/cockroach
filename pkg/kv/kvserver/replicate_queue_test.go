@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -537,7 +539,7 @@ func TestReplicateQueueUpAndDownReplicateNonVoters(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Test fails with the default tenant. Disabling and
 				// tracking with #76378.
-				DisableDefaultTestTenant: true,
+				DefaultTestTenant: base.TestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					SpanConfig: &spanconfig.TestingKnobs{
 						ConfigureScratchRange: true,
@@ -620,6 +622,7 @@ func TestReplicateQueueDecommissioningNonVoters(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	skip.UnderRace(t, "takes a long time or times out under race")
 	skip.UnderDeadlockWithIssue(t, 94383)
+	skip.UnderMetamorphicWithIssue(t, 99207)
 
 	ctx := context.Background()
 
@@ -881,7 +884,7 @@ func TestReplicateQueueTracingOnError(t *testing.T) {
 
 	// Flush logs and get log messages from replicate_queue.go since just
 	// before calling store.Enqueue(..).
-	log.Flush()
+	log.FlushFileSinks()
 	entries, err := log.FetchEntriesFromFiles(testStartTs.UnixNano(),
 		math.MaxInt64, 100, regexp.MustCompile(`replicate_queue\.go`), log.WithMarkedSensitiveData)
 	require.NoError(t, err)
@@ -1756,8 +1759,7 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	skip.UnderDeadlockWithIssue(t, 38565)
 	ctx := context.Background()
 
-	// Create a cluster with really small ranges.
-	const rangeMaxSize = base.MinRangeMaxBytes
+	const rangeMaxSize = 64 << 20
 	zcfg := zonepb.DefaultZoneConfig()
 	zcfg.RangeMinBytes = proto.Int64(rangeMaxSize / 2)
 	zcfg.RangeMaxBytes = proto.Int64(rangeMaxSize)
@@ -1777,12 +1779,13 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	)
 	defer tc.Stopper().Stop(ctx)
 
-	// We're going to create a table with a big row and a small row. We'll split
-	// the table in between the rows, to produce a large range and a small one.
-	// Then we'll increase the replication factor to 5 and check that both ranges
-	// behave the same - i.e. they both get up-replicated. For the purposes of
-	// this test we're only worried about the large one up-replicating, but we
-	// test the small one as a control so that we don't fool ourselves.
+	// We're going to create a table with many versions of a big row and a small
+	// row. We'll split the table in between the rows, to produce a large range
+	// and a small one. Then we'll increase the replication factor to 5 and check
+	// that both ranges behave the same - i.e. they both get up-replicated. For
+	// the purposes of this test we're only worried about the large one
+	// up-replicating, but we test the small one as a control so that we don't
+	// fool ourselves.
 
 	// Disable the queues so they don't mess with our manual relocation. We'll
 	// re-enable them later.
@@ -1801,14 +1804,20 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	toggleReplicationQueues(tc, true /* active */)
 	toggleSplitQueues(tc, true /* active */)
 
-	// We're going to create a row that's larger than range_max_bytes, but not
-	// large enough that write back-pressuring kicks in and refuses it.
+	// We're going to create a large row, but now large enough that write
+	// back-pressuring kicks in and refuses it.
 	var sb strings.Builder
-	for i := 0; i < 1.5*rangeMaxSize; i++ {
+	for i := 0; i < rangeMaxSize/8; i++ {
 		sb.WriteRune('a')
 	}
-	_, err = db.Exec("INSERT INTO t(i,s) VALUES (1, $1)", sb.String())
-	require.NoError(t, err)
+
+	// Write 16 versions of the same row. This way the range won't be able to split.
+	for i := 0; i < 16; i++ {
+		_, err = db.Exec("UPSERT INTO t(i,s) VALUES (1, $1)", sb.String())
+		require.NoError(t, err)
+	}
+
+	// Write a small row into the second range.
 	_, err = db.Exec("INSERT INTO t(i,s) VALUES (2, 'b')")
 	require.NoError(t, err)
 
@@ -2069,6 +2078,8 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
@@ -2081,9 +2092,10 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 			// statuses pre and post enabling the replicate queue.
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				ScanMinIdleTime:          time.Millisecond,
-				ScanMaxIdleTime:          time.Millisecond,
+				Settings:          st,
+				DefaultTestTenant: base.TestTenantDisabled,
+				ScanMinIdleTime:   time.Millisecond,
+				ScanMaxIdleTime:   time.Millisecond,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
 						StickyEngineRegistry:      stickyEngineRegistry,
@@ -2349,4 +2361,91 @@ func TestPromoteNonVoterInAddVoter(t *testing.T) {
 				addVoterEvent.AddedReplica.Type, addVoterEvents)
 		}
 	}
+}
+
+// TestReplicateQueueExpirationLeasesOnly tests that changing
+// kv.expiration_leases_only.enabled switches all leases to the correct kind.
+func TestReplicateQueueExpirationLeasesOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t) // too slow under stressrace
+	skip.UnderDeadlock(t)
+	skip.UnderShort(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Settings: st,
+			// Speed up the replicate queue, which switches the lease type.
+			ScanMinIdleTime: time.Millisecond,
+			ScanMaxIdleTime: time.Millisecond,
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	require.NoError(t, tc.WaitForFullReplication())
+
+	db := tc.Server(0).DB()
+	sqlDB := tc.ServerConn(0)
+
+	// Split off a few ranges so we have something to work with.
+	scratchKey := tc.ScratchRange(t)
+	for i := 0; i <= 255; i++ {
+		splitKey := append(scratchKey.Clone(), byte(i))
+		require.NoError(t, db.AdminSplit(ctx, splitKey, hlc.MaxTimestamp))
+	}
+
+	countLeases := func() (epoch int64, expiration int64) {
+		for i := 0; i < tc.NumServers(); i++ {
+			require.NoError(t, tc.Server(i).GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+				require.NoError(t, s.ComputeMetrics(ctx))
+				expiration += s.Metrics().LeaseExpirationCount.Value()
+				epoch += s.Metrics().LeaseEpochCount.Value()
+				return nil
+			}))
+		}
+		return
+	}
+
+	// We expect to have both expiration and epoch leases at the start, since the
+	// meta and liveness ranges require expiration leases. However, it's possible
+	// that there are a few other stray expiration leases too, since lease
+	// transfers use expiration leases as well.
+	epochLeases, expLeases := countLeases()
+	require.NotZero(t, epochLeases)
+	require.NotZero(t, expLeases)
+	initialExpLeases := expLeases
+	t.Logf("initial: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+
+	// Switch to expiration leases and wait for them to change.
+	_, err := sqlDB.ExecContext(ctx, `SET CLUSTER SETTING kv.expiration_leases_only.enabled = true`)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		epochLeases, expLeases = countLeases()
+		t.Logf("enabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+		return epochLeases == 0 && expLeases > 0
+	}, 30*time.Second, 500*time.Millisecond) // accomodate stress/deadlock builds
+
+	// Run a scan across the ranges, just to make sure they work.
+	scanCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err = db.Scan(scanCtx, scratchKey, scratchKey.PrefixEnd(), 1)
+	require.NoError(t, err)
+
+	// Switch back to epoch leases and wait for them to change. We still expect to
+	// have some required expiration leases, but they should be at or below the
+	// number of expiration leases we had at the start (primarily the meta and
+	// liveness ranges, but possibly a few more since lease transfers also use
+	// expiration leases).
+	_, err = sqlDB.ExecContext(ctx, `SET CLUSTER SETTING kv.expiration_leases_only.enabled = false`)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		epochLeases, expLeases = countLeases()
+		t.Logf("disabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+		return epochLeases > 0 && expLeases > 0 && expLeases <= initialExpLeases
+	}, 30*time.Second, 500*time.Millisecond)
 }

@@ -195,8 +195,7 @@ var FunDefs map[string]*FunctionDefinition
 var ResolvedBuiltinFuncDefs map[string]*ResolvedFunctionDefinition
 
 // OidToBuiltinName contains a map from the hashed OID of all builtin functions
-// to their name. We populate this from the pg_catalog.go file in the sql
-// package because of dependency issues: we can't use oidHasher from this file.
+// to their name.
 var OidToBuiltinName map[oid.Oid]string
 
 // OidToQualifiedBuiltinOverload is a map from builtin function OID to an
@@ -259,8 +258,6 @@ func (fd *ResolvedFunctionDefinition) MatchOverload(
 ) (QualifiedOverload, error) {
 	matched := func(ol QualifiedOverload, schema string) bool {
 		if ol.IsUDF {
-			// TODO(mgartner/chengxiong-ruan): Differentiate between functions
-			// defined with `Body` and UDFs, now that we use `Body` for built-in functions.
 			return schema == ol.Schema && (paramTypes == nil || ol.params().MatchIdentical(paramTypes))
 		}
 		return schema == ol.Schema && (paramTypes == nil || ol.params().Match(paramTypes))
@@ -318,6 +315,9 @@ func combineOverloads(a, b []QualifiedOverload) []QualifiedOverload {
 // method, function is resolved to one overload, so that we can get rid of this
 // function and similar methods below.
 func (fd *ResolvedFunctionDefinition) GetClass() (FunctionClass, error) {
+	if len(fd.Overloads) < 1 {
+		return 0, errors.AssertionFailedf("no overloads found for function %s", fd.Name)
+	}
 	ret := fd.Overloads[0].Class
 	for i := range fd.Overloads {
 		if fd.Overloads[i].Class != ret {
@@ -333,6 +333,9 @@ func (fd *ResolvedFunctionDefinition) GetClass() (FunctionClass, error) {
 // different length. This is good enough since we don't create UDF with
 // ReturnLabel.
 func (fd *ResolvedFunctionDefinition) GetReturnLabel() ([]string, error) {
+	if len(fd.Overloads) < 1 {
+		return nil, errors.AssertionFailedf("no overloads found for function %s", fd.Name)
+	}
 	ret := fd.Overloads[0].ReturnLabels
 	for i := range fd.Overloads {
 		if len(ret) != len(fd.Overloads[i].ReturnLabels) {
@@ -346,6 +349,9 @@ func (fd *ResolvedFunctionDefinition) GetReturnLabel() ([]string, error) {
 // checking each overload's HasSequenceArguments flag. Ambiguous error is
 // returned if there is any overload has a different flag.
 func (fd *ResolvedFunctionDefinition) GetHasSequenceArguments() (bool, error) {
+	if len(fd.Overloads) < 1 {
+		return false, errors.AssertionFailedf("no overloads found for function %s", fd.Name)
+	}
 	ret := fd.Overloads[0].HasSequenceArguments
 	for i := range fd.Overloads {
 		if ret != fd.Overloads[i].HasSequenceArguments {

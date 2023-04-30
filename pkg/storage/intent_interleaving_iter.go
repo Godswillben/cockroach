@@ -267,7 +267,7 @@ func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator
 	if reader.ConsistentIterators() {
 		iter = maybeUnwrapUnsafeIter(reader.NewMVCCIterator(MVCCKeyIterKind, opts)).(*pebbleIterator)
 	} else {
-		iter = newPebbleIteratorByCloning(intentIter.GetRawIter(), opts, StandardDurability)
+		iter = newPebbleIteratorByCloning(intentIter.CloneContext(), opts, StandardDurability)
 	}
 
 	*iiIter = intentInterleavingIter{
@@ -980,14 +980,6 @@ func (i *intentInterleavingIter) ValueLen() int {
 		return i.intentIter.ValueLen()
 	}
 	return i.iter.ValueLen()
-}
-
-func (i *intentInterleavingIter) Key() MVCCKey {
-	key := i.UnsafeKey()
-	keyCopy := make([]byte, len(key.Key))
-	copy(keyCopy, key.Key)
-	key.Key = keyCopy
-	return key
 }
 
 func (i *intentInterleavingIter) Value() ([]byte, error) {

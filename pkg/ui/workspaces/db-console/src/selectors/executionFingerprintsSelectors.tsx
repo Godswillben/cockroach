@@ -10,8 +10,12 @@
 
 import { AdminUIState } from "../redux/state";
 
-export const selectStatementsLastUpdated = (state: AdminUIState) =>
-  state.cachedData.statements?.setAt?.utc();
+// Transactions
+export const selectTxnsLastUpdated = (state: AdminUIState) =>
+  state.cachedData.transactions?.setAt?.utc();
 
-export const selectStatementsDataValid = (state: AdminUIState) =>
-  state.cachedData.statements?.valid;
+export const selectTxnsDataValid = (state: AdminUIState) =>
+  state.cachedData.transactions?.valid;
+
+export const selectTxnsDataInFlight = (state: AdminUIState) =>
+  state.cachedData.transactions?.inFlight;

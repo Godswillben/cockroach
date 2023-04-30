@@ -8,7 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-export const aggregationIntervalAttr = "aggregation_interval";
+import { duration } from "moment-timezone";
+
 export const aggregatedTsAttr = "aggregated_ts";
 export const appAttr = "app";
 export const appNamesAttr = "appNames";
@@ -46,3 +47,5 @@ export const serverToClientErrorMessageMap = new Map([
 ]);
 
 export const NO_SAMPLES_FOUND = "no samples";
+
+export const INTERNAL_APP_NAME_PREFIX = "$ internal";

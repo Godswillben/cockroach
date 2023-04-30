@@ -196,22 +196,26 @@ func TestDataDriven(t *testing.T) {
 					if i+1 != len(receivedUpdates) && receivedUpdates[i+1].TenantID.Equal(receivedUpdates[i].TenantID) {
 						continue // de-duplicate
 					}
-					output.WriteString(fmt.Sprintf("%+v\n", receivedUpdates[i]))
+					if receivedUpdates[i].Deleted {
+						output.WriteString(fmt.Sprintf("delete: ten=%v\n", receivedUpdates[i].TenantID))
+					} else {
+						output.WriteString(fmt.Sprintf("update: ten=%v cap=%v\n", receivedUpdates[i].TenantID, tenantcapabilitiestestutils.AlteredCapabilitiesString(receivedUpdates[i].TenantCapabilities)))
+					}
 				}
 				return output.String()
 
 			case "upsert":
-				update, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
+				tenID, caps, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
 				require.NoError(t, err)
 				info := mtinfopb.ProtoInfo{
-					Capabilities: update.TenantCapabilities,
+					Capabilities: *caps,
 				}
 				buf, err := protoutil.Marshal(&info)
 				require.NoError(t, err)
 				tdb.Exec(
 					t,
 					fmt.Sprintf("UPSERT INTO %s (id, active, info) VALUES ($1, $2, $3)", dummyTableName),
-					update.TenantID.ToUint64(),
+					tenID.ToUint64(),
 					true, /* active */
 					buf,
 				)
@@ -231,13 +235,13 @@ func TestDataDriven(t *testing.T) {
 				if !found {
 					return "not-found"
 				}
-				return fmt.Sprintf("%+v", cp)
+				return fmt.Sprintf("%v", tenantcapabilitiestestutils.AlteredCapabilitiesString(cp))
 
 			case "flush-state":
 				var output strings.Builder
 				entries := watcher.TestingFlushCapabilitiesState()
 				for _, entry := range entries {
-					output.WriteString(fmt.Sprintf("%+v\n", entry))
+					output.WriteString(fmt.Sprintf("ten=%v cap=%v\n", entry.TenantID, tenantcapabilitiestestutils.AlteredCapabilitiesString(entry.TenantCapabilities)))
 				}
 				return output.String()
 			case "inject-error":

@@ -27,6 +27,8 @@ import { selectTimeScale } from "src/redux/timeScale";
 import { refreshSettings } from "src/redux/apiReducers";
 import KeyVisSamplesRequest = cockroach.server.serverpb.KeyVisSamplesRequest;
 import KeyVisSamplesResponse = cockroach.server.serverpb.KeyVisSamplesResponse;
+import { BackToAdvanceDebug } from "../reports/containers/util";
+import { RouteComponentProps } from "react-router-dom";
 
 const EnabledSetting = "keyvisualizer.enabled";
 const IntervalSetting = "keyvisualizer.sample_interval";
@@ -128,15 +130,15 @@ interface KeyVisualizerContainerProps {
 }
 
 class KeyVisualizerContainer extends React.Component<
-  KeyVisualizerContainerProps,
+  KeyVisualizerContainerProps & RouteComponentProps,
   KeyVisualizerContainerState
 > {
   interval: any;
 
-  state = { response: KeyVisSamplesResponse.create() };
+  state = { response: new KeyVisSamplesResponse() };
 
   fetchSamples() {
-    const req = KeyVisSamplesRequest.create({});
+    const req = new KeyVisSamplesRequest({});
     getKeyVisualizerSamples(req).then(res => this.setState({ response: res }));
   }
 
@@ -158,20 +160,31 @@ class KeyVisualizerContainer extends React.Component<
     const { samples, yOffsetsForKey, hottestBucket, keys } =
       buildKeyVisualizerProps(this.state, this.props.timeScale);
 
-    if (samples.length === 0 || Object.keys(keys).length === 0) {
-      return <div>Waiting for samples...</div>;
+    if (
+      this.state.response.samples.length === 0 ||
+      Object.keys(this.state.response.pretty_key_for_uuid).length === 0
+    ) {
+      return (
+        <>
+          <BackToAdvanceDebug history={this.props.history} />
+          <div>Waiting for samples...</div>
+        </>
+      );
     }
 
     return (
-      <div style={{ position: "relative" }}>
-        <KeyVisualizerTimeWindow />
-        <KeyVisualizer
-          samples={samples}
-          yOffsetsForKey={yOffsetsForKey}
-          hottestBucket={hottestBucket}
-          keys={keys}
-        />
-      </div>
+      <>
+        <BackToAdvanceDebug history={this.props.history} />
+        <div style={{ position: "relative" }}>
+          <KeyVisualizerTimeWindow />
+          <KeyVisualizer
+            samples={samples}
+            yOffsetsForKey={yOffsetsForKey}
+            hottestBucket={hottestBucket}
+            keys={keys}
+          />
+        </div>
+      </>
     );
   }
 }
@@ -185,7 +198,7 @@ interface KeyVisualizerPageProps {
 }
 
 const KeyVisualizerPage: React.FunctionComponent<
-  KeyVisualizerPageProps
+  KeyVisualizerPageProps & RouteComponentProps
 > = props => {
   if (props.clusterSettings === undefined) {
     props.refreshSettings();
@@ -197,6 +210,7 @@ const KeyVisualizerPage: React.FunctionComponent<
   if (!enabled) {
     return (
       <div>
+        <BackToAdvanceDebug history={props.history} />
         <p>To enable the key visualizer, run the following SQL statement:</p>
         <pre>SET CLUSTER SETTING {EnabledSetting} = true;</pre>
       </div>
@@ -209,6 +223,7 @@ const KeyVisualizerPage: React.FunctionComponent<
 
   return (
     <KeyVisualizerContainer
+      {...props}
       timeScale={props.timeScale}
       refreshInterval={refreshInterval}
     />

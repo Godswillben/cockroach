@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clienturl"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/configprofiles"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -59,6 +60,7 @@ var serverHTTPAdvertiseAddr, serverHTTPAdvertisePort string
 var localityAdvertiseHosts localityList
 var startBackground bool
 var storeSpecs base.StoreSpecList
+var goMemLimit int64
 
 // initPreFlagsDefaults initializes the values of the global variables
 // defined above.
@@ -87,6 +89,8 @@ func initPreFlagsDefaults() {
 	startBackground = false
 
 	storeSpecs = base.StoreSpecList{}
+
+	goMemLimit = 0
 }
 
 // AddPersistentPreRunE add 'fn' as a persistent pre-run function to 'cmd'.
@@ -390,6 +394,10 @@ func init() {
 		// planning?
 		if cmd != connectInitCmd && cmd != connectJoinCmd {
 			cliflagcfg.StringFlag(f, &serverCfg.Attrs, cliflags.Attrs)
+			// Cluster initialization. We only do this for a regular start command;
+			// SQL-only servers get their initialization payload from their tenant
+			// configuration.
+			cliflagcfg.VarFlag(f, configprofiles.NewProfileSetter(&serverCfg.AutoConfigProvider), cliflags.ConfigProfile)
 		}
 	}
 
@@ -513,10 +521,11 @@ func init() {
 			// Engine flags.
 			cliflagcfg.VarFlag(f, &startCtx.cacheSizeValue, cliflags.Cache)
 			cliflagcfg.VarFlag(f, &startCtx.sqlSizeValue, cliflags.SQLMem)
+			cliflagcfg.VarFlag(f, &startCtx.goMemLimitValue, cliflags.GoMemLimit)
 			cliflagcfg.VarFlag(f, &startCtx.tsdbSizeValue, cliflags.TSDBMem)
-			// N.B. diskTempStorageSizeValue.ResolvePercentage() will be called after
-			// the stores flag has been parsed and the storage device that a percentage
-			// refers to becomes known.
+			// N.B. diskTempStorageSizeValue.Resolve() will be called after the
+			// stores flag has been parsed and the storage device that a
+			// percentage refers to becomes known.
 			cliflagcfg.VarFlag(f, &startCtx.diskTempStorageSizeValue, cliflags.SQLTempStorage)
 			cliflagcfg.StringFlag(f, &startCtx.tempDir, cliflags.TempDir)
 			cliflagcfg.StringFlag(f, &startCtx.externalIODir, cliflags.ExternalIODir)
@@ -700,6 +709,10 @@ func init() {
 	// Decommission command.
 	cliflagcfg.VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionWait, cliflags.Wait)
 
+	// Decommission pre-check flags.
+	cliflagcfg.VarFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionChecks, cliflags.NodeDecommissionChecks)
+	cliflagcfg.BoolFlag(decommissionNodeCmd.Flags(), &nodeCtx.nodeDecommissionDryRun, cliflags.NodeDecommissionDryRun)
+
 	// Decommission and recommission share --self.
 	for _, cmd := range []*cobra.Command{decommissionNodeCmd, recommissionNodeCmd} {
 		f := cmd.Flags()
@@ -820,6 +833,7 @@ func init() {
 		cliflagcfg.IntFlag(f, &demoCtx.HTTPPort, cliflags.DemoHTTPPort)
 		cliflagcfg.StringFlag(f, &demoCtx.ListeningURLFile, cliflags.ListeningURLFile)
 		cliflagcfg.StringFlag(f, &demoCtx.pidFile, cliflags.PIDFile)
+		cliflagcfg.VarFlag(f, configprofiles.NewProfileSetter(&demoCtx.AutoConfigProvider), cliflags.ConfigProfile)
 	}
 
 	{

@@ -60,6 +60,7 @@ func PrepareTransactionForRetry(
 		txn = roachpb.MakeTransaction(
 			txn.Name,
 			nil, // baseKey
+			txn.IsoLevel,
 			// We have errTxnPri, but this wants a roachpb.UserPriority. So
 			// we're going to overwrite the priority below.
 			roachpb.NormalUserPriority,
@@ -102,6 +103,13 @@ func PrepareTransactionForRetry(
 	case *WriteTooOldError:
 		// Increase the timestamp to the ts at which we've actually written.
 		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
+	case *IntentMissingError:
+		// IntentMissingErrors are not expected to be handled at this level;
+		// We instead expect the txnPipeliner to transform them into a
+		// TransactionRetryErrors(RETRY_ASYNC_WRITE_FAILURE) error.
+		log.Fatalf(
+			ctx, "unexpected intent missing error (%T); should be transformed into retry error", pErr.GetDetail(),
+		)
 	default:
 		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
 	}
@@ -143,3 +151,28 @@ func TransactionRefreshTimestamp(pErr *Error) (bool, hlc.Timestamp) {
 	}
 	return true, timestamp
 }
+
+// LeaseAppliedIndex is attached to every Raft message and is used for replay
+// protection.
+type LeaseAppliedIndex uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s LeaseAppliedIndex) SafeValue() {}
+
+// RaftTerm represents the term of a raft message. This corresponds to Term in
+// HardState.Term in the Raft library. That type is a uint64, so it is necessary
+// to cast to/from that type when dealing with the Raft library, however
+// internally RaftTerm is used for all fields in CRDB.
+type RaftTerm uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s RaftTerm) SafeValue() {}
+
+// RaftIndex represents the term of a raft message. This corresponds to Index in
+// HardState.Index in the Raft library. That type is a uint64, so it is
+// necessary to cast to/from that type when dealing with the Raft library,
+// however internally RaftIndex is used for all fields in CRDB.
+type RaftIndex uint64
+
+// SafeValue implements the redact.SafeValue interface.
+func (s RaftIndex) SafeValue() {}

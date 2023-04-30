@@ -37,6 +37,7 @@ import {
   Filters,
   getTimeValueInSeconds,
   handleFiltersFromQueryString,
+  SelectedFilters,
 } from "../queryFilter";
 
 import TerminateQueryModal, {
@@ -57,7 +58,7 @@ import ColumnsSelector, {
   SelectOption,
 } from "../columnsSelector/columnsSelector";
 import { TimestampToMoment, unset } from "src/util";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   getLabel,
   StatisticTableColumnKeys,
@@ -396,6 +397,11 @@ export class SessionsPage extends React.Component<
             filters={filters}
             timeLabel={"Session duration"}
           />
+          <SelectedFilters
+            filters={filters}
+            onRemoveFilter={this.onSubmitFilters}
+            onClearFilters={this.onClearFilters}
+          />
         </div>
         <section className={sessionsPageCx("sessions-table-area")}>
           <div className={statementsPageCx("cl-table-statistic")}>
@@ -403,13 +409,13 @@ export class SessionsPage extends React.Component<
               <ColumnsSelector
                 options={tableColumns}
                 onSubmitColumns={onColumnsChange}
+                size={"small"}
               />
               <TableStatistics
                 pagination={pagination}
                 totalCount={sessionsToDisplay.length}
                 arrayItemName="sessions"
                 activeFilters={activeFilters}
-                onClearFilters={this.onClearFilters}
               />
             </div>
           </div>

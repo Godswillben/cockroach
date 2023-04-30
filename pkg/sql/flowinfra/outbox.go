@@ -50,6 +50,7 @@ type Outbox struct {
 	execinfra.RowChannel
 
 	flowCtx       *execinfra.FlowCtx
+	processorID   int32
 	streamID      execinfrapb.StreamID
 	sqlInstanceID base.SQLInstanceID
 	// The rows received from the RowChannel will be forwarded on this stream once
@@ -97,12 +98,13 @@ var _ Startable = &Outbox{}
 // NewOutbox creates a new Outbox.
 func NewOutbox(
 	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	sqlInstanceID base.SQLInstanceID,
 	streamID execinfrapb.StreamID,
 	numOutboxes *int32,
 	isGatewayNode bool,
 ) *Outbox {
-	m := &Outbox{flowCtx: flowCtx, sqlInstanceID: sqlInstanceID}
+	m := &Outbox{flowCtx: flowCtx, processorID: processorID, sqlInstanceID: sqlInstanceID}
 	m.encoder.SetHeaderFields(flowCtx.ID, streamID)
 	m.streamID = streamID
 	m.numOutboxes = numOutboxes
@@ -227,35 +229,42 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 	ctx, m.outboxCtxCancel = context.WithCancel(ctx)
 
 	var span *tracing.Span
-	ctx, span = execinfra.ProcessorSpan(ctx, "outbox")
+	ctx, span = execinfra.ProcessorSpan(ctx, m.flowCtx, "outbox", m.processorID)
 	defer span.Finish()
 	if span != nil {
 		m.statsCollectionEnabled = span.RecordingType() != tracingpb.RecordingOff
 		if span.IsVerbose() {
-			span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(m.flowCtx.ID.String()))
 			span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(m.streamID)))
 		}
 	}
 
-	conn, err := execinfra.GetConnForOutbox(
-		ctx, m.flowCtx.Cfg.PodNodeDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
-	)
-	if err != nil {
-		// Log any Dial errors. This does not have a verbosity check due to being
-		// a critical part of query execution: if this step doesn't work, the
-		// receiving side might end up hanging or timing out.
-		log.Infof(ctx, "outbox: connection dial error: %+v", err)
-		return err
-	}
-	client := execinfrapb.NewDistSQLClient(conn)
-	if log.V(2) {
-		log.Infof(ctx, "outbox: calling FlowStream")
-	}
-	m.stream, err = client.FlowStream(ctx)
-	if err != nil {
-		if log.V(1) {
-			log.Infof(ctx, "FlowStream error: %s", err)
+	if err := func() error {
+		conn, err := execinfra.GetConnForOutbox(
+			ctx, m.flowCtx.Cfg.PodNodeDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
+		)
+		if err != nil {
+			// Log any Dial errors. This does not have a verbosity check due to being
+			// a critical part of query execution: if this step doesn't work, the
+			// receiving side might end up hanging or timing out.
+			log.Infof(ctx, "outbox: connection dial error: %+v", err)
+			return err
 		}
+		client := execinfrapb.NewDistSQLClient(conn)
+		if log.V(2) {
+			log.Infof(ctx, "outbox: calling FlowStream")
+		}
+		m.stream, err = client.FlowStream(ctx)
+		if err != nil {
+			if log.V(1) {
+				log.Infof(ctx, "FlowStream error: %s", err)
+			}
+			return err
+		}
+		return nil
+	}(); err != nil {
+		// An error during stream setup - the whole query will fail, so we might
+		// as well proactively cancel the flow on this node.
+		m.flowCtxCancel()
 		return err
 	}
 	if log.V(2) {
@@ -310,10 +319,12 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 						m.stats.FlowStats.ConsumedRU.Set(uint64(m.flowCtx.TenantCPUMonitor.EndCollection(ctx)))
 					}
 					span.RecordStructured(&m.stats)
-					if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
-						err := m.AddRow(ctx, nil, &execinfrapb.ProducerMetadata{TraceData: trace})
-						if err != nil {
-							return err
+					if !m.flowCtx.Gateway {
+						if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
+							err := m.AddRow(ctx, nil, &execinfrapb.ProducerMetadata{TraceData: trace})
+							if err != nil {
+								return err
+							}
 						}
 					}
 				}
@@ -383,6 +394,7 @@ func (m *Outbox) startWatchdogGoroutine(
 	stream := m.stream
 	wg.Add(1)
 	if err := m.flowCtx.Cfg.Stopper.RunAsyncTask(ctx, "watchdog", func(ctx context.Context) {
+		defer wg.Done()
 		for {
 			signal, err := stream.Recv()
 			if err != nil {
@@ -403,17 +415,11 @@ func (m *Outbox) startWatchdogGoroutine(
 			}
 		}
 		close(ch)
-		wg.Done()
 	}); err != nil {
 		wg.Done()
 		return nil, err
 	}
 	return ch, nil
-}
-
-func (m *Outbox) run(ctx context.Context, wg *sync.WaitGroup) {
-	m.setErr(m.mainLoop(ctx, wg))
-	wg.Done()
 }
 
 // Start starts the outbox.
@@ -423,7 +429,10 @@ func (m *Outbox) Start(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel co
 	}
 	m.flowCtxCancel = flowCtxCancel
 	wg.Add(1)
-	go m.run(ctx, wg)
+	go func() {
+		defer wg.Done()
+		m.setErr(m.mainLoop(ctx, wg))
+	}()
 }
 
 // setErr sets the error stored in the Outbox if it hasn't been set previously.

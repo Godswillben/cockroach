@@ -62,6 +62,8 @@ func (tc *Catalog) CreateFunction(c *tree.CreateFunction) {
 		panic(fmt.Errorf("built-in function with name %q already exists", name))
 	}
 	if _, ok := tc.udfs[name]; ok {
+		// TODO(mgartner): The test catalog should support multiple overloads
+		// with the same name if their arguments are different.
 		panic(fmt.Errorf("user-defined function with name %q already exists", name))
 	}
 	if c.RoutineBody != nil {
@@ -149,7 +151,7 @@ func collectFuncOptions(
 			}
 
 		case tree.FunctionLanguage:
-			if t != tree.FunctionLangSQL && t != tree.FunctionLangPlPgSQL {
+			if t != tree.FunctionLangSQL && t != tree.FunctionLangPLpgSQL {
 				panic(fmt.Errorf("LANGUAGE must be SQL or plpgsql"))
 			}
 

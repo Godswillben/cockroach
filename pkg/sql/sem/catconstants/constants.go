@@ -51,6 +51,7 @@ const (
 	ZonesTableName                         SystemTableName = "zones"
 	SettingsTableName                      SystemTableName = "settings"
 	DescIDSequenceTableName                SystemTableName = "descriptor_id_seq"
+	TenantIDSequenceTableName              SystemTableName = "tenant_id_seq"
 	TenantsTableName                       SystemTableName = "tenants"
 	LeaseTableName                         SystemTableName = "lease"
 	EventLogTableName                      SystemTableName = "eventlog"
@@ -78,11 +79,15 @@ const (
 	JoinTokensTableName                    SystemTableName = "join_tokens"
 	StatementStatisticsTableName           SystemTableName = "statement_statistics"
 	TransactionStatisticsTableName         SystemTableName = "transaction_statistics"
+	StatementActivityTableName             SystemTableName = "statement_activity"
+	TransactionActivityTableName           SystemTableName = "transaction_activity"
 	DatabaseRoleSettingsTableName          SystemTableName = "database_role_settings"
 	TenantUsageTableName                   SystemTableName = "tenant_usage"
 	SQLInstancesTableName                  SystemTableName = "sql_instances"
 	SpanConfigurationsTableName            SystemTableName = "span_configurations"
+	TaskPayloadsTableName                  SystemTableName = "task_payloads"
 	TenantSettingsTableName                SystemTableName = "tenant_settings"
+	TenantTasksTableName                   SystemTableName = "tenant_tasks"
 	SpanCountTableName                     SystemTableName = "span_count"
 	SystemPrivilegeTableName               SystemTableName = "privileges"
 	SystemExternalConnectionsTableName     SystemTableName = "external_connections"
@@ -158,14 +163,20 @@ const (
 	CrdbInternalSchemaChangesTableID
 	CrdbInternalSessionTraceTableID
 	CrdbInternalSessionVariablesTableID
+	CrdbInternalStmtActivityTableID
 	CrdbInternalStmtStatsTableID
+	CrdbInternalStmtStatsPersistedTableID
+	CrdbInternalStmtStatsPersistedV22_2TableID
 	CrdbInternalTableColumnsTableID
 	CrdbInternalTableIndexesTableID
 	CrdbInternalTableSpansTableID
 	CrdbInternalTablesTableID
 	CrdbInternalTablesTableLastStatsID
 	CrdbInternalTransactionStatsTableID
+	CrdbInternalTxnActivityTableID
 	CrdbInternalTxnStatsTableID
+	CrdbInternalTxnStatsPersistedTableID
+	CrdbInternalTxnStatsPersistedV22_2TableID
 	CrdbInternalZonesTableID
 	CrdbInternalInvalidDescriptorsTableID
 	CrdbInternalClusterDatabasePrivilegesTableID
@@ -179,6 +190,7 @@ const (
 	CrdbInternalPgCatalogTableIsImplementedTableID
 	CrdbInternalSuperRegions
 	CrdbInternalDroppedRelationsViewID
+	CrdbInternalShowTenantCapabilitiesCacheTableID
 	InformationSchemaID
 	InformationSchemaAdministrableRoleAuthorizationsID
 	InformationSchemaApplicableRolesID

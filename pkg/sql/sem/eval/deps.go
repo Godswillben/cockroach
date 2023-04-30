@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/lib/pq/oid"
 )
 
@@ -195,6 +196,10 @@ type Planner interface {
 	tree.FunctionReferenceResolver
 
 	// Mon returns the Planner's monitor.
+	//
+	// TODO(yuzefovich): memory usage against this monitor doesn't count against
+	// sql.mem.distsql.current metric, audit the callers to see whether this is
+	// undesirable in some places.
 	Mon() *mon.BytesMonitor
 
 	// ExecutorConfig returns *ExecutorConfig
@@ -369,12 +374,25 @@ type Planner interface {
 	// statements.
 	IsANSIDML() bool
 
+	// EnforceHomeRegion returns true if the statement being planned is an ANSI
+	// DML statement and the enforce_home_region session setting is true.
+	EnforceHomeRegion() bool
+
+	// GetRangeDescIterator gets a rangedesc.Iterator for the specified span.
+	GetRangeDescIterator(context.Context, roachpb.Span) (rangedesc.Iterator, error)
+
 	// GetRangeDescByID gets the RangeDescriptor by the specified RangeID.
 	GetRangeDescByID(context.Context, roachpb.RangeID) (roachpb.RangeDescriptor, error)
 
-	SpanStats(context.Context, roachpb.RKey, roachpb.RKey) (*roachpb.SpanStatsResponse, error)
+	SpanStats(context.Context, roachpb.Spans) (*roachpb.SpanStatsResponse, error)
 
 	GetDetailsForSpanStats(ctx context.Context, dbId int, tableId int) (InternalRows, error)
+
+	// MaybeReallocateAnnotations makes a new annotations slice of size
+	// numAnnotations if one is maintained by this Planner and the current one has
+	// less than numAnnotations entries. If updated, the annotations in the eval
+	// context held in the planner is also updated.
+	MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx)
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
@@ -437,6 +455,9 @@ type SessionAccessor interface {
 	// HasRoleOption returns nil iff the current session user has the specified
 	// role option.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+
+	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
+	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
 
 	// HasViewActivityOrViewActivityRedactedRole returns true iff the current session user has the
 	// VIEWACTIVITY or VIEWACTIVITYREDACTED permission.
@@ -506,14 +527,6 @@ type RegionOperator interface {
 	// ResetMultiRegionZoneConfigsForDatabase resets the given database's zone
 	// configuration to its multi-region default.
 	ResetMultiRegionZoneConfigsForDatabase(ctx context.Context, id int64) error
-
-	// OptimizeSystemDatabase configures some tables in the system data as
-	// global and regional by row. The locality changes reduce how long it
-	// takes a server to start up in a multi-region deployment.
-	//
-	// TODO(jeffswenson): remove OptimizeSystemDatabase after cleaning up the
-	// unsafe_optimize_system_database built in.
-	OptimizeSystemDatabase(ctx context.Context) error
 }
 
 // SequenceOperators is used for various sql related functions that can

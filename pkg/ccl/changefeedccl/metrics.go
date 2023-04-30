@@ -32,6 +32,7 @@ const (
 	changefeedCheckpointHistMaxLatency = 30 * time.Second
 	changefeedBatchHistMaxLatency      = 30 * time.Second
 	changefeedFlushHistMaxLatency      = 1 * time.Minute
+	changefeedIOQueueMaxLatency        = 5 * time.Minute
 	admitLatencyMaxValue               = 1 * time.Minute
 	commitLatencyMaxValue              = 10 * time.Minute
 )
@@ -55,6 +56,8 @@ type AggMetrics struct {
 	Flushes                   *aggmetric.AggCounter
 	FlushHistNanos            *aggmetric.AggHistogram
 	SizeBasedFlushes          *aggmetric.AggCounter
+	ParallelIOQueueNanos      *aggmetric.AggHistogram
+	SinkIOInflight            *aggmetric.AggGauge
 	CommitLatency             *aggmetric.AggHistogram
 	BackfillCount             *aggmetric.AggGauge
 	BackfillPendingRanges     *aggmetric.AggGauge
@@ -63,6 +66,8 @@ type AggMetrics struct {
 	RunningCount              *aggmetric.AggGauge
 	BatchReductionCount       *aggmetric.AggGauge
 	InternalRetryMessageCount *aggmetric.AggGauge
+	SchemaRegistrations       *aggmetric.AggCounter
+	SchemaRegistryRetries     *aggmetric.AggCounter
 
 	// There is always at least 1 sliMetrics created for defaultSLI scope.
 	mu struct {
@@ -90,6 +95,8 @@ type metricsRecorder interface {
 	getBackfillCallback() func() func()
 	getBackfillRangeCallback() func(int64) (func(), func())
 	recordSizeBasedFlush()
+	recordParallelIOQueueLatency(time.Duration)
+	recordSinkIOInflightChange(int64)
 }
 
 var _ metricsRecorder = (*sliMetrics)(nil)
@@ -109,6 +116,8 @@ type sliMetrics struct {
 	Flushes                   *aggmetric.Counter
 	FlushHistNanos            *aggmetric.Histogram
 	SizeBasedFlushes          *aggmetric.Counter
+	ParallelIOQueueNanos      *aggmetric.Histogram
+	SinkIOInflight            *aggmetric.Gauge
 	CommitLatency             *aggmetric.Histogram
 	ErrorRetries              *aggmetric.Counter
 	AdmitLatency              *aggmetric.Histogram
@@ -117,6 +126,8 @@ type sliMetrics struct {
 	RunningCount              *aggmetric.Gauge
 	BatchReductionCount       *aggmetric.Gauge
 	InternalRetryMessageCount *aggmetric.Gauge
+	SchemaRegistrations       *aggmetric.Counter
+	SchemaRegistryRetries     *aggmetric.Counter
 }
 
 // sinkDoesNotCompress is a sentinel value indicating the sink
@@ -240,6 +251,20 @@ func (m *sliMetrics) recordSizeBasedFlush() {
 	m.SizeBasedFlushes.Inc(1)
 }
 
+func (m *sliMetrics) recordParallelIOQueueLatency(latency time.Duration) {
+	if m == nil {
+		return
+	}
+	m.ParallelIOQueueNanos.RecordValue(latency.Nanoseconds())
+}
+func (m *sliMetrics) recordSinkIOInflightChange(delta int64) {
+	if m == nil {
+		return
+	}
+
+	m.SinkIOInflight.Inc(delta)
+}
+
 type wrappingCostController struct {
 	ctx      context.Context
 	inner    metricsRecorder
@@ -308,6 +333,14 @@ func (w *wrappingCostController) getBackfillRangeCallback() func(int64) (func(),
 // Record size-based flush.
 func (w *wrappingCostController) recordSizeBasedFlush() {
 	w.inner.recordSizeBasedFlush()
+}
+
+func (w *wrappingCostController) recordParallelIOQueueLatency(latency time.Duration) {
+	w.inner.recordParallelIOQueueLatency(latency)
+}
+
+func (w *wrappingCostController) recordSinkIOInflightChange(delta int64) {
+	w.inner.recordSinkIOInflightChange(delta)
 }
 
 var (
@@ -494,6 +527,30 @@ func newAggregateMetrics(histogramWindow time.Duration) *AggMetrics {
 		Measurement: "Messages",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaSchemaRegistryRetriesCount := metric.Metadata{
+		Name:        "changefeed.schema_registry.retry_count",
+		Help:        "Number of retries encountered when sending requests to the schema registry",
+		Measurement: "Retries",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaSchemaRegistryRegistrations := metric.Metadata{
+		Name:        "changefeed.schema_registry.registrations",
+		Help:        "Number of registration attempts with the schema registry",
+		Measurement: "Registrations",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaChangefeedParallelIOQueueNanos := metric.Metadata{
+		Name:        "changefeed.parallel_io_queue_nanos",
+		Help:        "Time spent with outgoing requests to the sink waiting in queue due to inflight requests with conflicting keys",
+		Measurement: "Changefeeds",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaChangefeedSinkIOInflight := metric.Metadata{
+		Name:        "changefeed.sink_io_inflight",
+		Help:        "The number of keys currently inflight as IO requests being sent to the sink",
+		Measurement: "Messages",
+		Unit:        metric.Unit_COUNT,
+	}
 	// NB: When adding new histograms, use sigFigs = 1.  Older histograms
 	// retain significant figures of 2.
 	b := aggmetric.MakeBuilder("scope")
@@ -512,6 +569,14 @@ func newAggregateMetrics(histogramWindow time.Duration) *AggMetrics {
 		FlushedBytes:     b.Counter(metaChangefeedFlushedBytes),
 		Flushes:          b.Counter(metaChangefeedFlushes),
 		SizeBasedFlushes: b.Counter(metaSizeBasedFlushes),
+		ParallelIOQueueNanos: b.Histogram(metric.HistogramOptions{
+			Metadata: metaChangefeedParallelIOQueueNanos,
+			Duration: histogramWindow,
+			MaxVal:   changefeedIOQueueMaxLatency.Nanoseconds(),
+			SigFigs:  2,
+			Buckets:  metric.BatchProcessLatencyBuckets,
+		}),
+		SinkIOInflight: b.Gauge(metaChangefeedSinkIOInflight),
 
 		BatchHistNanos: b.Histogram(metric.HistogramOptions{
 			Metadata: metaChangefeedBatchHistNanos,
@@ -546,6 +611,8 @@ func newAggregateMetrics(histogramWindow time.Duration) *AggMetrics {
 		RunningCount:              b.Gauge(metaChangefeedRunning),
 		BatchReductionCount:       b.Gauge(metaBatchReductionCount),
 		InternalRetryMessageCount: b.Gauge(metaInternalRetryMessageCount),
+		SchemaRegistryRetries:     b.Counter(metaSchemaRegistryRetriesCount),
+		SchemaRegistrations:       b.Counter(metaSchemaRegistryRegistrations),
 	}
 	a.mu.sliMetrics = make(map[string]*sliMetrics)
 	_, err := a.getOrCreateScope(defaultSLIScope)
@@ -593,6 +660,8 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 		Flushes:                   a.Flushes.AddChild(scope),
 		FlushHistNanos:            a.FlushHistNanos.AddChild(scope),
 		SizeBasedFlushes:          a.SizeBasedFlushes.AddChild(scope),
+		ParallelIOQueueNanos:      a.ParallelIOQueueNanos.AddChild(scope),
+		SinkIOInflight:            a.SinkIOInflight.AddChild(scope),
 		CommitLatency:             a.CommitLatency.AddChild(scope),
 		ErrorRetries:              a.ErrorRetries.AddChild(scope),
 		AdmitLatency:              a.AdmitLatency.AddChild(scope),
@@ -601,6 +670,8 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 		RunningCount:              a.RunningCount.AddChild(scope),
 		BatchReductionCount:       a.BatchReductionCount.AddChild(scope),
 		InternalRetryMessageCount: a.InternalRetryMessageCount.AddChild(scope),
+		SchemaRegistryRetries:     a.SchemaRegistryRetries.AddChild(scope),
+		SchemaRegistrations:       a.SchemaRegistrations.AddChild(scope),
 	}
 
 	a.mu.sliMetrics[scope] = sm

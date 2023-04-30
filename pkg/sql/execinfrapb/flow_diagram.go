@@ -620,6 +620,20 @@ func (g *GenerativeSplitAndScatterSpec) summary() (string, []string) {
 	return "GenerativeSplitAndScatterSpec", []string{detail}
 }
 
+// summary implements the diagramCellType interface.
+func (i *InsertSpec) summary() (string, []string) {
+	return "Insert", []string{
+		fmt.Sprintf("TableID: %d", i.Table.ID),
+		fmt.Sprintf("AutoCommit: %t", i.AutoCommit),
+	}
+}
+
+// summary implements the diagramCellType interface.
+func (i *IngestStoppedSpec) summary() (string, []string) {
+	detail := fmt.Sprintf("job %d ingest stopped spans", i.JobID)
+	return "IngestStoppedSpec", []string{detail}
+}
+
 type diagramCell struct {
 	Title   string   `json:"title"`
 	Details []string `json:"details"`

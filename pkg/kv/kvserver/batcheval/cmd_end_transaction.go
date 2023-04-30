@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
@@ -360,7 +361,7 @@ func EndTxn(
 		// NOTE: if the transaction is in the implicit commit state and this EndTxn
 		// request is marking the commit as explicit, this check must succeed. We
 		// assert this in txnCommitter.makeTxnCommitExplicitAsync.
-		if retry, reason, extraMsg := IsEndTxnTriggeringRetryError(reply.Txn, args); retry {
+		if retry, reason, extraMsg := IsEndTxnTriggeringRetryError(reply.Txn, args.Deadline); retry {
 			return result.Result{}, kvpb.NewTransactionRetryError(reason, extraMsg)
 		}
 
@@ -467,7 +468,7 @@ func EndTxn(
 	txnResult.Local.UpdatedTxns = []*roachpb.Transaction{reply.Txn}
 	txnResult.Local.ResolvedLocks = resolvedLocks
 
-	// Run the rest of the commit triggers if successfully committed.
+	// Run the commit triggers if successfully committed.
 	if reply.Txn.Status == roachpb.COMMITTED {
 		triggerResult, err := RunCommitTrigger(
 			ctx, cArgs.EvalCtx, readWriter.(storage.Batch), ms, args, reply.Txn,
@@ -490,36 +491,31 @@ func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline hlc.Timestamp) b
 	return !deadline.IsEmpty() && deadline.LessEq(commitTS)
 }
 
-// IsEndTxnTriggeringRetryError returns true if the EndTxnRequest cannot be
+// IsEndTxnTriggeringRetryError returns true if the Transaction cannot be
 // committed and needs to return a TransactionRetryError. It also returns the
 // reason and possibly an extra message to be used for the error.
 func IsEndTxnTriggeringRetryError(
-	txn *roachpb.Transaction, args *kvpb.EndTxnRequest,
+	txn *roachpb.Transaction, deadline hlc.Timestamp,
 ) (retry bool, reason kvpb.TransactionRetryReason, extraMsg redact.RedactableString) {
-	// If we saw any WriteTooOldErrors, we must restart to avoid lost
-	// update anomalies.
 	if txn.WriteTooOld {
-		retry, reason = true, kvpb.RETRY_WRITE_TOO_OLD
-	} else {
-		readTimestamp := txn.ReadTimestamp
-		isTxnPushed := txn.WriteTimestamp != readTimestamp
-
+		// If we saw any WriteTooOldErrors, we must restart to avoid lost
+		// update anomalies.
+		return true, kvpb.RETRY_WRITE_TOO_OLD, ""
+	}
+	if txn.WriteTimestamp != txn.ReadTimestamp {
 		// Return a transaction retry error if the commit timestamp isn't equal to
 		// the txn timestamp.
-		if isTxnPushed {
-			retry, reason = true, kvpb.RETRY_SERIALIZABLE
-		}
+		return true, kvpb.RETRY_SERIALIZABLE, ""
 	}
-
-	// A transaction must obey its deadline, if set.
-	if !retry && IsEndTxnExceedingDeadline(txn.WriteTimestamp, args.Deadline) {
-		exceededBy := txn.WriteTimestamp.GoTime().Sub(args.Deadline.GoTime())
+	if IsEndTxnExceedingDeadline(txn.WriteTimestamp, deadline) {
+		// A transaction must obey its deadline, if set.
+		exceededBy := txn.WriteTimestamp.GoTime().Sub(deadline.GoTime())
 		extraMsg = redact.Sprintf(
 			"txn timestamp pushed too much; deadline exceeded by %s (%s > %s)",
-			exceededBy, txn.WriteTimestamp, args.Deadline)
-		retry, reason = true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED
+			exceededBy, txn.WriteTimestamp, deadline)
+		return true, kvpb.RETRY_COMMIT_DEADLINE_EXCEEDED, extraMsg
 	}
-	return retry, reason, extraMsg
+	return false, 0, ""
 }
 
 const lockResolutionBatchSize = 500
@@ -1272,9 +1268,7 @@ func mergeTrigger(
 
 	// The stats for the merged range are the sum of the LHS and RHS stats
 	// adjusted for range key merges (which is the inverse of the split
-	// adjustment). The RHS's replicated range ID stats are subtracted -- the only
-	// replicated range ID keys we copy from the RHS are the keys in the abort
-	// span, and we've already accounted for those stats above.
+	// adjustment).
 	ms.Add(merge.RightMVCCStats)
 	msRangeKeyDelta, err := computeSplitRangeKeyStatsDelta(batch, merge.LeftDesc, merge.RightDesc)
 	if err != nil {
@@ -1282,7 +1276,18 @@ func mergeTrigger(
 	}
 	ms.Subtract(msRangeKeyDelta)
 
-	{
+	// The RHS's replicated range ID stats are subtracted -- the only replicated
+	// range ID keys we copy from the RHS are the keys in the abort span, and
+	// we've already accounted for those stats above.
+	//
+	// NB: RangeIDLocalMVCCStats is introduced in 23.2 to mitigate a SysBytes race
+	// with lease requests (which ignore latches). For 23.1 compatibility, we fall
+	// back to computing it here when not set. We don't need a version gate since
+	// it's only used at evaluation time and doesn't affect below-Raft state.
+	if merge.RightRangeIDLocalMVCCStats != (enginepb.MVCCStats{}) {
+		ms.Subtract(merge.RightRangeIDLocalMVCCStats)
+	} else {
+		_ = clusterversion.V23_1 // remove this branch when 23.1 support is removed
 		ridPrefix := keys.MakeRangeIDReplicatedPrefix(merge.RightDesc.RangeID)
 		sysMS, err := storage.ComputeStats(batch, ridPrefix, ridPrefix.PrefixEnd(), 0 /* nowNanos */)
 		if err != nil {

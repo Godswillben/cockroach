@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -490,6 +491,7 @@ var startCtx struct {
 	// humanized size value.
 	cacheSizeValue           bytesOrPercentageValue
 	sqlSizeValue             bytesOrPercentageValue
+	goMemLimitValue          bytesOrPercentageValue
 	diskTempStorageSizeValue bytesOrPercentageValue
 	tsdbSizeValue            bytesOrPercentageValue
 }
@@ -514,6 +516,7 @@ func setStartContextDefaults() {
 	startCtx.geoLibsDir = "/usr/local/lib/cockroach"
 	startCtx.cacheSizeValue = makeBytesOrPercentageValue(&serverCfg.CacheSize, memoryPercentResolver)
 	startCtx.sqlSizeValue = makeBytesOrPercentageValue(&serverCfg.MemoryPoolSize, memoryPercentResolver)
+	startCtx.goMemLimitValue = makeBytesOrPercentageValue(&goMemLimit, memoryPercentResolver)
 	startCtx.diskTempStorageSizeValue = makeBytesOrPercentageValue(nil /* v */, nil /* percentResolver */)
 	startCtx.tsdbSizeValue = makeBytesOrPercentageValue(&serverCfg.TimeSeriesServerConfig.QueryMemoryMax, memoryPercentResolver)
 }
@@ -543,6 +546,8 @@ func setDrainContextDefaults() {
 var nodeCtx struct {
 	nodeDecommissionWait   nodeDecommissionWaitType
 	nodeDecommissionSelf   bool
+	nodeDecommissionChecks nodeDecommissionCheckMode
+	nodeDecommissionDryRun bool
 	statusShowRanges       bool
 	statusShowStats        bool
 	statusShowDecommission bool
@@ -555,6 +560,8 @@ var nodeCtx struct {
 func setNodeContextDefaults() {
 	nodeCtx.nodeDecommissionWait = nodeDecommissionWaitAll
 	nodeCtx.nodeDecommissionSelf = false
+	nodeCtx.nodeDecommissionChecks = nodeDecommissionChecksEnabled
+	nodeCtx.nodeDecommissionDryRun = false
 	nodeCtx.statusShowRanges = false
 	nodeCtx.statusShowStats = false
 	nodeCtx.statusShowAll = false
@@ -633,6 +640,7 @@ func setDemoContextDefaults() {
 	demoCtx.Multitenant = true
 	demoCtx.DisableServerController = false
 	demoCtx.DefaultEnableRangefeeds = true
+	demoCtx.AutoConfigProvider = acprovider.NoTaskProvider{}
 
 	demoCtx.pidFile = ""
 	demoCtx.disableEnterpriseFeatures = false

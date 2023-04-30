@@ -204,6 +204,7 @@ func (bse *boundedStalenessEvents) validate(t *testing.T) {
 				require.True(
 					t,
 					ev.MinTimestampBound.Less(lastTxnRetry.MinTimestampBound),
+					"expected MinTimestampBound=%s to be less than previous retry's MinTimestampBound=%s",
 					ev.MinTimestampBound,
 					lastTxnRetry.MinTimestampBound,
 				)
@@ -274,7 +275,7 @@ func TestBoundedStalenessDataDriven(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		i := i
 		clusterArgs.ServerArgsPerNode[i] = base.TestServerArgs{
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
 					WithStatementTrace: func(trace tracingpb.Recording, stmt string) {

@@ -14,10 +14,11 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -190,16 +191,17 @@ func (r *Replica) maybeQuiesceRaftMuLockedReplicaMuLocked(
 }
 
 type quiescer interface {
+	ClusterSettings() *cluster.Settings
 	descRLocked() *roachpb.RangeDescriptor
 	isRaftLeaderRLocked() bool
 	raftSparseStatusRLocked() *raftSparseStatus
 	raftBasicStatusRLocked() raft.BasicStatus
-	raftLastIndexRLocked() uint64
+	raftLastIndexRLocked() kvpb.RaftIndex
 	hasRaftReadyRLocked() bool
 	hasPendingProposalsRLocked() bool
 	hasPendingProposalQuotaRLocked() bool
-	leaseStatusAtRLocked(ctx context.Context, now hlc.ClockTimestamp) kvserverpb.LeaseStatus
-	StoreID() roachpb.StoreID
+	getLeaseRLocked() (roachpb.Lease, roachpb.Lease)
+	ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimestamp) bool
 	mergeInProgressRLocked() bool
 	isDestroyedRLocked() (DestroyReason, error)
 }
@@ -252,17 +254,19 @@ func (s laggingReplicaSet) Less(i, j int) bool { return s[i].NodeID < s[j].NodeI
 // un-quiesce the range.
 //
 // A replica should quiesce if all the following hold:
-// a) The leaseholder and the leader are collocated. We don't want to quiesce
+// a) The lease is not expiration-based and kv.expiration_leases_only.enabled
+// is true, since we'll have to renew it shortly.
+// b) The leaseholder and the leader are collocated. We don't want to quiesce
 // otherwise as we don't want to quiesce while a leader election is in progress,
 // and also we don't want to quiesce if another replica might have commands
 // pending that require this leader for proposing them. Note that, after the
 // leaseholder decides to quiesce, followers can still refuse quiescing if they
 // have pending commands.
-// b) There are no commands in-flight proposed by this leaseholder. Clients can
+// c) There are no commands in-flight proposed by this leaseholder. Clients can
 // be waiting for results while there's pending proposals.
-// c) There is no outstanding proposal quota. Quiescing while there's quota
+// d) There is no outstanding proposal quota. Quiescing while there's quota
 // outstanding can lead to deadlock. See #46699.
-// d) All the live followers are caught up. We don't want to quiesce when
+// e) All the live followers are caught up. We don't want to quiesce when
 // followers are behind because then they might not catch up until we
 // un-quiesce. We like it when everybody is caught up because otherwise
 // failovers can take longer.
@@ -282,6 +286,13 @@ func shouldReplicaQuiesce(
 		if log.V(4) {
 			log.Infof(ctx, "not quiescing: not leader")
 		}
+		return nil, nil, false
+	}
+	// Fast path: don't quiesce expiration-based leases, since they'll likely be
+	// renewed soon. The lease may not be ours, but in that case we wouldn't be
+	// able to quiesce anyway (see leaseholder condition below).
+	if l, _ := q.getLeaseRLocked(); l.Type() == roachpb.LeaseExpiration && l.Sequence != 0 {
+		log.VInfof(ctx, 4, "not quiescing: expiration-based lease")
 		return nil, nil, false
 	}
 	if q.hasPendingProposalsRLocked() {
@@ -340,36 +351,15 @@ func shouldReplicaQuiesce(
 		return nil, nil, false
 	}
 
-	// Don't quiesce if there is a current leaseholder elsewhere. Otherwise, the
-	// leaseholder may have pending commands which it's waiting on this leader to
-	// propose.
-	//
-	// We allow quiescing with an expired lease (both expiration-based and
-	// epoch-based), since leases are not always eagerly renewed. This replica
-	// thinks it's the leader, and it checks that there are no unapplied entries,
-	// so there can't be a new leaseholder if that's still the case. If someone
-	// else recently acquired leadership then this replica would not be able to
-	// quiesce those followers, only itself and any stale followers, and it would
-	// unquiesce once it hears from the new leader.
-	st := q.leaseStatusAtRLocked(ctx, now)
-	switch st.State {
-	// Allow quiescing if the current lease is ours, even if we can't use it.
-	case kvserverpb.LeaseState_VALID, kvserverpb.LeaseState_UNUSABLE, kvserverpb.LeaseState_PROSCRIBED:
-		if !st.OwnedBy(q.StoreID()) {
-			if log.V(4) {
-				log.Infof(ctx, "not quiescing: not leaseholder")
-			}
-			return nil, nil, false
-		}
-	// Allow expired leases to quiesce.
-	case kvserverpb.LeaseState_EXPIRED:
-	default:
+	// Only quiesce if this replica is the leaseholder as well;
+	// otherwise the replica which is the valid leaseholder may have
+	// pending commands which it's waiting on this leader to propose.
+	if !q.ownsValidLeaseRLocked(ctx, now) {
 		if log.V(4) {
-			log.Infof(ctx, "not quiescing: lease in state %s", st)
+			log.Infof(ctx, "not quiescing: not leaseholder")
 		}
 		return nil, nil, false
 	}
-
 	// We need all of Applied, Commit, LastIndex and Progress.Match indexes to be
 	// equal in order to quiesce.
 	if status.Applied != status.Commit {
@@ -380,7 +370,7 @@ func shouldReplicaQuiesce(
 		return nil, nil, false
 	}
 	lastIndex := q.raftLastIndexRLocked()
-	if status.Commit != lastIndex {
+	if kvpb.RaftIndex(status.Commit) != lastIndex {
 		if log.V(4) {
 			log.Infof(ctx, "not quiescing: commit (%d) != lastIndex (%d)",
 				status.Commit, lastIndex)

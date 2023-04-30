@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -41,7 +42,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -257,6 +257,10 @@ type BaseConfig struct {
 	// These events are meant for the Observability Service, but they might pass
 	// through an OpenTelemetry Collector.
 	ObsServiceAddr string
+
+	// AutoConfigProvider provides auto-configuration tasks to apply on
+	// the cluster during server initialization.
+	AutoConfigProvider acprovider.Provider
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -296,6 +300,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.Stores = base.StoreSpecList{
 		Specs: []base.StoreSpec{storeSpec},
 	}
+	cfg.AutoConfigProvider = acprovider.NoTaskProvider{}
 	// We use the tag "n" here for both KV nodes and SQL instances,
 	// using the knowledge that the value part of a SQL instance ID
 	// container will prefix the value with the string "sql", resulting
@@ -423,10 +428,6 @@ type KVConfig struct {
 	// DefaultSystemZoneConfigOverride server testing knob.
 	DefaultSystemZoneConfig zonepb.ZoneConfig
 
-	// LocalityAddresses contains private IP addresses the can only be accessed
-	// in the corresponding locality.
-	LocalityAddresses []roachpb.LocalityAddress
-
 	// EventLogEnabled is a switch which enables recording into cockroach's SQL
 	// event log tables. These tables record transactional events about changes
 	// to cluster metadata, such as DDL statements and range rebalancing
@@ -505,6 +506,10 @@ type SQLConfig struct {
 	// Only applies when the SQL server is deployed individually.
 	TenantKVAddrs []string
 
+	// TenantLoopbackAddr is the address to use for the tenant's loopback connection.
+	// It only applies when in a shared-process configuration.
+	TenantLoopbackAddr string
+
 	// The following values can only be set via environment variables and are
 	// for testing only. They are not meant to be set by the end user.
 
@@ -517,6 +522,10 @@ type SQLConfig struct {
 	// LocalKVServerInfo is set in configs for shared-process tenants. It contains
 	// info for making Batch requests to the local KV server without using gRPC.
 	LocalKVServerInfo *LocalKVServerInfo
+
+	// NodeMetricsRecorder is the node's MetricRecorder; the tenant's metrics will
+	// be recorded with it. Nil if this is not a shared-process tenant.
+	NodeMetricsRecorder *status.MetricsRecorder
 }
 
 // LocalKVServerInfo is used to group information about the local KV server
@@ -945,27 +954,9 @@ func (cfg *Config) parseGossipBootstrapAddresses(
 		}
 
 		if cfg.JoinPreferSRVRecords {
-			// The following code substitutes the entry in --join by the
-			// result of SRV resolution, if suitable SRV records are found
-			// for that name.
-			//
-			// TODO(knz): Delay this lookup. The logic for "regular" addresses
-			// is delayed until the point the connection is attempted, so that
-			// fresh DNS records are used for a new connection. This makes
-			// it possible to update DNS records without restarting the node.
-			// The SRV logic here does not have this property (yet).
-			srvAddrs, err := netutil.SRV(ctx, address)
-			if err != nil {
-				return nil, err
-			}
-
-			if len(srvAddrs) > 0 {
-				for _, sa := range srvAddrs {
-					bootstrapAddresses = append(bootstrapAddresses,
-						util.MakeUnresolvedAddrWithDefaults("tcp", sa, base.DefaultPort))
-				}
-				continue
-			}
+			// We will use the port in the SRV records.
+			bootstrapAddresses = append(bootstrapAddresses, util.MakeUnresolvedAddr("tcp", address))
+			continue
 		}
 
 		// Otherwise, use the address.

@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -43,9 +44,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -135,7 +138,7 @@ func TestStoreSplitAbortSpan(t *testing.T) {
 	left, middle, right := roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c")
 
 	txn := func(key roachpb.Key, ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("test", key, 0, ts, 0, int32(s.SQLInstanceID()))
+		txn := roachpb.MakeTransaction("test", key, 0, 0, ts, 0, int32(s.SQLInstanceID()))
 		return &txn
 	}
 
@@ -393,9 +396,9 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 			break
 		}
 
-		if bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(roachpb.KeyMin)) ||
-			bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(splitKey)) {
-			t.Errorf("unexpected system key: %s; txn record should have been cleaned up", iter.Key())
+		if bytes.HasPrefix([]byte(iter.UnsafeKey().Key), txnPrefix(roachpb.KeyMin)) ||
+			bytes.HasPrefix([]byte(iter.UnsafeKey().Key), txnPrefix(splitKey)) {
+			t.Errorf("unexpected system key: %s; txn record should have been cleaned up", iter.UnsafeKey())
 		}
 	}
 }
@@ -454,6 +457,7 @@ func TestQueryLocksAcrossRanges(t *testing.T) {
 	txn3Proto := roachpb.MakeTransaction(
 		"waiter",
 		nil, // baseKey
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		s.Clock().NowAsClockTimestamp().ToTimestamp(),
 		s.Clock().MaxOffset().Nanoseconds(),
@@ -628,7 +632,7 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	// Increments are a good way of testing idempotency. Up here, we
 	// address them to the original range, then later to the one that
 	// contains the key.
-	txn := roachpb.MakeTransaction("test", []byte("c"), 10, store.Clock().Now(), 0, int32(s.SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", []byte("c"), isolation.Serializable, 10, store.Clock().Now(), 0, int32(s.SQLInstanceID()))
 	lIncArgs := incrementArgs([]byte("apoptosis"), 100)
 	lTxn := txn
 	lTxn.Sequence++
@@ -1043,10 +1047,10 @@ func fillRange(
 			return
 		}
 		if key == nil || !singleKey {
-			key = append(append([]byte(nil), prefix...), randutil.RandBytes(src, 100)...)
+			key = append(append([]byte(nil), prefix...), randutil.RandBytes(src, 1000)...)
 			key = keys.MakeFamilyKey(key, src.Uint32())
 		}
-		val := randutil.RandBytes(src, int(src.Int31n(1<<8)))
+		val := randutil.RandBytes(src, 200000)
 		pArgs := putArgs(key, val)
 		_, pErr := kv.SendWrappedWith(context.Background(), store, kvpb.Header{
 			RangeID: rangeID,
@@ -1089,7 +1093,7 @@ func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 	tdb.Exec(t, "CREATE TABLE t ()")
 	var descID uint32
 	tdb.QueryRow(t, "SELECT 't'::regclass::int").Scan(&descID)
-	const maxBytes, minBytes = 1 << 16, 1 << 14
+	const maxBytes, minBytes = 100 << 20, 1 << 14
 	tdb.Exec(t, "ALTER TABLE t CONFIGURE ZONE USING range_max_bytes = $1, range_min_bytes = $2",
 		maxBytes, minBytes)
 
@@ -1165,7 +1169,7 @@ func TestStoreRangeSplitWithMaxBytesUpdate(t *testing.T) {
 	tdb.Exec(t, "CREATE TABLE t ()")
 	var descID uint32
 	tdb.QueryRow(t, "SELECT 't'::regclass::int").Scan(&descID)
-	const maxBytes, minBytes = 1 << 16, 1 << 14
+	const maxBytes, minBytes = 100 << 20, 1 << 14
 	tdb.Exec(t, "ALTER TABLE t CONFIGURE ZONE USING range_max_bytes = $1, range_min_bytes = $2",
 		maxBytes, minBytes)
 
@@ -1416,7 +1420,7 @@ func runSetupSplitSnapshotRace(
 			RaftConfig: base.RaftConfig{
 				// Disable the split delay mechanism, or it'll spend 10s going in circles.
 				// (We can't set it to zero as otherwise the default overrides us).
-				RaftDelaySplitToSuppressSnapshotTicks: -1,
+				RaftDelaySplitToSuppressSnapshot: -1,
 			},
 		}
 	}
@@ -2025,8 +2029,12 @@ func TestStoreSplitGCHint(t *testing.T) {
 // and the uninitialized replica reacting to messages.
 func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 66480, "flaky test")
 	defer log.Scope(t).Close(t)
+
+	// The aggressive Raft timeouts in this test prevents it from maintaining
+	// quorum and making progress when stressing under race or deadlock detection.
+	skip.UnderRace(t)
+	skip.UnderDeadlock(t)
 
 	currentTrigger := make(chan *roachpb.SplitTrigger, 1)
 	var seen struct {
@@ -2103,6 +2111,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		errChan := make(chan *kvpb.Error)
+		failedSendLog := log.Every(time.Second)
 
 		// Closed when the split goroutine is done.
 		splitDone := make(chan struct{})
@@ -2147,7 +2156,15 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 						Term: term,
 					},
 				}, rpc.DefaultClass); !sent {
-					t.Error("transport failed to send vote request")
+					// SendAsync can return false, indicating the message didn't send.
+					// The most likely reason this test encounters a message failing to
+					// send is the outgoing message queue being full. The queue filling
+					// up is expected given it has fixed capacity and this loop is
+					// attempting to sending 1 MsgVote every microsecond. See comments
+					// below and above for the frequency rationale.
+					if failedSendLog.ShouldLog() {
+						log.Infof(ctx, "transport failed to send vote request")
+					}
 				}
 				select {
 				case <-splitDone:
@@ -2585,6 +2602,7 @@ func TestUnsplittableRange(t *testing.T) {
 				ProtectedTSReaderOverrideFn: spanconfig.EmptyProtectedTSReader,
 			},
 			KeyVisualizer: &keyvisualizer.TestingKnobs{SkipZoneConfigBootstrap: true},
+			SQLStatsKnobs: &sqlstats.TestingKnobs{SkipZoneConfigBootstrap: true},
 		},
 	})
 	s := serv.(*server.TestServer)
@@ -2776,13 +2794,15 @@ func TestTxnWaitQueueDependencyCycleWithRangeSplit(t *testing.T) {
 func TestStoreCapacityAfterSplit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 92677)
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, 2,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
 						WallClock: manualClock,
@@ -2800,16 +2820,6 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	key := tc.ScratchRange(t)
 	desc := tc.AddVotersOrFatal(t, key, tc.Target(1))
 	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(1))
-	testutils.SucceedsSoon(t, func() error {
-		repl, err := s.GetReplica(desc.RangeID)
-		if err != nil {
-			return err
-		}
-		if !repl.OwnsValidLease(ctx, tc.Servers[1].Clock().NowAsClockTimestamp()) {
-			return errors.New("s2 does not own valid lease for this range")
-		}
-		return nil
-	})
 
 	tc.IncrClockForLeaseUpgrade(t, manualClock)
 	tc.WaitForLeaseUpgrade(ctx, t, desc)
@@ -2851,6 +2861,11 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 		return nil
 	})
 
+	// Bump the clock again, right before calling capacity. We know that the
+	// writes have succeeded and should be reflected in Capacity, however the
+	// MinStatsDuration will cause nothing to be returned unless the last lease
+	// transfer is at least MinStatsDuration ago.
+	manualClock.Increment(int64(replicastats.MinStatsDuration))
 	cap, err = s.Capacity(ctx, false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
@@ -2865,7 +2880,7 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	// NB: The writes per second may be within some error bound below the
 	// minExpected due to timing and floating point calculation. An error of
 	// 0.01 (WPS) is added to avoid flaking the test.
-	if minExpected, a := 1/float64(replicastats.MinStatsDuration/time.Second), cap.WritesPerSecond; minExpected > a+0.01 {
+	if minExpected, a := 1/(float64(2*replicastats.MinStatsDuration/time.Second)), cap.WritesPerSecond; minExpected > a+0.01 {
 		t.Errorf("expected cap.WritesPerSecond >= %f, got %f", minExpected, a)
 	}
 
@@ -3203,7 +3218,7 @@ func TestRangeLookupAsyncResolveIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	txn := roachpb.MakeTransaction("test", key2, 1,
+	txn := roachpb.MakeTransaction("test", key2, isolation.Serializable, 1,
 		store.Clock().Now(), store.Clock().MaxOffset().Nanoseconds(),
 		int32(s.SQLInstanceID()))
 	// Officially begin the transaction. If not for this, the intent resolution

@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -64,7 +65,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.BeginTransaction,
 		*tree.CommentOnColumn, *tree.CommentOnConstraint, *tree.CommentOnDatabase, *tree.CommentOnIndex, *tree.CommentOnTable, *tree.CommentOnSchema,
 		*tree.CommitTransaction,
-		*tree.CopyFrom, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
+		*tree.CopyFrom, *tree.CopyTo, *tree.CreateDatabase, *tree.CreateIndex, *tree.CreateView,
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
@@ -90,7 +91,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		// we need to set the expected output columns to the output columns of the
 		// prepared statement that the user is trying to execute.
 		name := string(t.Name)
-		prepared, ok := p.preparedStatements.Get(name)
+		prepared, ok := p.preparedStatements.Get(name, true /* touchLRU */)
 		if !ok {
 			// We're trying to prepare an EXECUTE of a statement that doesn't exist.
 			// Let's just give up at this point.
@@ -363,8 +364,11 @@ func (opc *optPlanningCtx) reset(ctx context.Context) {
 		// descriptor versions are bumped at most once per transaction, even if there
 		// are multiple DDL operations; and transactions can be aborted leading to
 		// potential reuse of versions. To avoid these issues, we prevent saving a
-		// memo (for prepare) or reusing a saved memo (for execute).
-		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables()
+		// memo (for prepare) or reusing a saved memo (for execute). If
+		// RemoteRegions is set in the eval context we're building a memo for the
+		// purposes of generating the proper error message, and memo reuse or
+		// caching should not be done.
+		opc.allowMemoReuse = !p.Descriptors().HasUncommittedTables() && len(p.EvalContext().RemoteRegions) == 0
 		opc.useCache = opc.allowMemoReuse && queryCacheEnabled.Get(&p.execCfg.Settings.SV)
 
 		if _, isCanned := p.stmt.AST.(*tree.CannedOptPlan); isCanned {
@@ -575,9 +579,11 @@ func (opc *optPlanningCtx) buildExecMemo(ctx context.Context) (_ *memo.Memo, _ e
 	// find potential index candidates in the memo.
 	_, isExplain := opc.p.stmt.AST.(*tree.Explain)
 	if isExplain && p.SessionData().IndexRecommendationsEnabled {
-		if err := opc.makeQueryIndexRecommendation(ctx); err != nil {
+		indexRecs, err := opc.makeQueryIndexRecommendation(ctx)
+		if err != nil {
 			return nil, err
 		}
+		opc.p.instrumentation.explainIndexRecs = indexRecs
 	}
 
 	if _, isCanned := opc.p.stmt.AST.(*tree.CannedOptPlan); !isCanned {
@@ -626,7 +632,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 	var bld *execbuilder.Builder
 	if !planTop.instrumentation.ShouldBuildExplainPlan() {
 		bld = execbuilder.New(ctx, f, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
-			evalCtx, allowAutoCommit, stmt.IsANSIDML())
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -636,7 +642,7 @@ func (opc *optPlanningCtx) runExecBuilder(
 		// Create an explain factory and record the explain.Plan.
 		explainFactory := explain.NewFactory(f)
 		bld = execbuilder.New(ctx, explainFactory, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
-			evalCtx, allowAutoCommit, stmt.IsANSIDML())
+			evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST))
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -718,7 +724,9 @@ func (p *planner) DecodeGist(gist string, external bool) ([]string, error) {
 // indexes hypothetically added to the table. An index recommendation for the
 // query is outputted based on which hypothetical indexes are helpful in the
 // optimal plan.
-func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (err error) {
+func (opc *optPlanningCtx) makeQueryIndexRecommendation(
+	ctx context.Context,
+) (_ []indexrec.Rec, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// This code allows us to propagate internal errors without having to add
@@ -754,13 +762,13 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 		return ruleName.IsNormalize()
 	})
 	if _, err = opc.optimizer.Optimize(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Walk through the fully normalized memo to determine index candidates and
 	// create hypothetical tables.
 	indexCandidates := indexrec.FindIndexCandidateSet(f.Memo().RootExpr(), f.Metadata())
-	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	optTables, hypTables := indexrec.BuildOptAndHypTableMaps(opc.catalog, indexCandidates)
 
 	// Optimize with the saved memo and hypothetical tables. Walk through the
 	// optimal plan to determine index recommendations.
@@ -772,10 +780,14 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 	)
 	opc.optimizer.Memo().Metadata().UpdateTableMeta(f.EvalContext(), hypTables)
 	if _, err = opc.optimizer.Optimize(); err != nil {
-		return err
+		return nil, err
 	}
 
-	opc.p.instrumentation.indexRecs = indexrec.FindRecs(f.Memo().RootExpr(), f.Metadata())
+	var indexRecs []indexrec.Rec
+	indexRecs, err = indexrec.FindRecs(ctx, f.Memo().RootExpr(), f.Metadata())
+	if err != nil {
+		return nil, err
+	}
 
 	// Re-initialize the optimizer (which also re-initializes the factory) and
 	// update the saved memo's metadata with the original table information.
@@ -788,5 +800,5 @@ func (opc *optPlanningCtx) makeQueryIndexRecommendation(ctx context.Context) (er
 		f.CopyWithoutAssigningPlaceholders,
 	)
 
-	return nil
+	return indexRecs, nil
 }

@@ -43,7 +43,7 @@ import (
 // TODO(erikgrinaker): this, and the timeout handling, should be moved into a
 // migration helper that manages checkpointing and retries as well.
 var migrateApplicationTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.migration.migrate_application.timeout",
 	"timeout for a Migrate request to be applied across all replicas of a range",
 	1*time.Minute,
@@ -551,7 +551,8 @@ func (r *Replica) evaluate1PC(
 	clonedTxn.ReadTimestamp = br.Timestamp
 	clonedTxn.WriteTimestamp = br.Timestamp
 
-	// If the end transaction is not committed, clear the batch and mark the status aborted.
+	// If the end transaction is not committed, clear the batch and mark the
+	// status aborted.
 	if !etArg.Commit {
 		clonedTxn.Status = roachpb.ABORTED
 		batch.Close()
@@ -575,19 +576,44 @@ func (r *Replica) evaluate1PC(
 	}
 
 	// Even though the transaction is 1PC and hasn't written any intents, it may
-	// have acquired unreplicated locks, so inform the concurrency manager that
-	// it is finalized and than any unreplicated locks that it has acquired can
-	// be released.
-	res.Local.UpdatedTxns = []*roachpb.Transaction{clonedTxn}
-	res.Local.ResolvedLocks = make([]roachpb.LockUpdate, len(etArg.LockSpans))
-	for i, sp := range etArg.LockSpans {
-		res.Local.ResolvedLocks[i] = roachpb.LockUpdate{
-			Span:           sp,
-			Txn:            clonedTxn.TxnMeta,
-			Status:         clonedTxn.Status,
-			IgnoredSeqNums: clonedTxn.IgnoredSeqNums,
+	// have acquired unreplicated locks, so inform the local concurrency manager
+	// that it is finalized and that any unreplicated locks that it has acquired
+	// on this range can be released. The transaction may have also acquired
+	// unreplicated locks on other ranges. In such cases, retain the external
+	// locks so that they can be handed to async intent resolution.
+	//
+	// NOTE: we're holding a read latch on the RangeDescriptor key thanks to the
+	// EndTxn latch declaration, so this descriptor access is synchronized with
+	// splits and merges.
+	desc := r.Desc()
+	resolvedLocks := make([]roachpb.LockUpdate, 0, len(etArg.LockSpans))
+	var externalLocks []roachpb.Span
+	for _, sp := range etArg.LockSpans {
+		if len(sp.EndKey) == 0 {
+			// NOTE: kvserverbase.IntersectSpan does not support point spans, so we
+			// don't call it for point lock spans.
+			if kvserverbase.ContainsKey(desc, sp.Key) {
+				resolvedLocks = append(resolvedLocks, roachpb.MakeLockUpdate(clonedTxn, sp))
+			} else {
+				externalLocks = append(externalLocks, sp)
+			}
+		} else {
+			inSpan, outSpans := kvserverbase.IntersectSpan(sp, desc)
+			if inSpan != nil {
+				resolvedLocks = append(resolvedLocks, roachpb.MakeLockUpdate(clonedTxn, *inSpan))
+			}
+			externalLocks = append(externalLocks, outSpans...)
 		}
 	}
+	clonedTxn.LockSpans = externalLocks
+
+	if len(externalLocks) != 0 {
+		// NB: like in result.FromEndTxn, don't add to EndTxns if all lock spans
+		// were local and asynchronous resolution is not needed.
+		res.Local.EndTxns = []result.EndTxnIntents{{Txn: clonedTxn, Always: false, Poison: false}}
+	}
+	res.Local.UpdatedTxns = []*roachpb.Transaction{clonedTxn}
+	res.Local.ResolvedLocks = resolvedLocks
 
 	// Assign the response txn.
 	br.Txn = clonedTxn
@@ -770,7 +796,7 @@ func isOnePhaseCommit(ba *kvpb.BatchRequest) bool {
 	}
 	arg, _ := ba.GetArg(kvpb.EndTxn)
 	etArg := arg.(*kvpb.EndTxnRequest)
-	if retry, _, _ := batcheval.IsEndTxnTriggeringRetryError(ba.Txn, etArg); retry {
+	if retry, _, _ := batcheval.IsEndTxnTriggeringRetryError(ba.Txn, etArg.Deadline); retry {
 		return false
 	}
 	// If the transaction has already restarted at least once then it may have

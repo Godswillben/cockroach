@@ -102,13 +102,13 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • Schema:{DescID: 105}
 │       │   │   │ PUBLIC → DROPPED
 │       │   │   │
-│       │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 106, ReferencedDescID: 105}
+│       │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 106, ReferencedDescID: 105}
 │       │   │   │     rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │   │
-│       │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 107, ReferencedDescID: 105}
+│       │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 107, ReferencedDescID: 105}
 │       │   │   │     rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │   │
-│       │   │   └── • Precedence dependency from ABSENT ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   │   └── • Precedence dependency from ABSENT SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │         rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │
 │       │   ├── • SchemaParent:{DescID: 105, ReferencedDescID: 104}
@@ -172,7 +172,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   │   └── • Precedence dependency from DROPPED EnumType:{DescID: 106}
 │       │   │         rule: "descriptor dropped before dependent element removal"
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 106, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 106, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED EnumType:{DescID: 106}
@@ -215,7 +215,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 107, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 107, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
@@ -252,7 +252,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • Table:{DescID: 108}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 108}
@@ -271,8 +271,17 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 108}
-│       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 108}
+│       │   │   │     rule: "descriptor dropped before dependent element removal"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 1}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967295}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   └── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967294}
+│       │   │         rule: "column type removed before column family"
 │       │   │
 │       │   ├── • Column:{DescID: 108, ColumnID: 1}
 │       │   │   │ PUBLIC → WRITE_ONLY
@@ -407,10 +416,6 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │           │     TypeIDs:
 │           │     - 106
 │           │
-│           ├── • NotImplementedForPublicObjects
-│           │     DescID: 108
-│           │     ElementType: scpb.ColumnFamily
-│           │
 │           ├── • MakePublicColumnWriteOnly
 │           │     ColumnID: 1
 │           │     TableID: 108
@@ -502,6 +507,9 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │           ├── • RemoveUserPrivileges
 │           │     DescriptorID: 108
 │           │     User: root
+│           │
+│           ├── • AssertColumnFamilyIsRemoved
+│           │     TableID: 108
 │           │
 │           ├── • MarkDescriptorAsDropped
 │           │     DescriptorID: 104
@@ -648,7 +656,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │   │   │   ├── • EnumTypeValue:{DescID: 106, Name: us-east3}
 │   │   │   │     ABSENT → PUBLIC
 │   │   │   │
-│   │   │   ├── • ObjectParent:{DescID: 106, ReferencedDescID: 105}
+│   │   │   ├── • SchemaChild:{DescID: 106, ReferencedDescID: 105}
 │   │   │   │     ABSENT → PUBLIC
 │   │   │   │
 │   │   │   ├── • Namespace:{DescID: 107, Name: _crdb_internal_region, ReferencedDescID: 104}
@@ -669,7 +677,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │   │   │   ├── • AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
 │   │   │   │     DROPPED → PUBLIC
 │   │   │   │
-│   │   │   ├── • ObjectParent:{DescID: 107, ReferencedDescID: 105}
+│   │   │   ├── • SchemaChild:{DescID: 107, ReferencedDescID: 105}
 │   │   │   │     ABSENT → PUBLIC
 │   │   │   │
 │   │   │   ├── • Namespace:{DescID: 108, Name: table_regional_by_table, ReferencedDescID: 104}
@@ -687,7 +695,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │   │   │   ├── • Table:{DescID: 108}
 │   │   │   │     DROPPED → PUBLIC
 │   │   │   │
-│   │   │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│   │   │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │   │   │   │     ABSENT → PUBLIC
 │   │   │   │
 │   │   │   ├── • TableLocalitySecondaryRegion:{DescID: 108, ReferencedDescID: 106}
@@ -828,13 +836,13 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • Schema:{DescID: 105}
 │       │   │   │ PUBLIC → DROPPED
 │       │   │   │
-│       │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 106, ReferencedDescID: 105}
+│       │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 106, ReferencedDescID: 105}
 │       │   │   │     rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │   │
-│       │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 107, ReferencedDescID: 105}
+│       │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 107, ReferencedDescID: 105}
 │       │   │   │     rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │   │
-│       │   │   └── • Precedence dependency from ABSENT ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   │   └── • Precedence dependency from ABSENT SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │         rule: "back-reference in parent descriptor is removed before parent descriptor is dropped"
 │       │   │
 │       │   ├── • SchemaParent:{DescID: 105, ReferencedDescID: 104}
@@ -898,7 +906,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   │   └── • Precedence dependency from DROPPED EnumType:{DescID: 106}
 │       │   │         rule: "descriptor dropped before dependent element removal"
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 106, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 106, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED EnumType:{DescID: 106}
@@ -941,7 +949,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 107, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 107, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
@@ -978,7 +986,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • Table:{DescID: 108}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 108}
@@ -997,8 +1005,17 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │       │   ├── • ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 108}
-│       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 108}
+│       │   │   │     rule: "descriptor dropped before dependent element removal"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 1}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967295}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   └── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967294}
+│       │   │         rule: "column type removed before column family"
 │       │   │
 │       │   ├── • Column:{DescID: 108, ColumnID: 1}
 │       │   │   │ PUBLIC → ABSENT
@@ -1181,10 +1198,6 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │           │     TypeIDs:
 │           │     - 106
 │           │
-│           ├── • NotImplementedForPublicObjects
-│           │     DescID: 108
-│           │     ElementType: scpb.ColumnFamily
-│           │
 │           ├── • MakePublicColumnWriteOnly
 │           │     ColumnID: 1
 │           │     TableID: 108
@@ -1276,6 +1289,9 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
 │           ├── • RemoveUserPrivileges
 │           │     DescriptorID: 108
 │           │     User: root
+│           │
+│           ├── • AssertColumnFamilyIsRemoved
+│           │     TableID: 108
 │           │
 │           ├── • RemoveColumnNotNull
 │           │     ColumnID: 1
@@ -1518,7 +1534,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
         │   │   ├── • Precedence dependency from ABSENT EnumTypeValue:{DescID: 106, Name: us-east3}
         │   │   │     rule: "non-data dependents removed before descriptor"
         │   │   │
-        │   │   └── • Precedence dependency from ABSENT ObjectParent:{DescID: 106, ReferencedDescID: 105}
+        │   │   └── • Precedence dependency from ABSENT SchemaChild:{DescID: 106, ReferencedDescID: 105}
         │   │         rule: "non-data dependents removed before descriptor"
         │   │
         │   ├── • AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
@@ -1542,7 +1558,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
         │   │   ├── • PreviousStagePrecedence dependency from DROPPED AliasType:{DescID: 107, ReferencedTypeIDs: [106 107]}
         │   │   │     rule: "descriptor dropped in transaction before removal"
         │   │   │
-        │   │   └── • Precedence dependency from ABSENT ObjectParent:{DescID: 107, ReferencedDescID: 105}
+        │   │   └── • Precedence dependency from ABSENT SchemaChild:{DescID: 107, ReferencedDescID: 105}
         │   │         rule: "non-data dependents removed before descriptor"
         │   │
         │   ├── • Table:{DescID: 108}
@@ -1563,7 +1579,7 @@ EXPLAIN (ddl, verbose) DROP DATABASE multi_region_test_db CASCADE;
         │   │   ├── • PreviousStagePrecedence dependency from DROPPED Table:{DescID: 108}
         │   │   │     rule: "descriptor dropped in transaction before removal"
         │   │   │
-        │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 108, ReferencedDescID: 105}
+        │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 108, ReferencedDescID: 105}
         │   │   │     rule: "non-data dependents removed before descriptor"
         │   │   │
         │   │   ├── • Precedence dependency from ABSENT TableLocalitySecondaryRegion:{DescID: 108, ReferencedDescID: 106}

@@ -203,6 +203,9 @@ message LocalOnlySessionData {
   // InjectRetryErrorsEnabled causes statements inside an explicit
   // transaction to return a transaction retry error. It is intended for
   // developers to test their app's retry logic.
+  //
+  // Note that this session variable is **not** propagated to the internal
+  // executors - use InternalExecutorOverride for that.
   bool inject_retry_errors_enabled = 54;
   // NullOrderedLast controls whether NULL is ordered last. We default to
   // NULLS FIRST for ascending order by default, whereas postgres defaults
@@ -219,6 +222,8 @@ message LocalOnlySessionData {
   // AvoidBuffering indicates that the returned data should not be
   // buffered by conn executor.  This is currently used by replication primitives
   // to ensure the data is flushed to the consumer immediately.
+  //
+  // Does not apply to the InternalExecutor.
   bool avoid_buffering = 59;
   // CheckFunctionBodies indicates whether functions are validated during
   // creation.
@@ -316,7 +321,6 @@ message LocalOnlySessionData {
   // optimizer should use improved statistics calculations for disjunctive
   // filters.
   bool optimizer_use_improved_disjunction_stats = 86;
-
   // OptimizerUseLimitOrderingForStreamingGroupBy enables the exploration rule
   // which optimizes 'SELECT ... GROUP BY ... ORDER BY ... LIMIT n' queries.
   // The rule uses the required ordering in the limit expression to inform an
@@ -339,6 +343,50 @@ message LocalOnlySessionData {
   // transaction to return a transaction retry error just before transcation commit.
   // It is intended for developers to test their app's retry logic.
   bool inject_retry_errors_on_commit_enabled = 92;
+  // EnforceHomeRegionFollowerReadsEnabled, when true, allows the use of
+  // follower reads to dynamically detect and report a query's home region
+  // when the enforce_home_region session setting is also true.
+  bool enforce_home_region_follower_reads_enabled = 93;
+  // OptimizerAlwaysUseHistograms, when true, ensures that the optimizer
+  // always uses histograms to calculate statistics if available.
+  bool optimizer_always_use_histograms = 94;
+  // EnableCreateStatsUsingExtremes, when true, allows the use of CREATE
+  // STATISTICS .. USING EXTREMES.
+  bool enable_create_stats_using_extremes = 95;
+  // AllowRoleMembershipsToChangeDuringTransaction, when true, means that
+  // operations which consult the role membership cache do not retain their
+  // lease on that version of the cache throughout the transaction. The
+  // consequence of this is that the transaction may not experience a singular
+  // view of role membership, and it may be able to commit after the revocation
+  // of a role membership which the transaction relied on has successfully been
+  // committed and acknowledged to the user.
+  bool allow_role_memberships_to_change_during_transaction = 96;
+  // PreparedStatementsCacheSize, when not equal to 0, causes the LRU prepared
+  // statements in a session to be automatically deallocated when total prepared
+  // statement memory usage for that session is more than the cache size.
+  // Execution of these deallocated prepared statements will fail until they are
+  // prepared again.
+  int64 prepared_statements_cache_size = 97;
+  // StreamerEnabled controls whether the Streamer API can be used.
+  bool streamer_enabled = 98;
+  // DisableDropTenant causes errors when the client
+  // attempts to drop tenants or tenant records.
+  bool disable_drop_tenant = 99;
+  // MultipleActivePortalEnabled determines if the pgwire portal execution
+  // for certain queries can be paused. If true, portals with read-only SELECT
+  // query without sub/post queries can be executed in interleaving manner, but
+  // with a local execution plan.
+  bool multiple_active_portals_enabled = 100;
+  // UnboundedParallelScans, when true, indicates that the TableReader DistSQL
+  // processors should parallelize scans across ranges. Note that the
+  // parallelization will still be disabled for queries with LIMITs, and it can
+  // lead to increased likelihood of OOMs.
+  bool unbounded_parallel_scans = 101;
+  // OptimizerHoistUncorrelatedEqualitySubqueries, when true, causes the
+  // optimizer to hoist uncorrelated subqueries that are part of an equality
+  // expression with a column reference, which can produce more efficient query
+  // plans.
+  bool optimizer_hoist_uncorrelated_equality_subqueries = 102;
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

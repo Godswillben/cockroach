@@ -189,6 +189,13 @@ func TestExecBuild_explain_gist(
 	runExecBuildLogicTest(t, "explain_gist")
 }
 
+func TestExecBuild_explain_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "explain_redact")
+}
+
 func TestExecBuild_explain_shape(
 	t *testing.T,
 ) {
@@ -336,6 +343,13 @@ func TestExecBuild_join_order(
 	runExecBuildLogicTest(t, "join_order")
 }
 
+func TestExecBuild_json(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "json")
+}
+
 func TestExecBuild_limit(
 	t *testing.T,
 ) {
@@ -383,6 +397,13 @@ func TestExecBuild_not_visible_index(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "not_visible_index")
+}
+
+func TestExecBuild_observability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "observability")
 }
 
 func TestExecBuild_orderby(
@@ -509,6 +530,13 @@ func TestExecBuild_sql_fn(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "sql_fn")
+}
+
+func TestExecBuild_sql_statistics_persisted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runExecBuildLogicTest(t, "sql_statistics_persisted")
 }
 
 func TestExecBuild_srfs(

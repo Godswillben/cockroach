@@ -941,7 +941,7 @@ func (tc *Collection) aggregateAllLayers(
 	// Add stored comments which are not shadowed.
 	_ = stored.ForEachComment(func(key catalogkeys.CommentKey, cmt string) error {
 		if _, _, isShadowed := tc.uncommittedComments.getUncommitted(key); !isShadowed {
-			ret.UpsertComment(key, cmt)
+			return ret.UpsertComment(key, cmt)
 		}
 		return nil
 	})
@@ -984,7 +984,9 @@ func (tc *Collection) aggregateAllLayers(
 		})
 	}
 	// Add uncommitted comments and zone configs.
-	tc.uncommittedComments.addAllToCatalog(ret)
+	if err := tc.uncommittedComments.addAllToCatalog(ret); err != nil {
+		return nstree.MutableCatalog{}, err
+	}
 	tc.uncommittedZoneConfigs.addAllToCatalog(ret)
 	// Remove deleted descriptors from consideration, re-read and add the rest.
 	tc.deletedDescs.ForEach(descIDs.Remove)
@@ -1201,12 +1203,15 @@ func (tc *Collection) GetConstraintComment(
 }
 
 // MakeTestCollection makes a Collection that can be used for tests.
-func MakeTestCollection(ctx context.Context, leaseManager *lease.Manager) Collection {
+func MakeTestCollection(
+	ctx context.Context, codec keys.SQLCodec, leaseManager LeaseManager,
+) Collection {
 	settings := cluster.MakeTestingClusterSettings()
 	return Collection{
 		settings: settings,
 		version:  settings.Version.ActiveVersion(ctx),
 		leased:   makeLeasedDescriptors(leaseManager),
+		cr:       catkv.NewUncachedCatalogReader(codec),
 	}
 }
 

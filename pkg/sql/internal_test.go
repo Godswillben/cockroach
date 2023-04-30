@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -375,10 +377,10 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		s, _, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(context.Background())
 
-		testInternalExecutorAppNameInitialization(t, sem,
-			catconstants.InternalAppNamePrefix+"-test-query", // app name in SHOW
-			catconstants.InternalAppNamePrefix+"-test-query", // app name in stats
-			s.InternalExecutor().(*sql.InternalExecutor))
+		testInternalExecutorAppNameInitialization(
+			t, sem, catconstants.InternalAppNamePrefix+"-test-query",
+			s.InternalExecutor().(*sql.InternalExecutor),
+		)
 	})
 
 	// We are running the second test with a new server so
@@ -402,10 +404,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 				SequenceState: &sessiondata.SequenceState{},
 			})
 		testInternalExecutorAppNameInitialization(
-			t, sem,
-			"appname_findme", // app name in SHOW
-			catconstants.DelegatedAppNamePrefix+"appname_findme", // app name in stats
-			&ie,
+			t, sem, catconstants.DelegatedAppNamePrefix+"appname_findme", &ie,
 		)
 	})
 }
@@ -420,10 +419,7 @@ type testInternalExecutor interface {
 }
 
 func testInternalExecutorAppNameInitialization(
-	t *testing.T,
-	sem chan struct{},
-	expectedAppName, expectedAppNameInStats string,
-	ie testInternalExecutor,
+	t *testing.T, sem chan struct{}, expectedAppName string, ie testInternalExecutor,
 ) {
 	// Check that the application_name is set properly in the executor.
 	if row, err := ie.QueryRow(context.Background(), "test-query", nil,
@@ -511,8 +507,8 @@ func testInternalExecutorAppNameInitialization(
 		t.Fatal(err)
 	} else if row == nil {
 		t.Fatalf("expected 1 query, got 0")
-	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppNameInStats {
-		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppNameInStats, appName)
+	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppName {
+		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppName, appName)
 	}
 }
 
@@ -568,11 +564,12 @@ func TestInternalExecutorInLeafTxnDoesNotPanic(t *testing.T) {
 
 	rootTxn := kvDB.NewTxn(ctx, "root-txn")
 
-	ltis := rootTxn.GetLeafTxnInputState(ctx)
+	ltis, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, kvDB, roachpb.NodeID(1), ltis)
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
-	_, err := ie.ExecEx(
+	_, err = ie.ExecEx(
 		ctx, "leaf-query", leafTxn, sessiondata.RootUserSessionDataOverride, "SELECT 1",
 	)
 	require.NoError(t, err)
@@ -617,6 +614,156 @@ func TestInternalExecutorWithUndefinedQoSOverridePanics(t *testing.T) {
 		)
 		require.Error(t, err)
 	})
+}
+
+func TestInternalDBWithOverrides(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	idb1 := s.InternalDB().(*sql.InternalDB)
+
+	_ = idb1.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		assert.Equal(t, 8, int(txn.SessionData().DefaultIntSize))
+		assert.Equal(t, sessiondatapb.DistSQLAuto, txn.SessionData().DistSQLMode)
+		assert.Equal(t, "root", string(txn.SessionData().UserProto))
+
+		row, err := txn.QueryRow(ctx, "test", txn.KV(), "show default_int_size")
+		require.NoError(t, err)
+		assert.Equal(t, "'8'", row[0].String())
+
+		return nil
+	})
+
+	drow, err := idb1.Executor().QueryRow(ctx, "test", nil, "show default_int_size")
+	require.NoError(t, err)
+	assert.Equal(t, "'8'", drow[0].String())
+
+	idb2 := sql.NewInternalDBWithSessionDataOverrides(idb1,
+		func(sd *sessiondata.SessionData) {
+			sd.UserProto = "wowowo"
+			sd.DefaultIntSize = 2
+			sd.DistSQLMode = sessiondatapb.DistSQLOff
+		})
+
+	_ = idb2.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		// Verify the initial session data was overridden.
+		assert.Equal(t, 2, int(txn.SessionData().DefaultIntSize))
+		assert.Equal(t, sessiondatapb.DistSQLOff, txn.SessionData().DistSQLMode)
+		assert.Equal(t, "wowowo", string(txn.SessionData().UserProto))
+
+		// Verify that the override was propagated.
+		row, err := txn.QueryRow(ctx, "test", txn.KV(), "show default_int_size")
+		require.NoError(t, err)
+		assert.Equal(t, "'2'", row[0].String())
+
+		row, err = txn.QueryRow(ctx, "test", txn.KV(), "show session_authorization")
+		require.NoError(t, err)
+		assert.Equal(t, "'wowowo'", row[0].String())
+
+		row, err = txn.QueryRow(ctx, "test", txn.KV(), "show distsql")
+		require.NoError(t, err)
+		assert.Equal(t, "'off'", row[0].String())
+
+		return nil
+	})
+
+	// Also verify the override works for the non-txn-bound executor.
+	drow, err = idb2.Executor().QueryRow(ctx, "test", nil, "show default_int_size")
+	require.NoError(t, err)
+	assert.Equal(t, "'2'", drow[0].String())
+
+	drow, err = idb2.Executor().QueryRow(ctx, "test", nil, "show session_authorization")
+	require.NoError(t, err)
+	assert.Equal(t, "'wowowo'", drow[0].String())
+
+	drow, err = idb2.Executor().QueryRow(ctx, "test", nil, "show distsql")
+	require.NoError(t, err)
+	assert.Equal(t, "'off'", drow[0].String())
+}
+
+// TestInternalExecutorEncountersRetry verifies that if the internal executor
+// encounters a retry error after some data (rows or metadata) have been
+// communicated to the client, the query either results in a retry error (when
+// rows have been sent) or correctly transparently retries (#98558).
+func TestInternalExecutorEncountersRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, db, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := db.Exec("CREATE DATABASE test; CREATE TABLE test.t (c) AS SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	ie := s.InternalExecutor().(*sql.InternalExecutor)
+	ieo := sessiondata.InternalExecutorOverride{
+		User:                     username.RootUserName(),
+		InjectRetryErrorsEnabled: true,
+	}
+
+	// This test case verifies that if we execute the stmt of the RowsAffected
+	// type, it is transparently retried and the correct number of "rows
+	// affected" is reported.
+	t.Run("RowsAffected stmt", func(t *testing.T) {
+		// We will use PAUSE SCHEDULES statement which is of RowsAffected type.
+		//
+		// Notably, internally this statement will run some other queries via
+		// the "nested" internal executor, but those "nested" queries don't hit
+		// the injected retry error since this knob only applies to the "top"
+		// IE.
+		const stmt = `PAUSE SCHEDULES SELECT id FROM [SHOW SCHEDULES FOR SQL STATISTICS];`
+		paused, err := ie.ExecEx(ctx, "pause schedule", nil /* txn */, ieo, stmt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if paused != 1 {
+			t.Fatalf("expected 1 schedule to be paused, got %d", paused)
+		}
+	})
+
+	const rowsStmt = `SELECT * FROM test.t`
+
+	// This test case verifies that if the retry error occurs after some rows
+	// have been communicated to the client, then the stmt results in the retry
+	// error too - the IE cannot transparently retry it.
+	t.Run("Rows stmt", func(t *testing.T) {
+		_, err := ie.QueryBufferedEx(ctx, "read rows", nil /* txn */, ieo, rowsStmt)
+		if !testutils.IsError(err, "inject_retry_errors_enabled") {
+			t.Fatalf("expected to see injected retry error, got %v", err)
+		}
+	})
+
+	// This test case verifies that ExecEx of a stmt of Rows type correctly and
+	// transparently to us retries the stmt.
+	t.Run("ExecEx retries in implicit txn", func(t *testing.T) {
+		numRows, err := ie.ExecEx(ctx, "read rows", nil /* txn */, ieo, rowsStmt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if numRows != 1 {
+			t.Fatalf("expected 1 rowsAffected, got %d", numRows)
+		}
+	})
+
+	// This test case verifies that ExecEx doesn't retry when it's provided with
+	// an explicit txn.
+	t.Run("ExecEx doesn't retry in explicit txn", func(t *testing.T) {
+		txn := kvDB.NewTxn(ctx, "explicit")
+		_, err := ie.ExecEx(ctx, "read rows", txn, ieo, rowsStmt)
+		if !testutils.IsError(err, "inject_retry_errors_enabled") {
+			t.Fatalf("expected to see injected retry error, got %v", err)
+		}
+	})
+
+	// TODO(yuzefovich): add a test for when a schema change is done in-between
+	// the retries.
 }
 
 // TODO(andrei): Test that descriptor leases are released by the

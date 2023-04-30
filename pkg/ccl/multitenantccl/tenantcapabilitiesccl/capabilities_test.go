@@ -71,7 +71,7 @@ func TestDataDriven(t *testing.T) {
 
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true, // We'll create a tenant ourselves.
+				DefaultTestTenant: base.TestTenantDisabled, // We'll create a tenant ourselves.
 				Knobs: base.TestingKnobs{
 					TenantCapabilitiesTestingKnobs: &tenantcapabilities.TestingKnobs{
 						WatcherTestingKnobs: &tenantcapabilitieswatcher.TestingKnobs{
@@ -100,6 +100,7 @@ func TestDataDriven(t *testing.T) {
 		// us from being able to do so.
 		settings := cluster.MakeTestingClusterSettings()
 		sql.SecondaryTenantSplitAtEnabled.Override(ctx, &settings.SV, true)
+		sql.SecondaryTenantScatterEnabled.Override(ctx, &settings.SV, true)
 		tenantArgs := base.TestTenantArgs{
 			TenantID: serverutils.TestTenantID(),
 			Settings: settings,
@@ -115,7 +116,7 @@ func TestDataDriven(t *testing.T) {
 		}()
 		require.NoError(t, err)
 
-		var lastUpdateTS hlc.Timestamp
+		lastUpdateTS := tc.Server(0).Clock().Now() // ensure watcher isn't starting out empty
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 
 			switch d.Cmd {

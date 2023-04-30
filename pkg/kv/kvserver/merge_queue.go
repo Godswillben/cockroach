@@ -116,7 +116,7 @@ func newMergeQueue(store *Store, db *kv.DB) *mergeQueue {
 			// factor.
 			processTimeoutFunc:   makeRateLimitedTimeoutFunc(rebalanceSnapshotRate, recoverySnapshotRate),
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: false,
 			successes:            store.metrics.MergeQueueSuccesses,
 			failures:             store.metrics.MergeQueueFailures,
@@ -129,15 +129,6 @@ func newMergeQueue(store *Store, db *kv.DB) *mergeQueue {
 }
 
 func (mq *mergeQueue) enabled() bool {
-	if !mq.store.cfg.SpanConfigsDisabled {
-		if mq.store.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty() {
-			// If we don't have any span configs available, enabling range merges would
-			// be extremely dangerous -- we could collapse everything into a single
-			// range.
-			return false
-		}
-	}
-
 	st := mq.store.ClusterSettings()
 	return kvserverbase.MergeQueueEnabled.Get(&st.SV)
 }
@@ -156,7 +147,17 @@ func (mq *mergeQueue) shouldQueue(
 		return false, 0
 	}
 
-	if confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey.Next()) {
+	needsSplit, err := confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey.Next())
+	if err != nil {
+		log.Warningf(
+			ctx,
+			"could not compute if extending range would result in a split (err=%v); skipping merge for range %s",
+			err,
+			desc.RangeID,
+		)
+		return false, 0
+	}
+	if needsSplit {
 		// This range would need to be split if it extended just one key further.
 		// There is thus no possible right-hand neighbor that it could be merged
 		// with.

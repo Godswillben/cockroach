@@ -129,16 +129,17 @@ const (
 // will best accomplish the store-level goals.
 type StoreRebalancer struct {
 	log.AmbientContext
-	metrics           StoreRebalancerMetrics
-	st                *cluster.Settings
-	storeID           roachpb.StoreID
-	allocator         allocatorimpl.Allocator
-	storePool         storepool.AllocatorStorePool
-	rr                RangeRebalancer
-	replicaRankings   *ReplicaRankings
-	getRaftStatusFn   func(replica CandidateReplica) *raft.Status
-	processTimeoutFn  func(replica CandidateReplica) time.Duration
-	objectiveProvider RebalanceObjectiveProvider
+	metrics                 StoreRebalancerMetrics
+	st                      *cluster.Settings
+	storeID                 roachpb.StoreID
+	allocator               allocatorimpl.Allocator
+	storePool               storepool.AllocatorStorePool
+	rr                      RangeRebalancer
+	replicaRankings         *ReplicaRankings
+	getRaftStatusFn         func(replica CandidateReplica) *raft.Status
+	processTimeoutFn        func(replica CandidateReplica) time.Duration
+	objectiveProvider       RebalanceObjectiveProvider
+	subscribedToSpanConfigs func() bool
 }
 
 // NewStoreRebalancer creates a StoreRebalancer to work in tandem with the
@@ -170,6 +171,17 @@ func NewStoreRebalancer(
 			return rq.processTimeoutFunc(st, replica.Repl())
 		},
 		objectiveProvider: objectiveProvider,
+		subscribedToSpanConfigs: func() bool {
+			// The store rebalancer makes use of span configs. Wait until we've
+			// established subscription.
+			if rq.store.cfg.SpanConfigSubscriber == nil {
+				// Testing-only branch. testContext-style tests do not configure a
+				// SpanConfigSubscriber, so they always return false from this function.
+				// This has the effect of disabling the StoreRebalancer.
+				return false
+			}
+			return !rq.store.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty()
+		},
 	}
 	sr.AddLogTag("store-rebalancer", nil)
 	rq.store.metrics.registry.AddMetricStruct(&sr.metrics)
@@ -266,8 +278,11 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 			if mode == LBRebalancingOff {
 				continue
 			}
-			hottestRanges := sr.replicaRankings.TopLoad()
+			if !sr.subscribedToSpanConfigs() {
+				continue
+			}
 			objective := sr.RebalanceObjective()
+			hottestRanges := sr.replicaRankings.TopLoad(objective.ToDimension())
 			options := sr.scorerOptions(ctx, objective.ToDimension())
 			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, mode)
 			sr.rebalanceStore(ctx, rctx)
@@ -284,7 +299,8 @@ func (sr *StoreRebalancer) scorerOptions(
 	ctx context.Context, lbDimension load.Dimension,
 ) *allocatorimpl.LoadScorerOptions {
 	return &allocatorimpl.LoadScorerOptions{
-		StoreHealthOptions:           sr.allocator.StoreHealthOptions(ctx),
+		IOOverloadOptions:            sr.allocator.IOOverloadOptions(),
+		DiskOptions:                  sr.allocator.DiskOptions(),
 		Deterministic:                sr.storePool.IsDeterministic(),
 		LoadDims:                     []load.Dimension{lbDimension},
 		LoadThreshold:                allocatorimpl.LoadThresholds(&sr.st.SV, lbDimension),
@@ -582,6 +598,7 @@ func (sr *StoreRebalancer) LogRangeRebalanceOutcome(ctx context.Context, rctx *R
 			"ran out of replicas worth transferring and load %s is still above desired threshold %s; will check again soon",
 			rctx.LocalDesc.Capacity.Load(), rctx.maxThresholds)
 		sr.metrics.ImbalancedStateOverfullOptionsExhausted.Inc(1)
+		return
 	}
 
 	// We successfully rebalanced below or equal to the max threshold,
@@ -613,9 +630,6 @@ func (sr *StoreRebalancer) RebalanceRanges(
 	)
 
 	if candidateReplica == nil {
-		log.KvDistribution.Infof(ctx,
-			"ran out of replicas worth transferring and load %s is still above desired threshold %s; will check again soon",
-			rctx.LocalDesc.Capacity.Load(), rctx.maxThresholds)
 		return NoRebalanceTarget, candidateReplica, voterTargets, nonVoterTargets
 	}
 

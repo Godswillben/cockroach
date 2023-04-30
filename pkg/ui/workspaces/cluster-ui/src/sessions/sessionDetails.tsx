@@ -26,7 +26,7 @@ import { SummaryCard, SummaryCardItem } from "../summaryCard";
 import LoadingError from "../sqlActivity/errorComponent";
 
 import { DurationToMomentDuration, TimestampToMoment } from "src/util/convert";
-import { Bytes, DATE_FORMAT, Count } from "src/util/format";
+import { Bytes, DATE_FORMAT_24_TZ, Count } from "src/util/format";
 import { Col, Row } from "antd";
 import "antd/lib/col/style";
 import "antd/lib/row/style";
@@ -55,7 +55,8 @@ import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
 import { CircleFilled } from "../icon";
 import { createTimeScaleFromDateRange, TimeScale } from "src/timeScaleDropdown";
-import moment from "moment";
+import moment from "moment-timezone";
+import { Timestamp } from "../timestamp";
 
 const cx = classNames.bind(styles);
 const statementsPageCx = classNames.bind(statementsPageStyles);
@@ -102,8 +103,8 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
   terminateQueryRef: React.RefObject<TerminateQueryModalRef>;
 
   componentDidMount(): void {
-    this.props.refreshNodes();
     if (!this.props.isTenant) {
+      this.props.refreshNodes();
       this.props.refreshNodesLiveness();
     }
     this.props.refreshSessions();
@@ -283,7 +284,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
               <SummaryCard className={cx("summary-card")}>
                 <SummaryCardItem
                   label={"Transaction Start Time"}
-                  value={start.format(DATE_FORMAT)}
+                  value={<Timestamp time={start} format={DATE_FORMAT_24_TZ} />}
                 />
                 <SummaryCardItem
                   label={"Number of Statements Executed"}
@@ -339,7 +340,12 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
               <Col className="gutter-row" span={10}>
                 <SummaryCardItem
                   label={"Execution Start Time"}
-                  value={TimestampToMoment(stmt.start).format(DATE_FORMAT)}
+                  value={
+                    <Timestamp
+                      time={TimestampToMoment(stmt.start)}
+                      format={DATE_FORMAT_24_TZ}
+                    />
+                  }
                   className={cx("details-item")}
                 />
               </Col>
@@ -364,12 +370,22 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
             <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
                 label="Session Start Time"
-                value={TimestampToMoment(session.start).format(DATE_FORMAT)}
+                value={
+                  <Timestamp
+                    time={TimestampToMoment(session.start)}
+                    format={DATE_FORMAT_24_TZ}
+                  />
+                }
               />
               {session.end && (
                 <SummaryCardItem
                   label={"Session End Time"}
-                  value={TimestampToMoment(session.end).format(DATE_FORMAT)}
+                  value={
+                    <Timestamp
+                      time={TimestampToMoment(session.end)}
+                      format={DATE_FORMAT_24_TZ}
+                    />
+                  }
                 />
               )}
               <SummaryCardItem

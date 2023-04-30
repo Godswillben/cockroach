@@ -69,21 +69,23 @@ func registerLOQRecovery(r registry.Registry) {
 	} {
 		testSpec := s
 		r.Add(registry.TestSpec{
-			Name:              s.testName(""),
-			Owner:             registry.OwnerReplication,
-			Tags:              []string{`default`},
-			Cluster:           spec,
-			NonReleaseBlocker: true,
+			Name:                s.testName(""),
+			Owner:               registry.OwnerReplication,
+			Tags:                registry.Tags(`default`),
+			Cluster:             spec,
+			SkipPostValidations: registry.PostValidationInvalidDescriptors | registry.PostValidationNoDeadNodes,
+			NonReleaseBlocker:   true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runRecoverLossOfQuorum(ctx, t, c, testSpec)
 			},
 		})
 		r.Add(registry.TestSpec{
-			Name:              s.testName("half-online"),
-			Owner:             registry.OwnerReplication,
-			Tags:              []string{`default`},
-			Cluster:           spec,
-			NonReleaseBlocker: true,
+			Name:                s.testName("half-online"),
+			Owner:               registry.OwnerReplication,
+			Tags:                registry.Tags(`default`),
+			Cluster:             spec,
+			SkipPostValidations: registry.PostValidationInvalidDescriptors | registry.PostValidationNoDeadNodes,
+			NonReleaseBlocker:   true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runHalfOnlineRecoverLossOfQuorum(ctx, t, c, testSpec)
 			},
@@ -165,7 +167,9 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 	workloadHistogramFile := "restored.json"
 
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	settings := install.MakeClusterSettings()
+	settings := install.MakeClusterSettings(install.EnvOption([]string{
+		"COCKROACH_MIN_RANGE_MAX_BYTES=1",
+	}))
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, nodes)
 
 	// Cleanup stale files generated during recovery. We do this for the case
@@ -264,7 +268,10 @@ func runRecoverLossOfQuorum(ctx context.Context, t test.Test, c cluster.Cluster,
 					if ctx.Err() != nil {
 						return &recoveryImpossibleError{testOutcome: restartFailed}
 					}
-					db, err = c.ConnE(ctx, t.L(), 1)
+					// Note that conn doesn't actually connect, it just creates driver
+					// and prepares URL. Actual connection is done when statement is
+					// being executed.
+					db, err = c.ConnE(ctx, t.L(), 1, option.ConnectTimeout(15*time.Second))
 					if err == nil {
 						break
 					}
@@ -378,7 +385,9 @@ func runHalfOnlineRecoverLossOfQuorum(
 	workloadHistogramFile := "restored.json"
 
 	c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	settings := install.MakeClusterSettings()
+	settings := install.MakeClusterSettings(install.EnvOption([]string{
+		"COCKROACH_MIN_RANGE_MAX_BYTES=1",
+	}))
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, nodes)
 
 	// Cleanup stale files generated during recovery. We do this for the case
@@ -485,7 +494,7 @@ func runHalfOnlineRecoverLossOfQuorum(
 					if ctx.Err() != nil {
 						return &recoveryImpossibleError{testOutcome: restartFailed}
 					}
-					db, err = c.ConnE(ctx, t.L(), remaining[len(remaining)-1])
+					db, err = c.ConnE(ctx, t.L(), remaining[len(remaining)-1], option.ConnectTimeout(15*time.Second))
 					if err == nil {
 						break
 					}

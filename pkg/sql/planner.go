@@ -40,6 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -52,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
@@ -114,7 +117,9 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.Settings = execCfg.Settings
 	evalCtx.Codec = execCfg.Codec
 	evalCtx.Tracer = execCfg.AmbientCtx.Tracer
-	evalCtx.SQLLivenessReader = execCfg.SQLLiveness
+	if execCfg.SQLLiveness != nil { // nil in some tests
+		evalCtx.SQLLivenessReader = execCfg.SQLLiveness.CachedReader()
+	}
 	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
 	evalCtx.SetCompactionConcurrency = execCfg.CompactionConcurrencyFunc
 	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
@@ -122,6 +127,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	evalCtx.NodeID = execCfg.NodeInfo.NodeID
 	evalCtx.Locality = execCfg.Locality
+	evalCtx.OriginalLocality = execCfg.Locality
 	evalCtx.NodesStatusServer = execCfg.NodesStatusServer
 	evalCtx.TenantStatusServer = execCfg.TenantStatusServer
 	evalCtx.SQLStatusServer = execCfg.SQLStatusServer
@@ -171,10 +177,35 @@ type planner struct {
 	// a SQL session.
 	isInternalPlanner bool
 
+	atomic struct {
+		// innerPlansMustUseLeafTxn is set to 1 if the "outer" plan is using
+		// the LeafTxn forcing the "inner" plans to use the LeafTxns too. An
+		// example of this is apply-join iterations when the main query has
+		// concurrency.
+		//
+		// Note that even though the planner is not safe for concurrent usage,
+		// the "outer" plan modifies this field _before_ the "inner" plans start
+		// or _after_ the "inner" plans finish, so we could have avoided the
+		// usage of an atomic here, but we choose to be defensive about it.
+		// TODO(yuzefovich): this is a bit hacky. The problem is that the
+		// incorrect txn on the planner has already been captured by the
+		// planNodeToRowSource adapter before the "outer" query figured out that
+		// it must use the LeafTxn. Solving that issue properly is not trivial
+		// and is tracked in #41992.
+		innerPlansMustUseLeafTxn uint32
+	}
+
 	monitor *mon.BytesMonitor
 
 	// Corresponding Statement for this query.
 	stmt Statement
+
+	// StmtWithHomeRegionEnforced, if non-nil is the SQL statement for which a
+	// home region is being enforced.
+	StmtNoConstantsWithHomeRegionEnforced string
+
+	// pausablePortal is set when the query is from a pausable portal.
+	pausablePortal *PreparedPortal
 
 	instrumentation instrumentationHelper
 
@@ -233,6 +264,31 @@ type planner struct {
 
 	// evalCatalogBuiltins is used as part of the eval.Context.
 	evalCatalogBuiltins evalcatalog.Builtins
+
+	// trackDependency is used to track circular dependencies when dropping views.
+	trackDependency map[catid.DescID]bool
+}
+
+// hasFlowForPausablePortal returns true if the planner is for re-executing a
+// portal. We reuse the flow stored in p.pausablePortal.pauseInfo.
+func (p *planner) hasFlowForPausablePortal() bool {
+	return p.pausablePortal != nil && p.pausablePortal.pauseInfo != nil && p.pausablePortal.pauseInfo.resumableFlow.flow != nil
+}
+
+// resumeFlowForPausablePortal is called when re-executing a portal. We reuse
+// the flow with a new receiver, without re-generating the physical plan.
+func (p *planner) resumeFlowForPausablePortal(recv *DistSQLReceiver) error {
+	if !p.hasFlowForPausablePortal() {
+		return errors.AssertionFailedf("no flow found for pausable portal")
+	}
+	recv.discardRows = p.instrumentation.ShouldDiscardRows()
+	recv.outputTypes = p.pausablePortal.pauseInfo.resumableFlow.outputTypes
+	flow := p.pausablePortal.pauseInfo.resumableFlow.flow
+	finishedSetupFn, cleanup := getFinishedSetupFn(p)
+	finishedSetupFn(flow)
+	defer cleanup()
+	flow.Resume(recv)
+	return recv.commErr
 }
 
 func (evalCtx *extendedEvalContext) setSessionID(sessionID clusterunique.ID) {
@@ -270,7 +326,7 @@ func NewInternalPlanner(
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
 	execCfg *ExecutorConfig,
-	sessionData sessiondatapb.SessionData,
+	sessionData *sessiondata.SessionData,
 	opts ...InternalPlannerParamsOption,
 ) (interface{}, func()) {
 	return newInternalPlanner(opName, txn, user, memMetrics, execCfg, sessionData, opts...)
@@ -291,7 +347,7 @@ func newInternalPlanner(
 	user username.SQLUsername,
 	memMetrics *MemoryMetrics,
 	execCfg *ExecutorConfig,
-	sessionData sessiondatapb.SessionData,
+	sd *sessiondata.SessionData,
 	opts ...InternalPlannerParamsOption,
 ) (*planner, func()) {
 	// Default parameters which may be override by the supplied options.
@@ -310,19 +366,14 @@ func newInternalPlanner(
 	// suitable contexts.
 	ctx := logtags.AddTag(context.Background(), opName, "")
 
-	sd := &sessiondata.SessionData{
-		SessionData:   sessionData,
-		SearchPath:    sessiondata.DefaultSearchPathForUser(user),
-		SequenceState: sessiondata.NewSequenceState(),
-		Location:      time.UTC,
-	}
+	sd = sd.Clone()
 	if sd.SessionData.Database == "" {
 		sd.SessionData.Database = "system"
 	}
 	sd.SessionData.UserProto = user.EncodeProto()
 	sd.SessionData.Internal = true
+	sd.SearchPath = sessiondata.DefaultSearchPathForUser(user)
 	sds := sessiondata.NewStack(sd)
-
 	if params.collection == nil {
 		dsdp := catsessiondata.NewDescriptorSessionDataStackProvider(sds)
 		params.collection = execCfg.CollectionFactory.NewCollection(
@@ -384,10 +435,12 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Regions = p
 	p.extendedEvalCtx.JoinTokenCreator = p
 	p.extendedEvalCtx.Gossip = p
+	p.extendedEvalCtx.JobsProfiler = p
 	p.extendedEvalCtx.ClusterID = execCfg.NodeInfo.LogicalClusterID()
 	p.extendedEvalCtx.ClusterName = execCfg.RPCContext.ClusterName()
 	p.extendedEvalCtx.NodeID = execCfg.NodeInfo.NodeID
 	p.extendedEvalCtx.Locality = execCfg.Locality
+	p.extendedEvalCtx.OriginalLocality = execCfg.Locality
 
 	p.sessionDataMutatorIterator = smi
 	p.autoCommit = false
@@ -572,6 +625,14 @@ func (p *planner) InternalSQLTxn() descs.Txn {
 		p.internalSQLTxn.init(p.txn, ie)
 	}
 	return &p.internalSQLTxn
+}
+
+func (p *planner) regionsProvider() *regions.Provider {
+	if txn := p.InternalSQLTxn(); txn != nil {
+		_ = txn.Regions() // force initialization
+		return p.internalSQLTxn.extraTxnState.regionsProvider
+	}
+	return nil
 }
 
 func (p *planner) User() username.SQLUsername {
@@ -822,6 +883,7 @@ func (p *planner) resetPlanner(
 	p.evalCatalogBuiltins.Init(p.execCfg.Codec, txn, p.Descriptors())
 	p.skipDescriptorCache = false
 	p.typeResolutionDbID = descpb.InvalidID
+	p.pausablePortal = nil
 }
 
 // GetReplicationStreamManager returns a ReplicationStreamManager.
@@ -838,12 +900,11 @@ func (p *planner) GetStreamIngestManager(ctx context.Context) (eval.StreamIngest
 
 // SpanStats returns a stats for the given span of keys.
 func (p *planner) SpanStats(
-	ctx context.Context, startKey roachpb.RKey, endKey roachpb.RKey,
+	ctx context.Context, spans roachpb.Spans,
 ) (*roachpb.SpanStatsResponse, error) {
 	req := &roachpb.SpanStatsRequest{
-		NodeID:   "0",
-		StartKey: startKey,
-		EndKey:   endKey,
+		NodeID: "0",
+		Spans:  spans,
 	}
 	return p.ExecCfg().TenantStatusServer.SpanStats(ctx, req)
 }
@@ -877,4 +938,13 @@ func (p *planner) GetDetailsForSpanStats(
 		query,
 		args...,
 	)
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (p *planner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
+	if len(p.SemaCtx().Annotations) > int(numAnnotations) {
+		return
+	}
+	p.SemaCtx().Annotations = tree.MakeAnnotations(numAnnotations)
+	p.ExtendedEvalContext().Annotations = &p.SemaCtx().Annotations
 }

@@ -104,6 +104,7 @@ type Smither struct {
 	disableInsertSelect        bool
 	disableDivision            bool
 	disableDecimals            bool
+	disableUDFs                bool
 
 	bulkSrv     *httptest.Server
 	bulkFiles   map[string][]byte
@@ -264,6 +265,11 @@ func (o option) Apply(s *Smither) {
 	o.apply(s)
 }
 
+// DisableEverything disables every kind of statement.
+var DisableEverything = simpleOption("disable every kind of statement", func(s *Smither) {
+	s.stmtWeights = nil
+})
+
 // DisableMutations causes the Smither to not emit statements that could
 // mutate any on-disk data.
 var DisableMutations = simpleOption("disable mutations", func(s *Smither) {
@@ -312,6 +318,17 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 		{2, makeRollbackToSavepoint},
 		{2, makeCommit},
 		{2, makeRollback},
+	}
+})
+
+// OnlySingleDMLs causes the Smither to only emit single-statement DML (SELECT,
+// INSERT, UPDATE, DELETE).
+var OnlySingleDMLs = simpleOption("only single DMLs", func(s *Smither) {
+	s.stmtWeights = []statementWeight{
+		{20, makeSelect},
+		{5, makeInsert},
+		{5, makeUpdate},
+		{1, makeDelete},
 	}
 })
 
@@ -487,6 +504,11 @@ var DisableDivision = simpleOption("disable division", func(s *Smither) {
 // DisableDecimals disables use of decimal type columns in the query.
 var DisableDecimals = simpleOption("disable decimals", func(s *Smither) {
 	s.disableDecimals = true
+})
+
+// DisableUDFs causes the Smither to disable user-defined functions.
+var DisableUDFs = simpleOption("disable udfs", func(s *Smither) {
+	s.disableUDFs = true
 })
 
 // CompareMode causes the Smither to generate statements that have

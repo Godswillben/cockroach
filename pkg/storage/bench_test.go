@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/stretchr/testify/require"
 )
@@ -1267,7 +1268,7 @@ func runClearRange(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		batch := eng.NewUnindexedBatch(false /* writeOnly */)
+		batch := eng.NewUnindexedBatch()
 		if err := clearRange(eng, batch, MVCCKey{Key: keys.LocalMax}, MVCCKeyMax); err != nil {
 			b.Fatal(err)
 		}
@@ -1486,7 +1487,7 @@ func runBatchApplyBatchRepr(
 			})
 		}
 
-		batch := eng.NewUnindexedBatch(true /* writeOnly */)
+		batch := eng.NewWriteBatch()
 		defer batch.Close() // NB: hold open so batch.Repr() doesn't get reused
 
 		for i := 0; i < batchSize; i++ {
@@ -1503,9 +1504,9 @@ func runBatchApplyBatchRepr(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		var batch Batch
+		var batch WriteBatch
 		if !indexed {
-			batch = eng.NewUnindexedBatch(true /* writeOnly */)
+			batch = eng.NewWriteBatch()
 		} else {
 			batch = eng.NewBatch()
 		}
@@ -1721,7 +1722,7 @@ func runCheckSSTConflicts(
 	// between the engine keys without colliding.
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
+	sstFile := &MemObject{}
 	sstWriter := MakeIngestionSSTWriter(ctx, st, sstFile)
 	var sstStart, sstEnd MVCCKey
 	lastKeyNum := -1
@@ -1762,7 +1763,7 @@ func runSSTIterator(b *testing.B, numKeys int, verify bool) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	sstFile := &MemFile{}
+	sstFile := &MemObject{}
 	sstWriter := MakeIngestionSSTWriter(ctx, st, sstFile)
 
 	for i := 0; i < numKeys; i++ {
@@ -1932,7 +1933,7 @@ func BenchmarkMVCCScannerWithIntentsAndVersions(b *testing.B) {
 		// files.
 		format := sstable.TableFormatPebblev2
 		opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
-		writer := sstable.NewWriter(sstFile, opts)
+		writer := sstable.NewWriter(objstorageprovider.NewFileWritable(sstFile), opts)
 		for _, kv := range kvPairs {
 			require.NoError(b, writer.Add(
 				pebble.InternalKey{UserKey: kv.key, Trailer: uint64(kv.kind)}, kv.value))

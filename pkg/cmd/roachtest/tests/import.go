@@ -22,12 +22,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 )
 
@@ -124,9 +126,9 @@ func registerImportTPCC(r registry.Registry) {
 
 		t.Status("running workload")
 		m := c.NewMonitor(ctx)
-		dul := NewDiskUsageLogger(t, c)
+		dul := roachtestutil.NewDiskUsageLogger(t, c)
 		m.Go(dul.Runner)
-		hc := NewHealthChecker(t, c, c.All())
+		hc := roachtestutil.NewHealthChecker(t, c, c.All())
 		m.Go(hc.Runner)
 
 		tick, perfBuf := initBulkJobPerfArtifacts(testName, timeout)
@@ -243,9 +245,9 @@ func registerImportTPCH(r registry.Registry) {
 					t.Fatal(err)
 				}
 				m := c.NewMonitor(ctx)
-				dul := NewDiskUsageLogger(t, c)
+				dul := roachtestutil.NewDiskUsageLogger(t, c)
 				m.Go(dul.Runner)
-				hc := NewHealthChecker(t, c, c.All())
+				hc := roachtestutil.NewHealthChecker(t, c, c.All())
 				m.Go(hc.Runner)
 
 				// TODO(peter): This currently causes the test to fail because we see a
@@ -354,7 +356,7 @@ func registerImportMixedVersion(r registry.Registry) {
 			if c.IsLocal() && runtime.GOARCH == "arm64" {
 				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
 			}
-			predV, err := clusterupgrade.PredecessorVersion(*t.BuildVersion())
+			predV, err := version.PredecessorVersion(*t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}

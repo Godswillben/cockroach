@@ -48,9 +48,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -108,10 +111,6 @@ func nonTableDescriptorRangeCount() int64 {
 		keys.TenantsRangesID,
 	}))
 }
-
-// apiServerMessage is the standard body for all HTTP 500 responses.
-var errAdminAPIError = grpcstatus.Errorf(codes.Internal, "An internal server error "+
-	"has occurred. Please check your CockroachDB logs for more details.")
 
 // A adminServer provides a RESTful HTTP API to administration of
 // the cockroach cluster.
@@ -298,7 +297,15 @@ func (s *adminServer) RegisterGateway(
 			http.Error(w, "invalid id", http.StatusBadRequest)
 			return
 		}
-		s.getStatementBundle(ctx, id, w)
+		// Add default user when running in Insecure mode because we don't
+		// retrieve the user from gRPC metadata (which falls back to `root`)
+		// but from HTTP metadata (which does not).
+		if s.sqlServer.cfg.Insecure {
+			ctx := req.Context()
+			ctx = context.WithValue(ctx, webSessionUserKey{}, username.RootUser)
+			req = req.WithContext(ctx)
+		}
+		s.getStatementBundle(req.Context(), id, w)
 	})
 
 	// Register the endpoints defined in the proto.
@@ -309,14 +316,30 @@ func (s *adminServer) RegisterGateway(
 // the RPC endpoint method.
 func serverError(ctx context.Context, err error) error {
 	log.ErrorfDepth(ctx, 1, "%+v", err)
-	return errAdminAPIError
+
+	// Include the PGCode in the message for easier troubleshooting
+	errCode := pgerror.GetPGCode(err).String()
+	if errCode != pgcode.Uncategorized.String() {
+		errMessage := fmt.Sprintf("%s Error Code: %s", errAPIInternalErrorString, errCode)
+		return grpcstatus.Errorf(codes.Internal, errMessage)
+	}
+
+	// The error is already grpcstatus formatted error.
+	// Likely calling serverError multiple times on same error.
+	grpcCode := grpcstatus.Code(err)
+	if grpcCode != codes.Unknown {
+		return err
+	}
+
+	// Fallback to generic message
+	return errAPIInternalError
 }
 
 // serverErrorf logs the provided error and returns an error that should be returned by
 // the RPC endpoint method.
 func serverErrorf(ctx context.Context, format string, args ...interface{}) error {
 	log.ErrorfDepth(ctx, 1, format, args...)
-	return errAdminAPIError
+	return errAPIInternalError
 }
 
 // isNotFoundError returns true if err is a table/database not found error.
@@ -344,7 +367,7 @@ func (s *adminServer) ChartCatalog(
 ) (*serverpb.ChartCatalogResponse, error) {
 	metricsMetadata := s.metricsRecorder.GetMetricsMetadata()
 
-	chartCatalog, err := catalog.GenerateCatalog(metricsMetadata, false /* strict */)
+	chartCatalog, err := catalog.GenerateCatalog(metricsMetadata)
 	if err != nil {
 		return nil, serverError(ctx, err)
 	}
@@ -1032,11 +1055,50 @@ func (s *adminServer) tableDetailsHelper(
 	}
 
 	// MVCC Garbage result.
-	row, cols, err = s.internalExecutor.QueryRowExWithCols(
-		ctx, "admin-show-mvcc-garbage-info", nil,
-		sessiondata.InternalExecutorOverride{User: userName},
-		fmt.Sprintf(
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	if deprecatedshowranges.ShowRangesDeprecatedBehaviorSetting.Get(&s.st.SV) {
+		// NOTE: this query is deprecated. See the "else" branch below for
+		// the current code.
+		//
+		// This query is unable to handle table names with a schema qualification.
+		// If a user complains about this, tell them to opt out of the deprecated
+		// SHOW RANGES behavior, which will enable the proper semantics below.
+		tbName := strings.TrimPrefix(req.Table, "public.")
+		row, cols, err = s.internalExecutor.QueryRowExWithCols(
+			ctx, "admin-show-mvcc-garbage-info", nil,
+			sessiondata.InternalExecutorOverride{User: userName},
 			`WITH
+			range_stats AS (
+				SELECT crdb_internal.range_stats(start_key) AS d
+				FROM crdb_internal.ranges_no_leases WHERE database_name = $1 AND table_name = $2
+			),
+			aggregated AS (
+				SELECT
+					sum((d->>'live_bytes')::INT8) AS live,
+					sum(
+						(d->>'key_bytes')::INT8 + 
+						(d->>'val_bytes')::INT8 + 
+						COALESCE((d->>'range_key_bytes')::INT8, 0) +
+						COALESCE((d->>'range_val_bytes')::INT8, 0) +
+						(d->>'sys_bytes')::INT8) AS total
+				FROM
+					range_stats
+			)
+			SELECT
+				COALESCE(total, 0)::INT8 as total_bytes,
+				COALESCE(live, 0)::INT8 as live_bytes,
+				COALESCE(live / NULLIF(total,0), 0)::FLOAT8 as live_percentage
+			FROM aggregated`,
+			req.Database, tbName,
+		)
+	} else {
+		row, cols, err = s.internalExecutor.QueryRowExWithCols(
+			ctx, "admin-show-mvcc-garbage-info", nil,
+			sessiondata.InternalExecutorOverride{User: userName},
+			fmt.Sprintf(
+				`WITH
 			range_stats AS (
 				SELECT crdb_internal.range_stats(raw_start_key) AS d
 				FROM [SHOW RANGES FROM TABLE %s WITH KEYS]
@@ -1058,8 +1120,9 @@ func (s *adminServer) tableDetailsHelper(
 				COALESCE(live, 0)::INT8 as live_bytes,
 				COALESCE(live / NULLIF(total,0), 0)::FLOAT8 as live_percentage
 			FROM aggregated`,
-			escQualTable),
-	)
+				escQualTable),
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1359,9 +1422,8 @@ func (s *adminServer) statsForSpan(
 						if err == nil {
 							client := serverpb.NewStatusClient(conn)
 							req := roachpb.SpanStatsRequest{
-								StartKey: rSpan.Key,
-								EndKey:   rSpan.EndKey,
-								NodeID:   nodeID.String(),
+								Spans:  []roachpb.Span{span},
+								NodeID: nodeID.String(),
 							}
 							spanResponse, err = client.SpanStats(ctx, &req)
 						}
@@ -1396,9 +1458,9 @@ func (s *adminServer) statsForSpan(
 					},
 				)
 			} else {
-				tableStatResponse.Stats.Add(resp.resp.TotalStats)
-				tableStatResponse.ReplicaCount += int64(resp.resp.RangeCount)
-				tableStatResponse.ApproximateDiskBytes += resp.resp.ApproximateDiskBytes
+				tableStatResponse.Stats.Add(resp.resp.SpanToStats[span.String()].TotalStats)
+				tableStatResponse.ReplicaCount += int64(resp.resp.SpanToStats[span.String()].RangeCount)
+				tableStatResponse.ApproximateDiskBytes += resp.resp.SpanToStats[span.String()].ApproximateDiskBytes
 			}
 		case <-ctx.Done():
 			// Caller gave up, stop doing work.
@@ -1954,18 +2016,16 @@ func (s *adminServer) Settings(
 		return nil, serverError(ctx, err)
 	}
 
-	var lookupPurpose settings.LookupPurpose
+	redactValues := true
 	if isAdmin {
 		// Root accesses can customize the purpose.
 		// This is used by the UI to see all values (local access)
 		// and `cockroach zip` to redact the values (telemetry).
-		lookupPurpose = settings.LookupForReporting
 		if req.UnredactedValues {
-			lookupPurpose = settings.LookupForLocalAccess
+			redactValues = false
 		}
 	} else {
 		// Non-root access cannot see the values in any case.
-		lookupPurpose = settings.LookupForReporting
 		if err := s.adminPrivilegeChecker.requireViewClusterSettingOrModifyClusterSettingPermission(ctx); err != nil {
 			return nil, err
 		}
@@ -1998,7 +2058,13 @@ func (s *adminServer) Settings(
 
 	resp := serverpb.SettingsResponse{KeyValues: make(map[string]serverpb.SettingsResponse_Value)}
 	for _, k := range keys {
-		v, ok := settings.Lookup(k, lookupPurpose, settings.ForSystemTenant)
+		var v settings.Setting
+		var ok bool
+		if redactValues {
+			v, ok = settings.LookupForReporting(k, settings.ForSystemTenant)
+		} else {
+			v, ok = settings.LookupForLocalAccess(k, settings.ForSystemTenant)
+		}
 		if !ok {
 			continue
 		}
@@ -2594,14 +2660,10 @@ func (s *adminServer) QueryPlan(
 // getStatementBundle retrieves the statement bundle with the given id and
 // writes it out as an attachment.
 func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.ResponseWriter) {
-	sessionUser, err := userFromIncomingRPCContext(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	sqlUsername := userFromHTTPAuthInfoContext(ctx)
 	row, err := s.internalExecutor.QueryRowEx(
 		ctx, "admin-stmt-bundle", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: sessionUser},
+		sessiondata.InternalExecutorOverride{User: sqlUsername},
 		"SELECT bundle_chunks FROM system.statement_diagnostics WHERE id=$1 AND bundle_chunks IS NOT NULL",
 		id,
 	)
@@ -2620,7 +2682,7 @@ func (s *adminServer) getStatementBundle(ctx context.Context, id int64, w http.R
 	for _, chunkID := range chunkIDs {
 		chunkRow, err := s.internalExecutor.QueryRowEx(
 			ctx, "admin-stmt-bundle", nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: sessionUser},
+			sessiondata.InternalExecutorOverride{User: sqlUsername},
 			"SELECT data FROM system.statement_bundle_chunks WHERE id=$1",
 			chunkID,
 		)
@@ -2709,8 +2771,8 @@ func (s *systemAdminServer) DecommissionPreCheck(
 		}
 	}
 
-	// Evaluate readiness for each node to check based on how many ranges have
-	// replicas on the node that did not pass checks.
+	// Evaluate readiness by validating that there are no ranges with replicas on
+	// the given node(s) that did not pass checks.
 	for _, nID := range nodesToCheck {
 		numReplicas := len(results.replicasByNode[nID])
 		var readiness serverpb.DecommissionPreCheckResponse_NodeReadiness
@@ -2910,7 +2972,14 @@ func (s *systemAdminServer) Decommission(
 }
 
 // DataDistribution returns a count of replicas on each node for each table.
-func (s *adminServer) DataDistribution(
+//
+// TODO(kv): Now that we have coalesced ranges, this endpoint no longer reports
+// accurate replica counts. Furthermore, since it doesn't take coalesced ranges
+// into account, this endpoint doesn't work for secondary tenants whose ranges are
+// *always* coalesced. Update this endpoint to handle coalesced ranges and
+// implement tenant filtering, after which it can be moved back into the
+// adminServer instead of the systemAdminServer.
+func (s *systemAdminServer) DataDistribution(
 	ctx context.Context, req *serverpb.DataDistributionRequest,
 ) (_ *serverpb.DataDistributionResponse, retErr error) {
 	if err := s.requireViewClusterMetadataPermission(ctx); err != nil {
@@ -3059,6 +3128,17 @@ func (s *adminServer) dataDistributionHelper(
 			_, tenID, err := keys.DecodeTenantPrefix(rangeDesc.StartKey.AsRawKey())
 			if err != nil {
 				return err
+			}
+
+			// A range descriptor for a secondary tenant may not contain
+			// a table prefix. Often, the start key for a tenant will be just
+			// the tenant prefix itself, e.g. `/Tenant/2`. Once the tenant prefix
+			// is stripped inside `DecodeTablePrefix`, nothing (aka `/Min`) is left.
+			keySansPrefix, _ := keys.MakeSQLCodec(tenID).StripTenantPrefix(rangeDesc.StartKey.AsRawKey())
+			if keys.MinKey.Equal(keySansPrefix) {
+				// There's no table prefix to be decoded.
+				// Try the next descriptor.
+				continue
 			}
 			_, tableID, err := keys.MakeSQLCodec(tenID).DecodeTablePrefix(rangeDesc.StartKey.AsRawKey())
 			if err != nil {
@@ -4091,13 +4171,24 @@ func (s *adminServer) ListTracingSnapshots(
 	}
 
 	snapshotInfo := s.sqlServer.cfg.Tracer.GetSnapshots()
-	snapshots := make([]*serverpb.SnapshotInfo, len(snapshotInfo))
+	autoSnapshotInfo := s.sqlServer.cfg.Tracer.GetAutomaticSnapshots()
+	snapshots := make([]*serverpb.SnapshotInfo, 0, len(snapshotInfo)+len(autoSnapshotInfo))
 	for i := range snapshotInfo {
 		si := snapshotInfo[i]
-		snapshots[i] = &serverpb.SnapshotInfo{
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
 			SnapshotID: int64(si.ID),
 			CapturedAt: &si.CapturedAt,
-		}
+		})
+	}
+	for i := range autoSnapshotInfo {
+		si := autoSnapshotInfo[i]
+		snapshots = append(snapshots, &serverpb.SnapshotInfo{
+			// Flip the IDs of automatic snapshots to negative so we can tell when the
+			// client asks for one of these that we should look for it in the auto
+			// snapshots not the regular ones.
+			SnapshotID: int64(si.ID * -1),
+			CapturedAt: &si.CapturedAt,
+		})
 	}
 	resp := &serverpb.ListTracingSnapshotsResponse{
 		Snapshots: snapshots,
@@ -4163,7 +4254,14 @@ func (s *adminServer) GetTracingSnapshot(
 
 	id := tracing.SnapshotID(req.SnapshotId)
 	tr := s.sqlServer.cfg.Tracer
-	snapshot, err := tr.GetSnapshot(id)
+	var snapshot tracing.SpansSnapshot
+	// If the ID is negative it indicates it is an automatic snapshot, so flip it
+	// back to positive and fetch it from the automatic API instead.
+	if id < 0 {
+		snapshot, err = tr.GetAutomaticSnapshot(id * -1)
+	} else {
+		snapshot, err = tr.GetSnapshot(id)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -4175,8 +4273,18 @@ func (s *adminServer) GetTracingSnapshot(
 
 	for i, s := range spansList.Spans {
 		tags := make([]*serverpb.SpanTag, len(s.Tags))
-		for j, t := range s.Tags {
-			tags[j] = getSpanTag(t)
+		for j, tag := range s.Tags {
+			tags[j] = getSpanTag(tag)
+		}
+		childrenMetadata := make([]*serverpb.NamedOperationMetadata, len(s.ChildrenMetadata))
+
+		j := 0
+		for name, cm := range s.ChildrenMetadata {
+			childrenMetadata[j] = &serverpb.NamedOperationMetadata{
+				Name:     name,
+				Metadata: cm,
+			}
+			j++
 		}
 
 		spans[i] = &serverpb.TracingSpan{
@@ -4189,6 +4297,7 @@ func (s *adminServer) GetTracingSnapshot(
 			ProcessedTags:        tags,
 			Current:              s.Current,
 			CurrentRecordingMode: s.CurrentRecordingMode.ToProto(),
+			ChildrenMetadata:     childrenMetadata,
 		}
 	}
 
@@ -4285,38 +4394,6 @@ func (s *adminServer) SetTraceRecordingType(
 		return nil
 	})
 	return &serverpb.SetTraceRecordingTypeResponse{}, nil
-}
-
-func (s *adminServer) RecoveryCollectReplicaInfo(
-	request *serverpb.RecoveryCollectReplicaInfoRequest,
-	server serverpb.Admin_RecoveryCollectReplicaInfoServer,
-) error {
-	return errors.AssertionFailedf("To be implemented by #93040")
-}
-
-func (s *adminServer) RecoveryCollectLocalReplicaInfo(
-	request *serverpb.RecoveryCollectLocalReplicaInfoRequest,
-	server serverpb.Admin_RecoveryCollectLocalReplicaInfoServer,
-) error {
-	return errors.AssertionFailedf("To be implemented by #93040")
-}
-
-func (s *adminServer) RecoveryStagePlan(
-	ctx context.Context, request *serverpb.RecoveryStagePlanRequest,
-) (*serverpb.RecoveryStagePlanResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93044")
-}
-
-func (s *adminServer) RecoveryNodeStatus(
-	ctx context.Context, request *serverpb.RecoveryNodeStatusRequest,
-) (*serverpb.RecoveryNodeStatusResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
-}
-
-func (s *adminServer) RecoveryVerify(
-	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
-) (*serverpb.RecoveryVerifyResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
 }
 
 // ListTenants returns a list of tenants that are served

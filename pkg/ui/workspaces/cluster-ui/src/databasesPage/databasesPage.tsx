@@ -81,10 +81,6 @@ const booleanSettingCx = classnames.bind(booleanSettingStyles);
 //       rangeCount: number;
 //       nodes: number[];
 //       nodesByRegionString: string;
-//       missingTables: { // DatabasesPageDataMissingTable[]
-//         loading: boolean;
-//         name: string;
-//       }[];
 //     }[];
 //   }
 export interface DatabasesPageData {
@@ -109,7 +105,6 @@ export interface DatabasesPageDataDatabase {
   sizeInBytes: number;
   tableCount: number;
   rangeCount: number;
-  missingTables: DatabasesPageDataMissingTable[];
   // Array of node IDs used to unambiguously filter by node and region.
   nodes?: number[];
   // String of nodes grouped by region in alphabetical order, e.g.
@@ -119,22 +114,9 @@ export interface DatabasesPageDataDatabase {
   numIndexRecommendations: number;
 }
 
-// A "missing" table is one for which we were unable to gather size and range
-// count information during the backend call to fetch DatabaseDetails. We
-// expose it here so that the component has the opportunity to try to refresh
-// those properties for the table directly.
-export interface DatabasesPageDataMissingTable {
-  // Note that we don't need a "loaded" property here because we expect
-  // the reducers supplying our properties to remove a missing table from
-  // the list once we've loaded its data.
-  loading: boolean;
-  name: string;
-}
-
 export interface DatabasesPageActions {
   refreshDatabases: () => void;
   refreshDatabaseDetails: (database: string) => void;
-  refreshTableStats: (database: string, table: string) => void;
   refreshSettings: () => void;
   refreshNodes?: () => void;
   onFilterChange?: (value: Filters) => void;
@@ -333,21 +315,10 @@ export class DatabasesPage extends React.Component<
         this.setState({ lastDetailsError: lastDetailsError });
       }
 
-      if (
-        !database.loaded &&
-        !database.loading &&
-        (database.lastError === undefined ||
-          database.lastError?.name === "GetDatabaseInfoError")
-      ) {
+      if (!database.loaded && !database.loading && !database.lastError) {
         this.props.refreshDatabaseDetails(database.name);
         return;
       }
-
-      database.missingTables.forEach(table => {
-        if (!table.loading) {
-          return this.props.refreshTableStats(database.name, table.name);
-        }
-      });
     });
   }
 
@@ -446,16 +417,16 @@ export class DatabasesPage extends React.Component<
     );
   };
 
-  // Returns a list of databses to the display based on input from the search
+  // Returns a list of databases to the display based on input from the search
   // box and the applied filters.
   filteredDatabasesData = (): DatabasesPageDataDatabase[] => {
     const { search, databases, filters, nodeRegions } = this.props;
 
     // The regions and nodes selected from the filter dropdown.
     const regionsSelected =
-      filters.regions.length > 0 ? filters.regions.split(",") : [];
+      filters.regions?.length > 0 ? filters.regions.split(",") : [];
     const nodesSelected =
-      filters.nodes.length > 0 ? filters.nodes.split(",") : [];
+      filters.nodes?.length > 0 ? filters.nodes.split(",") : [];
 
     return databases
       .filter(db => (search ? filterBySearchQuery(db, search) : true))
@@ -467,13 +438,11 @@ export class DatabasesPage extends React.Component<
         let foundNode = nodesSelected.length == 0;
 
         db.nodes?.forEach(node => {
-          if (
-            foundRegion ||
-            regionsSelected.includes(nodeRegions[node.toString()])
-          ) {
+          const n = node?.toString() || "";
+          if (foundRegion || regionsSelected.includes(nodeRegions[n])) {
             foundRegion = true;
           }
-          if (foundNode || nodesSelected.includes("n" + node.toString())) {
+          if (foundNode || nodesSelected.includes("n" + n)) {
             foundNode = true;
           }
           if (foundNode && foundRegion) return true;
@@ -605,14 +574,15 @@ export class DatabasesPage extends React.Component<
       title: (
         <Tooltip
           placement="bottom"
-          title="Index recommendations will appear if the system detects improper index usage, such as the occurrence of unused indexes. Following index recommendations may help improve query performance."
+          title="Index recommendations will appear if the system detects improper index usage, such as the
+          occurrence of unused indexes. Following index recommendations may help improve query performance."
         >
           Index Recommendations
         </Tooltip>
       ),
       cell: this.renderIndexRecommendations,
       sort: database => database.numIndexRecommendations,
-      className: cx("databases-table__col-node-regions"),
+      className: cx("databases-table__col-idx-rec"),
       name: "numIndexRecommendations",
     },
   ];
@@ -646,7 +616,7 @@ export class DatabasesPage extends React.Component<
             hideAppNames={true}
             regions={regions}
             hideTimeLabel={true}
-            nodes={nodes.map(n => "n" + n.toString())}
+            nodes={nodes.map(n => "n" + n?.toString())}
             activeFilters={activeFilters}
             filters={defaultFilters}
             onSubmitFilters={this.onSubmitFilters}
@@ -710,6 +680,7 @@ export class DatabasesPage extends React.Component<
             render={() => (
               <DatabasesSortedTable
                 className={cx("databases-table")}
+                tableWrapperClassName={cx("sorted-table")}
                 data={databasesToDisplay}
                 columns={displayColumns}
                 sortSetting={this.props.sortSetting}
@@ -761,7 +732,7 @@ export class DatabasesPage extends React.Component<
         <Pagination
           pageSize={this.state.pagination.pageSize}
           current={this.state.pagination.current}
-          total={this.props.databases.length}
+          total={databasesToDisplay.length}
           onChange={this.changePage}
         />
       </div>

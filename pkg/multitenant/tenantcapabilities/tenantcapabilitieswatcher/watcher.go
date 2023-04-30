@@ -42,11 +42,11 @@ type Watcher struct {
 	mu struct {
 		syncutil.RWMutex
 
-		store map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
+		store map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities
 	}
 }
 
-var _ tenantcapabilities.Watcher = &Watcher{}
+var _ tenantcapabilities.Reader = &Watcher{}
 
 // New constructs a new Watcher.
 func New(
@@ -70,19 +70,31 @@ func New(
 		bufferMemLimit:   bufferMemLimit,
 		knobs:            watcherKnobs,
 	}
-	w.mu.store = make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities)
+	w.mu.store = make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities)
 	return w
 }
 
 // GetCapabilities implements the tenantcapabilities.Reader interface.
 func (w *Watcher) GetCapabilities(
 	id roachpb.TenantID,
-) (tenantcapabilitiespb.TenantCapabilities, bool) {
+) (*tenantcapabilitiespb.TenantCapabilities, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
 	cp, found := w.mu.store[id]
 	return cp, found
+}
+
+// GetGlobalCapabilityState implements the tenantcapabilities.Reader interface.
+func (w *Watcher) GetGlobalCapabilityState() map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	result := make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities, len(w.mu.store))
+	for tenID, cp := range w.mu.store {
+		result[tenID] = cp
+	}
+	return result
 }
 
 // capabilityEntrySize is an estimate for a (tenantID, capability) pair that the
@@ -149,7 +161,7 @@ func (w *Watcher) handleCompleteUpdate(updates []tenantcapabilities.Update) {
 	// happens when the rangefeed is first established, or if it's restarted for
 	// some reason. Either way, we want to throw away any accumulated state so
 	// far, and reconstruct it using the result of the scan.
-	freshStore := make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities)
+	freshStore := make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities)
 	for _, up := range updates {
 		freshStore[up.TenantID] = up.TenantCapabilities
 	}

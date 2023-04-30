@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -92,8 +93,8 @@ var minWALSyncInterval = settings.RegisterDurationSetting(
 var MVCCRangeTombstonesEnabledInMixedClusters = settings.RegisterBoolSetting(
 	settings.TenantReadOnly,
 	"storage.mvcc.range_tombstones.enabled",
-	"controls the use of MVCC range tombstones in mixed version clusters; range tombstones are always on in 23.1 clusters",
-	true)
+	"controls the use of MVCC range tombstones in mixed version clusters; range tombstones are always on in finalized 23.1 clusters",
+	false)
 
 // CanUseMVCCRangeTombstones returns true if the caller can begin writing MVCC
 // range tombstones, by setting DeleteRangeRequest.UseRangeTombstone. It
@@ -1155,8 +1156,9 @@ func mvccGetWithValueHeader(
 		keyBuf:           mvccScanner.keyBuf,
 	}
 
-	var results pebbleResults
-	mvccScanner.init(opts.Txn, opts.Uncertainty, &results)
+	results := &mvccScanner.alloc.pebbleResults
+	*results = pebbleResults{}
+	mvccScanner.init(opts.Txn, opts.Uncertainty, results)
 	mvccScanner.get(ctx)
 
 	// If we're tracking the ScanStats, include the stats from this Get.
@@ -2998,6 +3000,31 @@ func MVCCDeleteRange(
 	txn *roachpb.Transaction,
 	returnKeys bool,
 ) ([]roachpb.Key, *roachpb.Span, int64, error) {
+	// Scan to find the keys to delete.
+	//
+	// For a versioned delete range, scan at the request timestamp and with the
+	// FailOnMoreRecent option set to true. Doing so returns all non-tombstoned
+	// keys at or below the request timestamp and throws a WriteTooOld error on
+	// any key (mvcc tombstone or otherwise) above the request timestamp. This is
+	// different from scanning at MaxTimestamp and deferring write-write conflict
+	// checking to mvccPutInternal below. That approach ignores mvcc tombstones
+	// above the request timestamp, which could lead to serializability anomalies
+	// (see #56458).
+	//
+	// For an inline delete range, scan at MaxTimestamp. Doing so is not needed to
+	// retrieve inline values, but it ensures that all non-inline values are also
+	// returned. It is incompatible to mix an inline delete range with mvcc
+	// versions, so we want to pass these incompatible keys to mvccPutInternal to
+	// detect the condition and return an error. We also scan with the
+	// FailOnMoreRecent set to false. This is not strictly necessary (nothing is
+	// more recent than MaxTimestamp), but it provides added protection against
+	// the scan returning a WriteTooOld error.
+	scanTs := timestamp
+	failOnMoreRecent := true
+	if timestamp.IsEmpty() /* inline */ {
+		scanTs = hlc.MaxTimestamp
+		failOnMoreRecent = false
+	}
 	// In order for this operation to be idempotent when run transactionally, we
 	// need to perform the initial scan at the previous sequence number so that
 	// we don't see the result from equal or later sequences.
@@ -3007,8 +3034,8 @@ func MVCCDeleteRange(
 		prevSeqTxn.Sequence--
 		scanTxn = prevSeqTxn
 	}
-	res, err := MVCCScan(ctx, rw, key, endKey, timestamp, MVCCScanOptions{
-		FailOnMoreRecent: true, Txn: scanTxn, MaxKeys: max,
+	res, err := MVCCScan(ctx, rw, key, endKey, scanTs, MVCCScanOptions{
+		FailOnMoreRecent: failOnMoreRecent, Txn: scanTxn, MaxKeys: max,
 	})
 	if err != nil {
 		return nil, nil, 0, err
@@ -3664,32 +3691,31 @@ func recordIteratorStats(iter MVCCIterator, scanStats *kvpb.ScanStats) {
 // If ok=false is returned, then the returned result and the error are the
 // result of the scan.
 func mvccScanInit(
+	mvccScanner *pebbleMVCCScanner,
 	iter MVCCIterator,
 	key, endKey roachpb.Key,
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 	results results,
-) (ok bool, _ *pebbleMVCCScanner, _ MVCCScanResult, _ error) {
+) (ok bool, _ MVCCScanResult, _ error) {
 	if len(endKey) == 0 {
-		return false, nil, MVCCScanResult{}, emptyKeyError()
+		return false, MVCCScanResult{}, emptyKeyError()
 	}
 	if err := opts.validate(); err != nil {
-		return false, nil, MVCCScanResult{}, err
+		return false, MVCCScanResult{}, err
 	}
 	if opts.MaxKeys < 0 {
-		return false, nil, MVCCScanResult{
+		return false, MVCCScanResult{
 			ResumeSpan:   &roachpb.Span{Key: key, EndKey: endKey},
 			ResumeReason: kvpb.RESUME_KEY_LIMIT,
 		}, nil
 	}
 	if opts.TargetBytes < 0 {
-		return false, nil, MVCCScanResult{
+		return false, MVCCScanResult{
 			ResumeSpan:   &roachpb.Span{Key: key, EndKey: endKey},
 			ResumeReason: kvpb.RESUME_BYTE_LIMIT,
 		}, nil
 	}
-
-	mvccScanner := pebbleMVCCScannerPool.Get().(*pebbleMVCCScanner)
 
 	*mvccScanner = pebbleMVCCScanner{
 		parent:           iter,
@@ -3709,10 +3735,16 @@ func mvccScanInit(
 		tombstones:       opts.Tombstones,
 		failOnMoreRecent: opts.FailOnMoreRecent,
 		keyBuf:           mvccScanner.keyBuf,
+		// NB: If the `results` argument passed to this function is a pointer to
+		// mvccScanner.alloc.pebbleResults, we don't want to overwrite any
+		// initialization of the pebbleResults struct performed by the caller.
+		// The struct should not contain any stale buffers from previous uses,
+		// because pebbleMVCCScanner.release zeros it.
+		alloc: mvccScanner.alloc,
 	}
 
 	mvccScanner.init(opts.Txn, opts.Uncertainty, results)
-	return true /* ok */, mvccScanner, MVCCScanResult{}, nil
+	return true /* ok */, MVCCScanResult{}, nil
 }
 
 func mvccScanToBytes(
@@ -3722,12 +3754,14 @@ func mvccScanToBytes(
 	timestamp hlc.Timestamp,
 	opts MVCCScanOptions,
 ) (MVCCScanResult, error) {
-	var results pebbleResults
+	mvccScanner := pebbleMVCCScannerPool.Get().(*pebbleMVCCScanner)
+	results := &mvccScanner.alloc.pebbleResults
+	*results = pebbleResults{}
 	if opts.WholeRowsOfSize > 1 {
 		results.lastOffsetsEnabled = true
 		results.lastOffsets = make([]int, opts.WholeRowsOfSize)
 	}
-	ok, mvccScanner, res, err := mvccScanInit(iter, key, endKey, timestamp, opts, &results)
+	ok, res, err := mvccScanInit(mvccScanner, iter, key, endKey, timestamp, opts, results)
 	if !ok {
 		return res, err
 	}
@@ -3919,12 +3953,14 @@ func (opts *MVCCScanOptions) errOnIntents() bool {
 	return !opts.Inconsistent && !opts.SkipLocked
 }
 
-// MVCCScanResult groups the values returned from an MVCCScan operation. Depending
-// on the operation invoked, KVData or KVs is populated, but never both.
+// MVCCScanResult groups the values returned from an MVCCScan operation.
+// Depending on the operation invoked, only one of KVData, ColBatches, or KVs is
+// populated.
 type MVCCScanResult struct {
-	KVData  [][]byte
-	KVs     []roachpb.KeyValue
-	NumKeys int64
+	KVData     [][]byte
+	ColBatches []coldata.Batch
+	KVs        []roachpb.KeyValue
+	NumKeys    int64
 	// NumBytes is the number of bytes this scan result accrued in terms of the
 	// MVCCScanOptions.TargetBytes parameter. This roughly measures the bytes
 	// used for encoding the uncompressed kv pairs contained in the result.
@@ -5041,7 +5077,7 @@ func MVCCResolveWriteIntentRange(
 		mvccIter = rw.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
 	} else {
 		// For correctness, we need mvccIter to be consistent with engineIter.
-		mvccIter = newPebbleIteratorByCloning(engineIter.GetRawIter(), iterOpts, StandardDurability)
+		mvccIter = newPebbleIteratorByCloning(engineIter.CloneContext(), iterOpts, StandardDurability)
 	}
 	iterAndBuf := GetBufUsingIter(mvccIter)
 	defer func() {
@@ -5886,7 +5922,7 @@ func MVCCFindSplitKey(
 		if _, _, err := keys.MakeSQLCodec(tenID).DecodeTablePrefix(it.UnsafeKey().Key); err == nil {
 			// The first key in this range represents a row in a SQL table. Advance the
 			// minSplitKey past this row to avoid the problems described above.
-			firstRowKey, err := keys.EnsureSafeSplitKey(it.Key().Key)
+			firstRowKey, err := keys.EnsureSafeSplitKey(it.UnsafeKey().Key.Clone())
 			if err != nil {
 				return nil, err
 			}
@@ -5897,7 +5933,7 @@ func MVCCFindSplitKey(
 	if minSplitKey == nil {
 		// The first key in the range does not represent a row in a SQL table.
 		// Allow a split at any key that sorts after it.
-		minSplitKey = it.Key().Key.Next()
+		minSplitKey = it.UnsafeKey().Key.Clone().Next()
 	}
 
 	splitKey, err := it.FindSplitKey(key.AsRawKey(), endKey.AsRawKey(), minSplitKey, targetSize)
@@ -6432,7 +6468,7 @@ func mvccExportToWriter(
 	firstIteration := true
 	// skipTombstones controls whether we include tombstones.
 	//
-	// We want tombstones if we are exporting all reivions or if
+	// We want tombstones if we are exporting all revisions or if
 	// we have a StartTS. A non-empty StartTS is used by
 	// incremental backups and thus needs to see tombstones if
 	// that happens to be the latest value.
@@ -6441,7 +6477,10 @@ func mvccExportToWriter(
 	var rows RowCounter
 	// Only used if trackKeyBoundary is true.
 	var curKey roachpb.Key
+
 	var resumeKey MVCCKey
+	var resumeIsCPUOverLimit bool
+
 	var rangeKeys MVCCRangeKeyStack
 	var rangeKeysSize int64
 
@@ -6513,7 +6552,8 @@ func mvccExportToWriter(
 				if isNewKey {
 					resumeKey.Timestamp = hlc.Timestamp{}
 				}
-				return rows.BulkOpSummary, ExportRequestResumeInfo{ResumeKey: resumeKey, CPUOverlimit: true}, nil
+				resumeIsCPUOverLimit = true
+				break
 			}
 		}
 
@@ -6722,7 +6762,7 @@ func mvccExportToWriter(
 		rows.BulkOpSummary.DataSize += rangeKeysSize
 	}
 
-	return rows.BulkOpSummary, ExportRequestResumeInfo{ResumeKey: resumeKey}, nil
+	return rows.BulkOpSummary, ExportRequestResumeInfo{ResumeKey: resumeKey, CPUOverlimit: resumeIsCPUOverLimit}, nil
 }
 
 // MVCCExportOptions contains options for MVCCExportToSST.
@@ -6783,6 +6823,10 @@ type MVCCExportFingerprintOptions struct {
 	// If StripValueChecksum is true, checksums are removed from
 	// the value before hashing.
 	StripValueChecksum bool
+	// If StripIndexPrefixAndTimestamp is true, the key's timestamp and index
+	// prefix are not hashed. Because the index prefix is stripped, this option
+	// should only get used in the table key space.
+	StripIndexPrefixAndTimestamp bool
 }
 
 // MVCCIsSpanEmptyOptions configures the MVCCIsSpanEmpty function.

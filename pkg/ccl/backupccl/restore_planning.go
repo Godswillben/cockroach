@@ -392,12 +392,33 @@ func allocateDescriptorRewrites(
 					}
 					parentID = newParentID
 				}
-				// Check that the table name is _not_ in use.
+
+				// If we are restoring the table into an existing schema in the target
+				// database, we must ensure that the table name is _not_ in use.
 				// This would fail the CPut later anyway, but this yields a prettier error.
-				tableName := tree.NewUnqualifiedTableName(tree.Name(table.GetName()))
-				err := descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, table.GetParentSchemaID(), tableName)
-				if err != nil {
-					return err
+				//
+				// If we are restoring the table into a schema that is also being
+				// restored then we do not need to check for collisions as the backing
+				// up cluster would enforce uniqueness of table names in a schema.
+				rw, ok := descriptorRewrites[table.GetParentSchemaID()]
+				// We may not find an entry for the parent schema in our
+				// descriptorRewrites if it is a table being restored into the public
+				// schema of the system database. This public schema is a pseudo-schema
+				// i.e. it is not backed by a descriptor, hence we check for that case
+				// separately below.
+				restoringIntoExistingSchema := ok && rw.ToExisting
+				isSystemTable := table.GetParentID() == keys.SystemDatabaseID &&
+					table.GetParentSchemaID() == keys.SystemPublicSchemaID
+				if restoringIntoExistingSchema || isSystemTable {
+					schemaID := table.GetParentSchemaID()
+					if ok {
+						schemaID = rw.ID
+					}
+					tableName := tree.NewUnqualifiedTableName(tree.Name(table.GetName()))
+					err := descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, schemaID, tableName)
+					if err != nil {
+						return err
+					}
 				}
 
 				// Check privileges.
@@ -472,26 +493,41 @@ func allocateDescriptorRewrites(
 						"failed to lookup parent DB %d", errors.Safe(parentID))
 				}
 
-				// See if there is an existing type with the same name.
-				getParentSchemaID := func(typ *typedesc.Mutable) (parentSchemaID descpb.ID) {
-					parentSchemaID = typ.GetParentSchemaID()
-					// If we find UDS with same name defined in the restoring DB, use its ID instead.
-					if rewrite, ok := descriptorRewrites[parentSchemaID]; ok && rewrite.ID != 0 {
-						parentSchemaID = rewrite.ID
+				// If we are restoring the type into an existing schema in the target
+				// database, we can find the type with the same name and don't need to
+				// create it as part of the restore.
+				//
+				// If we are restoring the type into a schema that is also being
+				// restored then we need to create the type and the array type as part
+				// of the restore.
+				var desc catalog.Descriptor
+				if rewrite, ok := descriptorRewrites[typ.GetParentSchemaID()]; ok && rewrite.ToExisting {
+					var err error
+					desc, err = descs.GetDescriptorCollidingWithObjectName(
+						ctx,
+						col,
+						txn.KV(),
+						parentID,
+						rewrite.ID,
+						typ.Name,
+					)
+					if err != nil {
+						return err
 					}
-					return
+
+					if desc == nil {
+						// If we did not find a type descriptor, ensure that the
+						// corresponding array type descriptor does not exist. This is
+						// because we will create both the type and array type below.
+						arrTyp := typesByID[typ.ArrayTypeID]
+						typeName := tree.NewUnqualifiedTypeName(arrTyp.GetName())
+						err = descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, rewrite.ID, typeName)
+						if err != nil {
+							return errors.Wrapf(err, "name collision for %q's array type", typ.Name)
+						}
+					}
 				}
-				desc, err := descs.GetDescriptorCollidingWithObjectName(
-					ctx,
-					col,
-					txn.KV(),
-					parentID,
-					getParentSchemaID(typ),
-					typ.Name,
-				)
-				if err != nil {
-					return err
-				}
+
 				if desc == nil {
 					// If we didn't find a type with the same name, then mark that we
 					// need to create the type.
@@ -507,14 +543,8 @@ func allocateDescriptorRewrites(
 					// Create a rewrite entry for the type.
 					descriptorRewrites[typ.ID] = &jobspb.DescriptorRewrite{ParentID: parentID}
 
-					// Ensure that there isn't a collision with the array type name.
-					arrTyp := typesByID[typ.ArrayTypeID]
-					typeName := tree.NewUnqualifiedTypeName(arrTyp.GetName())
-					err = descs.CheckObjectNameCollision(ctx, col, txn.KV(), parentID, getParentSchemaID(typ), typeName)
-					if err != nil {
-						return errors.Wrapf(err, "name collision for %q's array type", typ.Name)
-					}
 					// Create the rewrite entry for the array type as well.
+					arrTyp := typesByID[typ.ArrayTypeID]
 					descriptorRewrites[arrTyp.ID] = &jobspb.DescriptorRewrite{ParentID: parentID}
 				} else {
 					// If there was a name collision, we'll try to see if we can remap
@@ -882,14 +912,15 @@ func resolveOptionsForRestoreJobDescription(
 	}
 
 	newOpts := tree.RestoreOptions{
-		SkipMissingFKs:            opts.SkipMissingFKs,
-		SkipMissingSequences:      opts.SkipMissingSequences,
-		SkipMissingSequenceOwners: opts.SkipMissingSequenceOwners,
-		SkipMissingViews:          opts.SkipMissingViews,
-		SkipMissingUDFs:           opts.SkipMissingUDFs,
-		Detached:                  opts.Detached,
-		SchemaOnly:                opts.SchemaOnly,
-		VerifyData:                opts.VerifyData,
+		SkipMissingFKs:                   opts.SkipMissingFKs,
+		SkipMissingSequences:             opts.SkipMissingSequences,
+		SkipMissingSequenceOwners:        opts.SkipMissingSequenceOwners,
+		SkipMissingViews:                 opts.SkipMissingViews,
+		SkipMissingUDFs:                  opts.SkipMissingUDFs,
+		Detached:                         opts.Detached,
+		SchemaOnly:                       opts.SchemaOnly,
+		VerifyData:                       opts.VerifyData,
+		UnsafeRestoreIncompatibleVersion: opts.UnsafeRestoreIncompatibleVersion,
 	}
 
 	if opts.EncryptionPassphrase != nil {
@@ -1031,11 +1062,6 @@ func restorePlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	if restoreStmt.Options.SchemaOnly &&
-		!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2Start) {
-		return nil, nil, nil, false,
-			errors.New("cannot run RESTORE with schema_only until cluster has fully upgraded to 22.2")
-	}
 	if !restoreStmt.Options.SchemaOnly && restoreStmt.Options.VerifyData {
 		return nil, nil, nil, false,
 			errors.New("to set the verify_backup_table_data option, the schema_only option must be set")
@@ -1417,6 +1443,48 @@ func checkClusterRegions(
 	return nil
 }
 
+// checkBackupManifestVersionCompatability performs various checks to ensure
+// that the manifests we are about to restore are from backups taken on a
+// version compatible with our current version.
+func checkBackupManifestVersionCompatability(
+	p sql.PlanHookState,
+	currentActiveVersion clusterversion.ClusterVersion,
+	mainBackupManifests []backuppb.BackupManifest,
+	unsafeRestoreIncompatibleVersion bool,
+) error {
+	// We support restoring a backup that was taken on a cluster with a cluster
+	// version >= the earliest binary version that we can interoperate with.
+	minimumRestoreableVersion := p.ExecCfg().Settings.Version.BinaryMinSupportedVersion()
+	for i := range mainBackupManifests {
+		v := mainBackupManifests[i].ClusterVersion
+		// This is the "cluster" version that does not change between patch releases
+		// but rather just tracks migrations run. If the backup is more migrated
+		// than this cluster, then this cluster isn't ready to restore this backup.
+		if currentActiveVersion.Less(v) {
+			return errors.Errorf("backup from version %s is newer than current version %s", v, currentActiveVersion)
+		}
+
+		// If the backup is from a version earlier than the minimum restoreable
+		// version, then we do not support restoring it. Unless, the user has
+		// explicitly run the restore with the `UNSAFE_RESTORE_INCOMPATIBLE_VERSION`
+		// option.
+		if !unsafeRestoreIncompatibleVersion && v.Less(minimumRestoreableVersion) {
+			if v.Major == 0 {
+				// This accounts for manifests that were generated on a version before
+				// the `ClusterVersion` field exists.
+				return errors.WithHint(errors.Newf("the backup is from a version older than our "+
+					"minimum restoreable version %s", minimumRestoreableVersion),
+					"refer to our documentation about restoring across versions: https://www.cockroachlabs.com/docs/v22.2/restoring-backups-across-versions.html")
+			}
+			return errors.WithHint(errors.Newf("backup from version %s is older than the "+
+				"minimum restoreable version %s", v, minimumRestoreableVersion),
+				"refer to our documentation about restoring across versions: https://www.cockroachlabs.com/docs/v22.2/restoring-backups-across-versions.html")
+		}
+	}
+
+	return nil
+}
+
 func doRestorePlan(
 	ctx context.Context,
 	restoreStmt *tree.Restore,
@@ -1592,15 +1660,9 @@ func doRestorePlan(
 	}()
 
 	currentVersion := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
-	for i := range mainBackupManifests {
-		if v := mainBackupManifests[i].ClusterVersion; v.Major != 0 {
-			// This is the "cluster" version that does not change between patches but
-			// rather just tracks migrations run. If the backup is more migrated than
-			// this cluster, then this cluster isn't ready to restore this backup.
-			if currentVersion.Less(v) {
-				return errors.Errorf("backup from version %s is newer than current version %s", v, currentVersion)
-			}
-		}
+	if err := checkBackupManifestVersionCompatability(p, currentVersion, mainBackupManifests,
+		restoreStmt.Options.UnsafeRestoreIncompatibleVersion); err != nil {
+		return err
 	}
 
 	if restoreStmt.DescriptorCoverage == tree.AllDescriptors {
@@ -1937,10 +1999,11 @@ func doRestorePlan(
 		// compatability.
 		//
 		// TODO(msbutler): Delete in 23.1
-		RestoreSystemUsers: restoreStmt.DescriptorCoverage == tree.SystemUsers,
-		PreRewriteTenantId: oldTenantID,
-		SchemaOnly:         restoreStmt.Options.SchemaOnly,
-		VerifyData:         restoreStmt.Options.VerifyData,
+		RestoreSystemUsers:  restoreStmt.DescriptorCoverage == tree.SystemUsers,
+		PreRewriteTenantId:  oldTenantID,
+		SchemaOnly:          restoreStmt.Options.SchemaOnly,
+		VerifyData:          restoreStmt.Options.VerifyData,
+		SkipLocalitiesCheck: restoreStmt.Options.SkipLocalitiesCheck,
 	}
 
 	jr := jobs.Record{

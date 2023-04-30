@@ -119,7 +119,7 @@ func newSplitQueue(store *Store, db *kv.DB) *splitQueue {
 			maxSize:              defaultQueueMaxSize,
 			maxConcurrency:       splitQueueConcurrency,
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.SplitQueueSuccesses,
 			failures:             store.metrics.SplitQueueFailures,
@@ -139,7 +139,12 @@ func shouldSplitRange(
 	shouldBackpressureWrites bool,
 	confReader spanconfig.StoreReader,
 ) (shouldQ bool, priority float64) {
-	if confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey) {
+	needsSplit, err := confReader.NeedsSplit(ctx, desc.StartKey, desc.EndKey)
+	if err != nil {
+		log.Warningf(ctx, "unable to compute NeedsSpilt (%v); skipping range %s", err, desc.RangeID)
+		return false, 0
+	}
+	if needsSplit {
 		// Set priority to 1 in the event the range is split by zone configs.
 		priority = 1
 		shouldQ = true
@@ -171,6 +176,11 @@ func shouldSplitRange(
 	return shouldQ, priority
 }
 
+func (sq *splitQueue) enabled() bool {
+	st := sq.store.ClusterSettings()
+	return kvserverbase.SplitQueueEnabled.Get(&st.SV)
+}
+
 // shouldQueue determines whether a range should be queued for
 // splitting. This is true if the range is intersected by a zone config
 // prefix or if the range's size in bytes exceeds the limit for the zone,
@@ -178,11 +188,15 @@ func shouldSplitRange(
 func (sq *splitQueue) shouldQueue(
 	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, confReader spanconfig.StoreReader,
 ) (shouldQ bool, priority float64) {
+	if !sq.enabled() {
+		return false, 0
+	}
+
 	shouldQ, priority = shouldSplitRange(ctx, repl.Desc(), repl.GetMVCCStats(),
 		repl.GetMaxBytes(), repl.shouldBackpressureWrites(), confReader)
 
 	if !shouldQ && repl.SplitByLoadEnabled() {
-		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(ctx, repl.Clock().PhysicalTime()); splitKey != nil {
+		if splitKey := repl.loadSplitKey(ctx, repl.Clock().PhysicalTime()); splitKey != nil {
 			shouldQ, priority = true, 1.0 // default priority
 		}
 	}
@@ -203,6 +217,11 @@ var _ PurgatoryError = unsplittableRangeError{}
 func (sq *splitQueue) process(
 	ctx context.Context, r *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
+	if !sq.enabled() {
+		log.VEventf(ctx, 2, "skipping split: queue has been disabled")
+		return false, nil
+	}
+
 	processed, err = sq.processAttempt(ctx, r, confReader)
 	if errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 		// ConditionFailedErrors are an expected outcome for range split
@@ -222,7 +241,11 @@ func (sq *splitQueue) processAttempt(
 ) (processed bool, err error) {
 	desc := r.Desc()
 	// First handle the case of splitting due to span config maps.
-	if splitKey := confReader.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey); splitKey != nil {
+	splitKey, err := confReader.ComputeSplitKey(ctx, desc.StartKey, desc.EndKey)
+	if err != nil {
+		return false, errors.Wrapf(err, "unable to compute split key")
+	}
+	if splitKey != nil {
 		if _, err := r.adminSplitWithDescriptor(
 			ctx,
 			kvpb.AdminSplitRequest{
@@ -262,8 +285,7 @@ func (sq *splitQueue) processAttempt(
 	}
 
 	now := r.Clock().PhysicalTime()
-	splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(ctx, now)
-	if splitByLoadKey != nil {
+	if splitByLoadKey := r.loadSplitKey(ctx, now); splitByLoadKey != nil {
 		loadStats := r.loadStats.Stats()
 		batchHandledQPS := loadStats.QueriesPerSecond
 		raftAppliedQPS := loadStats.WriteKeysPerSecond

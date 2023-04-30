@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -209,6 +209,10 @@ type TestClusterInterface interface {
 	// range is lazily split off on the first call to ScratchRange.
 	ScratchRange(t testing.TB) roachpb.Key
 
+	// ScratchRangeWithExpirationLease is like ScratchRange, but returns a system
+	// range with an expiration lease.
+	ScratchRangeWithExpirationLease(t testing.TB) roachpb.Key
+
 	// WaitForFullReplication waits until all stores in the cluster
 	// have no ranges with replication pending.
 	WaitForFullReplication() error
@@ -236,7 +240,11 @@ type TestClusterInterface interface {
 	// tenant capabilities for the specified tenant ID.
 	// Only boolean capabilities are currently supported as we wait for the
 	// specified capabilities to have a "true" value.
-	WaitForTenantCapabilities(*testing.T, roachpb.TenantID, ...tenantcapabilitiespb.TenantCapabilityName)
+	WaitForTenantCapabilities(*testing.T, roachpb.TenantID, map[tenantcapabilities.ID]string)
+
+	// ToggleReplicateQueues activates or deactivates the replication queues on all
+	// the stores on all the nodes.
+	ToggleReplicateQueues(active bool)
 }
 
 // SplitPoint describes a split point that is passed to SplitTable.

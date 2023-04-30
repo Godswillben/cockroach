@@ -704,19 +704,19 @@ func TestMergeProcessor(t *testing.T) {
 		sp := tableDesc.IndexSpan(codec, srcIndex.GetID())
 
 		output := fakeReceiver{}
-		im, err := backfill.NewIndexBackfillMerger(ctx, &flowCtx, execinfrapb.IndexBackfillMergerSpec{
+		im, err := backfill.NewIndexBackfillMerger(ctx, &flowCtx, 0 /* processorID */, execinfrapb.IndexBackfillMergerSpec{
 			Table:            tableDesc.TableDescriptor,
 			TemporaryIndexes: []descpb.IndexID{srcIndex.GetID()},
 			AddedIndexes:     []descpb.IndexID{dstIndex.GetID()},
 			Spans:            []roachpb.Span{sp},
 			SpanIdx:          []int32{0},
 			MergeTimestamp:   kvDB.Clock().Now(),
-		}, &output)
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		im.Run(ctx)
+		im.Run(ctx, &output)
 		if output.err != nil {
 			t.Fatal(output.err)
 		}

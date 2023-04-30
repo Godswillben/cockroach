@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/split"
@@ -27,7 +28,7 @@ import (
 
 // SplitByLoadEnabled wraps "kv.range_split.by_load_enabled".
 var SplitByLoadEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_split.by_load_enabled",
 	"allow automatic splits of ranges based on where load is concentrated",
 	true,
@@ -35,7 +36,7 @@ var SplitByLoadEnabled = settings.RegisterBoolSetting(
 
 // SplitByLoadQPSThreshold wraps "kv.range_split.load_qps_threshold".
 var SplitByLoadQPSThreshold = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_split.load_qps_threshold",
 	"the QPS over which, the range becomes a candidate for load based splitting",
 	2500, // 2500 req/s
@@ -53,10 +54,24 @@ var SplitByLoadQPSThreshold = settings.RegisterIntSetting(
 // measured as max ops/s for kv and resource balance for allocbench. See #96869
 // for more details.
 var SplitByLoadCPUThreshold = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_split.load_cpu_threshold",
 	"the CPU use per second over which, the range becomes a candidate for load based splitting",
 	500*time.Millisecond,
+	func(threshold time.Duration) error {
+		// We enforce a minimum because of recursive splitting that may occur if
+		// the threshold is set too low. There is a fixed CPU overhead for a
+		// replica. At the moment no split key will be produced unless there are
+		// more than 100 samples (batch requests) to that replica, however the
+		// memory overhead of tracking split keys in split/weighted_finder.go is
+		// noticeable and a finder is created after exceeding this threshold.
+		if threshold < 10*time.Millisecond {
+			return errors.Errorf(
+				"Cannot set `kv.range_split.load_cpu_threshold` less than 10ms",
+			)
+		}
+		return nil
+	},
 ).WithPublic()
 
 func (obj LBRebalancingObjective) ToSplitObjective() split.SplitObjective {
@@ -235,4 +250,47 @@ func (r *Replica) recordBatchForLoadBasedSplitting(
 	if shouldInitSplit {
 		r.store.splitQueue.MaybeAddAsync(ctx, r, r.store.Clock().NowAsClockTimestamp())
 	}
+}
+
+// loadSplitKey returns a suggested load split key for the range if it exists,
+// otherwise it returns nil. If there were any errors encountered when
+// validating the split key, the error is returned as well.
+func (r *Replica) loadSplitKey(ctx context.Context, now time.Time) roachpb.Key {
+	splitKey := r.loadBasedSplitter.MaybeSplitKey(ctx, now)
+	if splitKey == nil {
+		return nil
+	}
+
+	// We swallow the error here and instead log an event. It is currently
+	// expected that the load based splitter may return the start key of the
+	// range.
+	if err := splitKeyPreCheck(r.Desc().RSpan(), splitKey); err != nil {
+		log.KvDistribution.VEventf(ctx, 1, "suggested load split key not usable: %s", err)
+		return nil
+	}
+
+	return splitKey
+}
+
+// splitKeyPreCheck checks that a split key is addressable and not the same as
+// the start key. An error is returned if these are not true. Additional checks
+// are made in adminSplitWithDescriptor when a split request is processed by
+// the replica.
+func splitKeyPreCheck(rspan roachpb.RSpan, splitKey roachpb.Key) error {
+	splitRKey, err := keys.Addr(splitKey)
+	if err != nil {
+		return err
+	}
+
+	// If the split key is equal to the start key of the range, it is treated as
+	// a no-op in adminSplitWithDescriptor, however it is treated as an error
+	// here because we shouldn't be suggesting split keys that are identical to
+	// the start key of the range.
+	if splitRKey.Equal(rspan.Key) {
+		return errors.Errorf(
+			"split key is equal to range start key (split_key=%s)",
+			splitRKey)
+	}
+
+	return nil
 }

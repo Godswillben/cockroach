@@ -11,6 +11,7 @@
 package batcheval
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -36,7 +37,7 @@ const SSTTargetSizeSetting = "kv.bulk_sst.target_size"
 // ExportRequestTargetFileSize controls the target file size for SSTs created
 // during backups.
 var ExportRequestTargetFileSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	SSTTargetSizeSetting,
 	fmt.Sprintf("target size for SSTs emitted from export requests; "+
 		"export requests (i.e. BACKUP) may buffer up to the sum of %s and %s in memory",
@@ -54,7 +55,7 @@ const MaxExportOverageSetting = "kv.bulk_sst.max_allowed_overage"
 // and an SST would exceed this size (due to large rows or large numbers of
 // versions), then the export will fail.
 var ExportRequestMaxAllowedFileSizeOverage = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	MaxExportOverageSetting,
 	fmt.Sprintf("if positive, allowed size in excess of target size for SSTs from export requests; "+
 		"export requests (i.e. BACKUP) may buffer up to the sum of %s and %s in memory",
@@ -172,7 +173,7 @@ func evalExport(
 
 	var curSizeOfExportedSSTs int64
 	for start := args.Key; start != nil; {
-		destFile := &storage.MemFile{}
+		var destFile bytes.Buffer
 		opts := storage.MVCCExportOptions{
 			StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
 			EndKey:             args.EndKey,
@@ -193,12 +194,27 @@ func evalExport(
 			// values before fingerprinting so that the fingerprint is tenant
 			// agnostic.
 			opts.FingerprintOptions = storage.MVCCExportFingerprintOptions{
-				StripTenantPrefix:  true,
-				StripValueChecksum: true,
+				StripTenantPrefix:            true,
+				StripValueChecksum:           true,
+				StripIndexPrefixAndTimestamp: args.FingerprintOptions.StripIndexPrefixAndTimestamp,
+			}
+			if opts.FingerprintOptions.StripIndexPrefixAndTimestamp && args.MVCCFilter == kvpb.MVCCFilter_All {
+				// If a key's value were updated from a to b, the xor hash without
+				// timestamps of those two mvcc values would look the same if the key
+				// were updated from b to a. In other words, the order of key value
+				// updates without timestamps does not affect the xor hash; but this
+				// order clearly presents different mvcc history, therefore, do not
+				// strip timestamps if fingerprinting all mvcc history.
+				return result.Result{}, errors.New("cannot fingerprint without mvcc timestamps and with mvcc history")
+			}
+			if opts.FingerprintOptions.StripIndexPrefixAndTimestamp && !args.StartTime.IsEmpty() {
+				// Supplying a startKey only complicates results (e.g. it surfaces
+				// tombstones), given that only the latest keys are surfaced.
+				return result.Result{}, errors.New("cannot fingerprint without mvcc timestamps and with a start time")
 			}
 			var hasRangeKeys bool
 			summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(ctx,
-				cArgs.EvalCtx.ClusterSettings(), reader, opts, destFile)
+				cArgs.EvalCtx.ClusterSettings(), reader, opts, &destFile)
 			if err != nil {
 				return result.Result{}, maybeAnnotateExceedMaxSizeError(err)
 			}
@@ -208,16 +224,16 @@ func evalExport(
 			// part of the ExportResponse. This frees up the memory used by the empty
 			// SST file.
 			if !hasRangeKeys {
-				destFile = &storage.MemFile{}
+				destFile = bytes.Buffer{}
 			}
 		} else {
 			summary, resumeInfo, err = storage.MVCCExportToSST(ctx, cArgs.EvalCtx.ClusterSettings(), reader,
-				opts, destFile)
+				opts, &destFile)
 			if err != nil {
 				return result.Result{}, maybeAnnotateExceedMaxSizeError(err)
 			}
 		}
-		data := destFile.Data()
+		data := destFile.Bytes()
 
 		// NB: This should only happen in two cases:
 		//
@@ -237,7 +253,7 @@ func evalExport(
 				// chance to move the goroutine off CPU allowing other processes to make
 				// progress. The client is responsible for handling pagination of
 				// ExportRequests.
-				if resumeInfo.CPUOverlimit {
+				if resumeInfo.CPUOverlimit && h.ReturnElasticCPUResumeSpans {
 					// Note, since we have not exported any data we do not populate the
 					// `Files` field of the ExportResponse.
 					reply.ResumeSpan = &roachpb.Span{
@@ -247,14 +263,18 @@ func evalExport(
 					reply.ResumeReason = kvpb.RESUME_ELASTIC_CPU_LIMIT
 					break
 				} else {
-					// We should never come here. There should be no condition aside from
-					// resource constraints that results in an early exit without
-					// exporting any data. Regardless, if we have a resumeKey we
-					// immediately retry the ExportRequest from that key and timestamp
-					// onwards.
-					if !build.IsRelease() {
-						return result.Result{}, errors.AssertionFailedf("ExportRequest exited without " +
-							"exporting any data for an unknown reason; programming error")
+					if !resumeInfo.CPUOverlimit {
+						// We should never come here. There should be no condition aside from
+						// resource constraints that results in an early exit without
+						// exporting any data. Regardless, if we have a resumeKey we
+						// immediately retry the ExportRequest from that key and timestamp
+						// onwards.
+						if !build.IsRelease() {
+							return result.Result{}, errors.AssertionFailedf("ExportRequest exited without " +
+								"exporting any data for an unknown reason; programming error")
+						} else {
+							log.Warningf(ctx, "unexpected resume span from ExportRequest without exporting any data for an unknown reason: %v", resumeInfo)
+						}
 					}
 					start = resumeInfo.ResumeKey.Key
 					resumeKeyTS = resumeInfo.ResumeKey.Timestamp
@@ -302,14 +322,12 @@ func evalExport(
 		// resuming our export from the resume key. This gives the scheduler a
 		// chance to take the current goroutine off CPU and allow other processes to
 		// progress.
-		if resumeInfo.CPUOverlimit {
+		if resumeInfo.CPUOverlimit && h.ReturnElasticCPUResumeSpans {
 			if resumeInfo.ResumeKey.Key != nil {
 				reply.ResumeSpan = &roachpb.Span{
 					Key:    resumeInfo.ResumeKey.Key,
 					EndKey: args.EndKey,
 				}
-				// TODO(during review): Do we want to add another resume reason
-				// specifically for CPU preemption.
 				reply.ResumeReason = kvpb.RESUME_ELASTIC_CPU_LIMIT
 			}
 			break

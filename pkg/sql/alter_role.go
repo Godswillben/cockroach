@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
@@ -290,8 +292,41 @@ func (p *planner) AlterRoleSet(ctx context.Context, n *tree.AlterRoleSet) (planN
 			return nil, err
 		}
 	} else {
-		if err := p.CheckRoleOption(ctx, roleoption.CREATEROLE); err != nil {
+		hasModify := false
+		hasSqlModify := false
+		hasCreateRole := false
+		// Check system privileges.
+		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
 			return nil, err
+		} else if ok {
+			hasModify = true
+			hasSqlModify = true
+		}
+		if !hasModify {
+			if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User()); err != nil {
+				return nil, err
+			} else if ok {
+				hasSqlModify = true
+			}
+		}
+		// Check role options.
+		if !hasSqlModify {
+			if ok, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING); err != nil {
+				return nil, err
+			} else if ok {
+				hasModify = true
+				hasSqlModify = true
+			}
+		}
+		if !hasModify && !hasSqlModify {
+			if ok, err := p.HasRoleOption(ctx, roleoption.CREATEROLE); err != nil {
+				return nil, err
+			} else if ok {
+				hasCreateRole = true
+			}
+		}
+		if !hasModify && !hasSqlModify && !hasCreateRole {
+			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "ALTER ROLE ... SET requires %s, %s or %s", privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, roleoption.CREATEROLE)
 		}
 	}
 
@@ -437,8 +472,13 @@ func (n *alterRoleSetNode) startExec(params runParams) error {
 	if databaseRoleSettingsHasRoleIDCol {
 		upsertQuery = fmt.Sprintf(`
 UPSERT INTO %s (database_id, role_name, settings, role_id)
-VALUES ($1, $2, $3, (SELECT user_id FROM system.users WHERE username = $2))`,
-			sessioninit.DatabaseRoleSettingsTableName,
+VALUES ($1, $2, $3, (
+	SELECT CASE $2
+		WHEN '%s' THEN %d
+		ELSE (SELECT user_id FROM system.users WHERE username = $2)
+	END
+))`,
+			sessioninit.DatabaseRoleSettingsTableName, username.EmptyRole, username.EmptyRoleID,
 		)
 	}
 

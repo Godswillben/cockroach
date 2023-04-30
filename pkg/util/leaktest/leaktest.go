@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/petermattis/goid"
@@ -37,8 +38,7 @@ import (
 // interestingGoroutines returns all goroutines we care about for the purpose
 // of leak checking. It excludes testing or runtime ones.
 func interestingGoroutines() map[int64]string {
-	buf := make([]byte, 2<<20)
-	buf = buf[:runtime.Stack(buf, true)]
+	buf := allstacks.Get()
 	gs := make(map[int64]string)
 	for _, g := range strings.Split(string(buf), "\n\n") {
 		sl := strings.SplitN(g, "\n", 2)
@@ -56,6 +56,8 @@ func interestingGoroutines() map[int64]string {
 			strings.Contains(stack, ").writeLoop(") ||
 			// Ignore the Sentry client, which is created lazily on first use.
 			strings.Contains(stack, "sentry-go.(*HTTPTransport).worker") ||
+			// Ignore the opensensus worker, which is created by the event exporter.
+			strings.Contains(stack, "go.opencensus.io/stats/view.(*worker).start") ||
 			// Seems to be gccgo specific.
 			(runtime.Compiler == "gccgo" && strings.Contains(stack, "testing.T.Parallel")) ||
 			// Ignore intentionally long-running logging goroutines that live for the

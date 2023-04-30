@@ -100,7 +100,7 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 	// Mark statements which are detected as slow or have a failed status.
 	var slowOrFailedStatements intsets.Fast
 	for i, s := range *statements {
-		if r.detector.isSlow(s) || isFailed(s) {
+		if !shouldIgnoreStatement(s) && (r.detector.isSlow(s) || isFailed(s)) {
 			slowOrFailedStatements.Add(i)
 		}
 	}
@@ -127,6 +127,11 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		insight.Transaction.Causes = addCause(insight.Transaction.Causes, Cause_HighContention)
 	}
 
+	var lastErrorCode string
+	// The transaction status will reflect the status of its statements; it will
+	// default to completed unless a failed statement status is found. Note that
+	// this does not take into account the "Cancelled" transaction status.
+	var lastStatus = Transaction_Completed
 	for i, s := range *statements {
 		if slowOrFailedStatements.Contains(i) {
 			switch s.Status {
@@ -134,6 +139,8 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 				s.Problem = Problem_SlowExecution
 				s.Causes = r.causes.examine(s.Causes, s)
 			case Statement_Failed:
+				lastErrorCode = s.ErrorCode
+				lastStatus = Transaction_Status(s.Status)
 				s.Problem = Problem_FailedExecution
 			}
 
@@ -148,6 +155,8 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		insight.Statements = append(insight.Statements, s)
 	}
 
+	insight.Transaction.LastErrorCode = lastErrorCode
+	insight.Transaction.Status = lastStatus
 	r.sink.AddInsight(insight)
 }
 

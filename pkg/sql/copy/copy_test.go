@@ -16,9 +16,10 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/url"
 	"regexp"
-	"runtime/pprof"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,16 +27,25 @@ import (
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgconn"
@@ -74,80 +84,128 @@ const lineitemSchema string = `CREATE TABLE lineitem (
 
 const csvData = `%d|155190|7706|1|17|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|egular courts above the`
 
-func TestCopy(t *testing.T) {
+func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-			Settings: cluster.MakeTestingClusterSettings(),
-		})
-		defer s.Stopper().Stop(ctx)
+	for _, vectorize := range []string{"on", "off"} {
+		for _, atomic := range []string{"on", "off"} {
+			for _, fastPath := range []string{"on", "off"} {
+				datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
+					s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+						Settings: cluster.MakeTestingClusterSettings(),
+					})
+					defer s.Stopper().Stop(ctx)
 
-		url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
-		defer cleanup()
-		var sqlConnCtx clisqlclient.Context
-		conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+					url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+					defer cleanup()
+					var sqlConnCtx clisqlclient.Context
+					conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
 
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			switch d.Cmd {
-			case "exec-ddl":
-				err := conn.Exec(ctx, d.Input)
-				if err != nil {
-					require.NoError(t, err, "%s: %s", d.Pos, d.Cmd)
-				}
-				return ""
-			case "copy-from", "copy-from-error":
-				lines := strings.Split(d.Input, "\n")
-				stmt := lines[0]
-				data := strings.Join(lines[1:], "\n")
-				rows, err := conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(data), stmt)
-				if d.Cmd == "copy-from" {
-					require.NoError(t, err, "%s\n%s\n", d.Cmd, d.Input)
-					require.Equal(t, int(rows), len(lines)-1, "not all rows were inserted")
-				} else {
-					require.Error(t, err)
-					return err.Error()
-				}
-				return fmt.Sprintf("%d", rows)
-			case "copy-to", "copy-to-error":
-				var buf bytes.Buffer
-				err := conn.GetDriverConn().CopyTo(ctx, &buf, d.Input)
-				if d.Cmd == "copy-to" {
+					err := conn.Exec(ctx, fmt.Sprintf(`SET VECTORIZE='%s'`, vectorize))
 					require.NoError(t, err)
-				} else {
-					require.Error(t, err)
-					return expandErrorString(err)
-				}
-				return buf.String()
-			case "query":
-				rows, err := conn.Query(ctx, d.Input)
-				require.NoError(t, err)
-				vals := make([]driver.Value, len(rows.Columns()))
-				var results string
-				for {
-					if err := rows.Next(vals); err == io.EOF {
-						break
-					} else if err != nil {
-						require.NoError(t, err)
-					}
-					for i, v := range vals {
-						if i > 0 {
-							results += "|"
+
+					err = conn.Exec(ctx, fmt.Sprintf(`SET COPY_FAST_PATH_ENABLED='%s'`, fastPath))
+					require.NoError(t, err)
+
+					err = conn.Exec(ctx, fmt.Sprintf(`SET COPY_FROM_ATOMIC_ENABLED='%s'`, atomic))
+					require.NoError(t, err)
+
+					datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+						switch d.Cmd {
+						case "exec-ddl":
+							err := conn.Exec(ctx, d.Input)
+							if err != nil {
+								require.NoError(t, err, "%s: %s", d.Pos, d.Cmd)
+							}
+							return ""
+						case "copy-from", "copy-from-error", "copy-from-kvtrace":
+							kvtrace := d.Cmd == "copy-from-kvtrace"
+							lines := strings.Split(d.Input, "\n")
+							stmt := lines[0]
+							data := strings.Join(lines[1:], "\n")
+							if kvtrace {
+								err := conn.Exec(ctx, "SET TRACING=on,kv")
+								require.NoError(t, err)
+							}
+							rows, err := conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(data), stmt)
+							if kvtrace {
+								err := conn.Exec(ctx, "SET TRACING=off")
+								require.NoError(t, err)
+							}
+							switch d.Cmd {
+							case "copy-from":
+								require.NoError(t, err, "%s\n%s\n", d.Cmd, d.Input)
+								require.Equal(t, int(rows), len(lines)-1, "Not all rows were inserted")
+								return fmt.Sprintf("%d", rows)
+							case "copy-from-error":
+								require.Error(t, err, "copy-from-error didn't return and error!")
+								return err.Error()
+							case "copy-from-kvtrace":
+								require.NoError(t, err, "%s\n%s\n", d.Cmd, d.Input)
+								rows, err := conn.Query(ctx,
+									`SELECT
+						  regexp_replace(message, '/Table/[0-9]*/', '/Table/<>/')
+						FROM [SHOW KV TRACE FOR SESSION]
+						WHERE message LIKE '%Put % -> %'`)
+								defer func() {
+									_ = rows.Close()
+								}()
+								require.NoError(t, err)
+								vals := make([]driver.Value, 1)
+								var results strings.Builder
+								for err = nil; err == nil; {
+									err = rows.Next(vals)
+									if err == io.EOF {
+										break
+									}
+									require.NoError(t, err)
+									results.WriteString(fmt.Sprintf("%v\n", vals[0]))
+								}
+								return results.String()
+							}
+						case "copy-to", "copy-to-error":
+							var buf bytes.Buffer
+							err := conn.GetDriverConn().CopyTo(ctx, &buf, d.Input)
+							if d.Cmd == "copy-to" {
+								require.NoError(t, err)
+							} else {
+								require.Error(t, err)
+								return expandErrorString(err)
+							}
+							return buf.String()
+						case "query":
+							rows, err := conn.Query(ctx, d.Input)
+							require.NoError(t, err)
+							vals := make([]driver.Value, len(rows.Columns()))
+							var results string
+							for {
+								if err := rows.Next(vals); err == io.EOF {
+									break
+								} else if err != nil {
+									require.NoError(t, err)
+								}
+								for i, v := range vals {
+									if i > 0 {
+										results += "|"
+									}
+									results += fmt.Sprintf("%v", v)
+								}
+								results += "\n"
+							}
+							err = rows.Close()
+							require.NoError(t, err)
+							return results
+						default:
+							return fmt.Sprintf("unknown command: %s\n", d.Cmd)
 						}
-						results += fmt.Sprintf("%v", v)
-					}
-					results += "\n"
-				}
-				err = rows.Close()
-				require.NoError(t, err)
-				return results
-			default:
-				return fmt.Sprintf("unknown command: %s\n", d.Cmd)
+						return ""
+					})
+				})
 			}
-		})
-	})
+		}
+	}
 }
 
 var issueLinkRE = regexp.MustCompile("https://go.crdb.dev/issue-v/([0-9]+)/.*")
@@ -176,120 +234,127 @@ func TestCopyFromTransaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Settings: cluster.MakeTestingClusterSettings(),
-	})
-	defer s.Stopper().Stop(ctx)
-
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
-	defer cleanup()
-	var sqlConnCtx clisqlclient.Context
-
-	decEq := func(v1, v2 driver.Value) bool {
-		valToDecimal := func(v driver.Value) *apd.Decimal {
-			mt, ok := v.(pgtype.Numeric)
-			require.True(t, ok)
-			buf, err := mt.EncodeText(nil, nil)
-			require.NoError(t, err)
-			decimal, _, err := apd.NewFromString(string(buf))
-			require.NoError(t, err)
-			return decimal
-		}
-		return valToDecimal(v1).Cmp(valToDecimal(v2)) == 0
-	}
-
-	testCases := []struct {
-		name   string
-		query  string
-		data   []string
-		testf  func(clisqlclient.Conn, func(clisqlclient.Conn))
-		result func(f1, f2 driver.Value) bool
-	}{
-		{
-			"explicit_copy",
-			"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
-			[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
-			func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
-				err := tconn.Exec(ctx, "BEGIN")
-				require.NoError(t, err)
-				f(tconn)
-				err = tconn.Exec(ctx, "COMMIT")
-				require.NoError(t, err)
+	testutils.RunTrueAndFalse(t, "disableAutoCommitDuringExec", func(t *testing.T, b bool) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+			Settings: cluster.MakeTestingClusterSettings(),
+			Knobs: base.TestingKnobs{
+				SQLExecutor: &sql.ExecutorTestingKnobs{
+					DisableAutoCommitDuringExec: b,
+				},
 			},
-			decEq,
-		},
-		{
-			"implicit_atomic",
-			"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
-			[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
-			func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
-				err := tconn.Exec(ctx, "SET copy_from_atomic_enabled = true")
-				require.NoError(t, err)
-				orig := sql.SetCopyFromBatchSize(1)
-				defer sql.SetCopyFromBatchSize(orig)
-				f(tconn)
-			},
-			decEq,
-		},
-		{
-			"implicit_non_atomic",
-			"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
-			[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
-			func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
-				err := tconn.Exec(ctx, "SET copy_from_atomic_enabled = false")
-				require.NoError(t, err)
-				orig := sql.SetCopyFromBatchSize(1)
-				defer sql.SetCopyFromBatchSize(orig)
-				f(tconn)
-			},
-			func(f1, f2 driver.Value) bool { return !decEq(f1, f2) },
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			tconn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
-			tc.testf(tconn, func(tconn clisqlclient.Conn) {
-				// Without this everything comes back as strings
-				tconn.SetAlwaysInferResultTypes(true)
-				// Put each test in its own db so they can be parallelized.
-				err := tconn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s; USE %s", tc.name, tc.name))
-				require.NoError(t, err)
-				err = tconn.Exec(ctx, lineitemSchema)
-				require.NoError(t, err)
-				numrows, err := tconn.GetDriverConn().CopyFrom(ctx, strings.NewReader(strings.Join(tc.data, "\n")), tc.query)
-				require.NoError(t, err)
-				require.Equal(t, len(tc.data), int(numrows))
-
-				result, err := tconn.QueryRow(ctx, "SELECT l_partkey FROM lineitem WHERE l_orderkey = 1")
-				require.NoError(t, err)
-				partKey, ok := result[0].(int64)
-				require.True(t, ok)
-				require.Equal(t, int64(155190), partKey)
-
-				results, err := tconn.Query(ctx, "SELECT crdb_internal_mvcc_timestamp FROM lineitem")
-				require.NoError(t, err)
-				var lastts driver.Value
-				firstTime := true
-				vals := make([]driver.Value, 1)
-				for {
-					err = results.Next(vals)
-					if err == io.EOF {
-						break
-					}
-					require.NoError(t, err)
-					if !firstTime {
-						require.True(t, tc.result(lastts, vals[0]))
-					} else {
-						firstTime = false
-					}
-					lastts = vals[0]
-				}
-			})
-			err := tconn.Exec(ctx, "TRUNCATE TABLE lineitem")
-			require.NoError(t, err)
 		})
-	}
+		defer s.Stopper().Stop(ctx)
+
+		url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+		defer cleanup()
+		var sqlConnCtx clisqlclient.Context
+
+		decEq := func(v1, v2 driver.Value) bool {
+			valToDecimal := func(v driver.Value) *apd.Decimal {
+				mt, ok := v.(pgtype.Numeric)
+				require.True(t, ok)
+				buf, err := mt.EncodeText(nil, nil)
+				require.NoError(t, err)
+				decimal, _, err := apd.NewFromString(string(buf))
+				require.NoError(t, err)
+				return decimal
+			}
+			return valToDecimal(v1).Cmp(valToDecimal(v2)) == 0
+		}
+
+		testCases := []struct {
+			name   string
+			query  string
+			data   []string
+			testf  func(clisqlclient.Conn, func(clisqlclient.Conn))
+			result func(f1, f2 driver.Value) bool
+		}{
+			{
+				"explicit_copy",
+				"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
+				[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
+				func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
+					err := tconn.Exec(ctx, "BEGIN")
+					require.NoError(t, err)
+					f(tconn)
+					err = tconn.Exec(ctx, "COMMIT")
+					require.NoError(t, err)
+				},
+				decEq,
+			},
+			{
+				"implicit_atomic",
+				"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
+				[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
+				func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
+					err := tconn.Exec(ctx, "SET copy_from_atomic_enabled = true")
+					require.NoError(t, err)
+					orig := sql.SetCopyFromBatchSize(1)
+					defer sql.SetCopyFromBatchSize(orig)
+					f(tconn)
+				},
+				decEq,
+			},
+			{
+				"implicit_non_atomic",
+				"COPY lineitem FROM STDIN WITH CSV DELIMITER '|';",
+				[]string{fmt.Sprintf(csvData, 1), fmt.Sprintf(csvData, 2)},
+				func(tconn clisqlclient.Conn, f func(tconn clisqlclient.Conn)) {
+					err := tconn.Exec(ctx, "SET copy_from_atomic_enabled = false")
+					require.NoError(t, err)
+					orig := sql.SetCopyFromBatchSize(1)
+					defer sql.SetCopyFromBatchSize(orig)
+					f(tconn)
+				},
+				func(f1, f2 driver.Value) bool { return !decEq(f1, f2) },
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				tconn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+				tc.testf(tconn, func(tconn clisqlclient.Conn) {
+					// Without this everything comes back as strings
+					tconn.SetAlwaysInferResultTypes(true)
+					// Put each test in its own db so they can be parallelized.
+					err := tconn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s; USE %s", tc.name, tc.name))
+					require.NoError(t, err)
+					err = tconn.Exec(ctx, lineitemSchema)
+					require.NoError(t, err)
+					numrows, err := tconn.GetDriverConn().CopyFrom(ctx, strings.NewReader(strings.Join(tc.data, "\n")), tc.query)
+					require.NoError(t, err)
+					require.Equal(t, len(tc.data), int(numrows))
+
+					result, err := tconn.QueryRow(ctx, "SELECT l_partkey FROM lineitem WHERE l_orderkey = 1")
+					require.NoError(t, err)
+					partKey, ok := result[0].(int64)
+					require.True(t, ok)
+					require.Equal(t, int64(155190), partKey)
+
+					results, err := tconn.Query(ctx, "SELECT crdb_internal_mvcc_timestamp FROM lineitem")
+					require.NoError(t, err)
+					var lastts driver.Value
+					firstTime := true
+					vals := make([]driver.Value, 1)
+					for {
+						err = results.Next(vals)
+						if err == io.EOF {
+							break
+						}
+						require.NoError(t, err)
+						if !firstTime {
+							require.True(t, tc.result(lastts, vals[0]))
+						} else {
+							firstTime = false
+						}
+						lastts = vals[0]
+					}
+				})
+				err := tconn.Exec(ctx, "TRUNCATE TABLE lineitem")
+				require.NoError(t, err)
+			})
+		}
+	})
 }
 
 // slowCopySource is a pgx.CopyFromSource that copies a fixed number of rows
@@ -412,7 +477,7 @@ func TestShowQueriesIncludesCopy(t *testing.T) {
 	t.Run("copy to", func(t *testing.T) {
 		g := ctxgroup.WithContext(ctx)
 		g.GoCtx(func(ctx context.Context) error {
-			_, err = copyConn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
+			_, err := copyConn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
 			return err
 		})
 
@@ -468,51 +533,231 @@ func TestShowQueriesIncludesCopy(t *testing.T) {
 	})
 }
 
-// BenchmarkCopyFrom measures copy performance against a TestServer.
-func BenchmarkCopyFrom(b *testing.B) {
-	defer leaktest.AfterTest(b)()
-	defer log.Scope(b).Close(b)
+// TestLargeDynamicRows ensure that we don't overflow memory with large rows by
+// testing that we break the inserts into batches, in this case at least 1
+// batch per row.  Also make sure adequately sized buffers just use 1 batch.
+func TestLargeDynamicRows(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-
-	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{
-		Settings: cluster.MakeTestingClusterSettings(),
-	})
+	params, _ := tests.CreateTestServerParams()
+	var batchNumber int
+	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
+		BeforeCopyFromInsert: func() error {
+			batchNumber++
+			return nil
+		},
+	}
+	s, _, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	url, cleanup := sqlutils.PGUrl(b, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
 
-	err := conn.Exec(ctx, lineitemSchema)
-	require.NoError(b, err)
+	// Only copy-fast-path has proper row accounting, override metamorphic that
+	// might turn it off.
+	err := conn.Exec(ctx, `SET COPY_FAST_PATH_ENABLED = 'true'`)
+	require.NoError(t, err)
 
-	// send data in 5 batches of 10k rows
-	const ROWS = sql.CopyBatchRowSizeDefault * 4
-	datalen := 0
-	var rows []string
-	for i := 0; i < ROWS; i++ {
-		row := fmt.Sprintf(csvData, i)
-		rows = append(rows, row)
-		datalen += len(row)
+	// 4.0 MiB is minimum, copy sets max row size to this value / 3
+	err = conn.Exec(ctx, "SET CLUSTER SETTING kv.raft.command.max_size = '4.0MiB'")
+	require.NoError(t, err)
+
+	err = conn.Exec(ctx, "CREATE TABLE t (s STRING)")
+	require.NoError(t, err)
+
+	rng, _ := randutil.NewTestRand()
+	str := randutil.RandString(rng, (2<<20)+1, "asdf")
+
+	var sb strings.Builder
+	for i := 0; i < 4; i++ {
+		sb.WriteString(str)
+		sb.WriteString("\n")
 	}
-	rowsize := datalen / ROWS
-	for _, batchSizeFactor := range []float64{.5, 1, 2, 4} {
-		batchSize := int(batchSizeFactor * sql.CopyBatchRowSizeDefault)
-		b.Run(fmt.Sprintf("%d", batchSize), func(b *testing.B) {
-			actualRows := rows[:batchSize]
-			for i := 0; i < b.N; i++ {
-				pprof.Do(ctx, pprof.Labels("run", "copy"), func(ctx context.Context) {
-					numrows, err := conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(strings.Join(actualRows, "\n")), "COPY lineitem FROM STDIN WITH CSV DELIMITER '|';")
-					require.NoError(b, err)
-					require.Equal(b, int(numrows), len(actualRows))
-				})
-				b.StopTimer()
-				err = conn.Exec(ctx, "TRUNCATE TABLE lineitem")
-				require.NoError(b, err)
-				b.StartTimer()
+	_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(sb.String()), "COPY t FROM STDIN")
+	require.NoError(t, err)
+	require.Greater(t, batchNumber, 4)
+	batchNumber = 0
+
+	// Reset and make sure we use 1 batch.
+	err = conn.Exec(ctx, "RESET CLUSTER SETTING kv.raft.command.max_size")
+	require.NoError(t, err)
+
+	// This won't work if the batch size gets set to less than 4.
+	if sql.CopyBatchRowSize < 4 {
+		sql.SetCopyFromBatchSize(4)
+	}
+
+	_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader(sb.String()), "COPY t FROM STDIN")
+	require.NoError(t, err)
+	require.Equal(t, 1, batchNumber)
+}
+
+// TestTinyRows ensures batch sizing logic doesn't explode with small table.
+func TestTinyRows(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	params, _ := tests.CreateTestServerParams()
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	defer cleanup()
+	var sqlConnCtx clisqlclient.Context
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+
+	err := conn.Exec(ctx, "CREATE TABLE t (b BOOL PRIMARY KEY)")
+	require.NoError(t, err)
+
+	_, err = conn.GetDriverConn().CopyFrom(ctx, strings.NewReader("true\nfalse\n"), "COPY t FROM STDIN")
+	require.NoError(t, err)
+}
+
+// TODO(cucaroach): get the rand utilities and ParseAndRequire to be friends
+// STRINGS don't roundtrip well, need to figure out proper escaping
+// INET doesn't round trip: ERROR: could not parse "70e5:112:5114:7da5:1" as inet. invalid IP (SQLSTATE 22P02)
+// DECIMAL(15,2) don't round trip, get too big number errors.
+const lineitemSchemaMunged string = `CREATE TABLE lineitem (
+	l_orderkey      INT8 NOT NULL,
+	l_partkey       INT8 NOT NULL,
+	l_suppkey       INT8 NOT NULL,
+	l_linenumber    INT8 NOT NULL,
+	l_quantity      INT8 NOT NULL,
+	l_extendedprice FLOAT NOT NULL,
+	l_discount      FLOAT NOT NULL,
+	l_tax           FLOAT NOT NULL,
+	l_returnflag    TIMESTAMPTZ NOT NULL,
+	l_linestatus    TIMESTAMPTZ NOT NULL,
+	l_shipdate      DATE NOT NULL,
+	l_commitdate    DATE NOT NULL,
+	l_receiptdate   DATE NOT NULL,
+	l_shipinstruct  INTERVAL NOT NULL,
+	l_shipmode      UUID NOT NULL,
+	l_comment       UUID NOT NULL,
+	PRIMARY KEY     (l_orderkey, l_linenumber),
+	INDEX l_ok      (l_orderkey ASC),
+	INDEX l_pk      (l_partkey ASC),
+	INDEX l_sk      (l_suppkey ASC),
+	INDEX l_sd      (l_shipdate ASC),
+	INDEX l_cd      (l_commitdate ASC),
+	INDEX l_rd      (l_receiptdate ASC),
+	INDEX l_pk_sk   (l_partkey ASC, l_suppkey ASC),
+	INDEX l_sk_pk   (l_suppkey ASC, l_partkey ASC)
+)`
+
+// Perform a COPY of N rows, N can be arbitrarily large to test huge copies.
+func TestLargeCopy(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	s, _, kvdb := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	defer cleanup()
+	var sqlConnCtx clisqlclient.Context
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
+
+	err := conn.Exec(ctx, lineitemSchemaMunged)
+	require.NoError(t, err)
+
+	desc := desctestutils.TestingGetTableDescriptor(kvdb, keys.SystemSQLCodec, "defaultdb", "public", "lineitem")
+	require.NotNil(t, desc, "Failed to lookup descriptor")
+
+	err = conn.Exec(ctx, "SET copy_from_atomic_enabled = false")
+	require.NoError(t, err)
+
+	rng := rand.New(rand.NewSource(0))
+	rows := 10000
+	numrows, err := conn.GetDriverConn().CopyFrom(ctx,
+		&copyReader{rng: rng, cols: desc.PublicColumns(), rows: rows},
+		"COPY lineitem FROM STDIN WITH CSV;")
+	require.NoError(t, err)
+	require.Equal(t, int(numrows), rows)
+}
+
+type copyReader struct {
+	cols          []catalog.Column
+	rng           *rand.Rand
+	rows          int
+	count         int
+	generatedRows io.Reader
+}
+
+var _ io.Reader = &copyReader{}
+
+func (c *copyReader) Read(b []byte) (n int, err error) {
+	if c.generatedRows == nil {
+		c.generateRows()
+	}
+	n, err = c.generatedRows.Read(b)
+	if err == io.EOF && c.count < c.rows {
+		c.generateRows()
+		n, err = c.generatedRows.Read(b)
+	}
+	return
+}
+
+func (c *copyReader) generateRows() {
+	numRows := min(1000, c.rows-c.count)
+	sb := strings.Builder{}
+	for i := 0; i < numRows; i++ {
+		row := make([]string, len(c.cols))
+		for j, col := range c.cols {
+			t := col.GetType()
+			var ds string
+			if j == 0 {
+				// Special handling for ID field
+				ds = strconv.Itoa(c.count + i)
+			} else {
+				d := randgen.RandDatum(c.rng, t, col.IsNullable())
+				ds = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+				// Empty string is treated as null
+				if len(ds) == 0 && !col.IsNullable() {
+					ds = "a"
+				}
+				switch t.Family() {
+				case types.CollatedStringFamily:
+					// For collated strings, we just want the raw contents in COPY.
+					ds = d.(*tree.DCollatedString).Contents
+				case types.FloatFamily:
+					ds = strings.TrimSuffix(ds, ".0")
+				}
+				switch t.Family() {
+				case types.BytesFamily,
+					types.DateFamily,
+					types.IntervalFamily,
+					types.INetFamily,
+					types.StringFamily,
+					types.TimestampFamily,
+					types.TimestampTZFamily,
+					types.UuidFamily,
+					types.CollatedStringFamily:
+					var b bytes.Buffer
+					if err := sql.EncodeCopy(&b, encoding.UnsafeConvertStringToBytes(ds), ','); err != nil {
+						panic(err)
+					}
+					ds = b.String()
+				}
 			}
-			b.SetBytes(int64(len(actualRows) * rowsize))
-		})
+			row[j] = ds
+		}
+		r := strings.Join(row, ",")
+		sb.WriteString(r)
+		sb.WriteString("\n")
 	}
+	c.count += numRows
+	c.generatedRows = strings.NewReader(sb.String())
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

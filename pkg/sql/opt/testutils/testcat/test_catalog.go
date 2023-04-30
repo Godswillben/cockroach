@@ -343,6 +343,20 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 		"\"%q\" is not a table", tree.ErrString(name)))
 }
 
+// LookupTable returns the test table that was previously added with the given
+// name but returns an error if the name does not exist instead of panicking.
+func (tc *Catalog) LookupTable(name *tree.TableName) (*Table, error) {
+	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	if err != nil {
+		return nil, err
+	}
+	if tab, ok := ds.(*Table); ok {
+		return tab, nil
+	}
+	return nil, pgerror.Newf(pgcode.WrongObjectType,
+		"\"%q\" is not a table", tree.ErrString(name))
+}
+
 // Tables returns a list of all tables added to the test catalog.
 func (tc *Catalog) Tables() []*Table {
 	tables := make([]*Table, 0, len(tc.testSchema.dataSources))
@@ -704,7 +718,7 @@ var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatTable(tt.Catalog, tt, tp)
+	cat.FormatTable(tt.Catalog, tt, tp, false /* redactableValues */)
 	return tp.String()
 }
 
@@ -981,8 +995,11 @@ type Index struct {
 	// Inverted is true when this index is an inverted index.
 	Inverted bool
 
-	// NotVisible is true when this index is a not visible index.
-	NotVisible bool
+	// Invisibility specifies the invisibility of an index and can be any float64
+	// between [0.0, 1.0]. An index with invisibility 0.0 means that the index is
+	// visible. An index with invisibility 1.0 means that the index is fully not
+	// visible.
+	Invisibility float64
 
 	Columns []cat.IndexColumn
 
@@ -1049,9 +1066,9 @@ func (ti *Index) IsInverted() bool {
 	return ti.Inverted
 }
 
-// IsNotVisible is part of the cat.Index interface.
-func (ti *Index) IsNotVisible() bool {
-	return ti.NotVisible
+// GetInvisibility is part of the cat.Index interface.
+func (ti *Index) GetInvisibility() float64 {
+	return ti.Invisibility
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -1183,6 +1200,7 @@ type TableStat struct {
 	evalCtx       *eval.Context
 	histogram     []cat.HistogramBucket
 	histogramType *types.T
+	tc            *Catalog
 }
 
 var _ cat.TableStatistic = &TableStat{}
@@ -1243,7 +1261,10 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	if err != nil {
 		panic(err)
 	}
-	colType := tree.MustBeStaticallyKnownType(colTypeRef)
+	colType, err := tree.ResolveType(context.Background(), colTypeRef, ts.tc)
+	if err != nil {
+		return nil
+	}
 
 	var offset int
 	if ts.js.NullCount > 0 {

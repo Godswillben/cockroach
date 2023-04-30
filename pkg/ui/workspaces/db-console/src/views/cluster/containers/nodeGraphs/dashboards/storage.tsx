@@ -11,7 +11,7 @@
 import React from "react";
 import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 
 import {
@@ -53,6 +53,7 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Live Bytes"
+      isKvGraph={false}
       sources={storeSources}
       tooltip={<LiveBytesGraphTooltip tooltipSelection={tooltipSelection} />}
     >

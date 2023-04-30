@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -31,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	prometheusgo "github.com/prometheus/client_model/go"
 )
 
@@ -261,8 +261,6 @@ type MVCCIterator interface {
 	// keys by avoiding the need to iterate over many deleted intents.
 	SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID)
 
-	// Key is like UnsafeKey, but returns memory now owned by the caller.
-	Key() MVCCKey
 	// UnsafeRawKey returns the current raw key which could be an encoded
 	// MVCCKey, or the more general EngineKey (for a lock table key).
 	// This is a low-level and dangerous method since it will expose the
@@ -363,9 +361,9 @@ type EngineIterator interface {
 	// Value returns the current value as a byte slice.
 	// REQUIRES: latest positioning function returned valid=true.
 	Value() ([]byte, error)
-	// GetRawIter is a low-level method only for use in the storage package,
-	// that returns the underlying pebble Iterator.
-	GetRawIter() pebbleiter.Iterator
+	// CloneContext is a low-level method only for use in the storage package,
+	// that provides sufficient context that the iterator may be cloned.
+	CloneContext() CloneContext
 	// SeekEngineKeyGEWithLimit is similar to SeekEngineKeyGE, but takes an
 	// additional exclusive upper limit parameter. The limit is semantically
 	// best-effort, and is an optimization to avoid O(n^2) iteration behavior in
@@ -388,6 +386,13 @@ type EngineIterator interface {
 	PrevEngineKeyWithLimit(limit roachpb.Key) (state pebble.IterValidityState, err error)
 	// Stats returns statistics about the iterator.
 	Stats() IteratorStats
+}
+
+// CloneContext is an opaque type encapsulating sufficient context to construct
+// a clone of an existing iterator.
+type CloneContext struct {
+	rawIter       pebbleiter.Iterator
+	statsReporter statsReporter
 }
 
 // IterOptions contains options used to create an {MVCC,Engine}Iterator.
@@ -464,6 +469,7 @@ type IterOptions struct {
 	// Range keys themselves are not affected by the masking, and will be
 	// emitted as normal.
 	RangeKeyMaskingBelow hlc.Timestamp
+
 	// useL6Filters allows the caller to opt into reading filter blocks for
 	// L6 sstables. Only for use with Prefix = true. Helpful if a lot of prefix
 	// Seeks are expected in quick succession, that are also likely to not
@@ -896,26 +902,35 @@ type Engine interface {
 	// NewUnindexedBatch returns a new instance of a batched engine which wraps
 	// this engine. It is unindexed, in that writes to the batch are not
 	// visible to reads until after it commits. The batch accumulates all
-	// mutations and applies them atomically on a call to Commit(). Read
-	// operations return an error, unless writeOnly is set to false.
+	// mutations and applies them atomically on a call to Commit().
 	//
-	// When writeOnly is false, reads will be satisfied by reading from the
-	// underlying engine, i.e., the caller does not see its own writes. This
-	// setting should be used only when the caller is certain that this
-	// optimization is correct, and beneficial. There are subtleties here -- see
-	// the discussion on https://github.com/cockroachdb/cockroach/pull/57661 for
-	// more details.
+	// Reads will be satisfied by reading from the underlying engine, i.e., the
+	// caller does not see its own writes. This setting should be used only when
+	// the caller is certain that this optimization is correct, and beneficial.
+	// There are subtleties here -- see the discussion on
+	// https://github.com/cockroachdb/cockroach/pull/57661 for more details.
 	//
-	// TODO(sumeer): We should separate the writeOnly=true case into a
-	// separate method, that returns a WriteBatch interface. Even better would
-	// be not having an option to pass writeOnly=false, and have the caller
-	// explicitly work with a separate WriteBatch and Reader.
-	NewUnindexedBatch(writeOnly bool) Batch
-	// NewSnapshot returns a new instance of a read-only snapshot
-	// engine. Snapshots are instantaneous and, as long as they're
-	// released relatively quickly, inexpensive. Snapshots are released
-	// by invoking Close(). Note that snapshots must not be used after the
-	// original engine has been stopped.
+	// TODO(sumeer,jackson): Remove this method and force the caller to operate
+	// explicitly with a separate WriteBatch and Reader.
+	NewUnindexedBatch() Batch
+	// NewWriteBatch returns a new write batch that will commit to the
+	// underlying Engine. The batch accumulates all mutations and applies them
+	// atomically on a call to Commit().
+	NewWriteBatch() WriteBatch
+	// NewSnapshot returns a new instance of a read-only snapshot engine. A
+	// snapshot provides a consistent view of the database across multiple
+	// iterators. If a caller only needs a single consistent iterator, they
+	// should create an iterator directly off the engine instead.
+	//
+	// Acquiring a snapshot is instantaneous and is inexpensive if quickly
+	// released. Snapshots are released by invoking Close(). Open snapshots
+	// prevent compactions from reclaiming space or removing tombstones for any
+	// keys written after the snapshot is acquired. This can be problematic
+	// during rebalancing or large ingestions, so they should be used sparingly
+	// and briefly.
+	//
+	// Note that snapshots must not be used after the original engine has been
+	// stopped.
 	NewSnapshot() Reader
 	// Type returns engine type.
 	Type() enginepb.EngineType
@@ -943,7 +958,7 @@ type Engine interface {
 	// be invoked while holding mutexes).
 	RegisterFlushCompletedCallback(cb func())
 	// Filesystem functionality.
-	fs.FS
+	vfs.FS
 	// CreateCheckpoint creates a checkpoint of the engine in the given directory,
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used. If spans is not empty, the checkpoint excludes
@@ -963,6 +978,11 @@ type Engine interface {
 	// SetCompactionConcurrency is used to set the engine's compaction
 	// concurrency. It returns the previous compaction concurrency.
 	SetCompactionConcurrency(n uint64) uint64
+
+	// SetStoreID informs the engine of the store ID, once it is known.
+	// Used to show the store ID in logs and to initialize the shared object
+	// creator ID (if shared object storage is configured).
+	SetStoreID(ctx context.Context, storeID int32) error
 }
 
 // Batch is the interface for batch specific operations.
@@ -971,7 +991,15 @@ type Batch interface {
 	// iterator creation. To guarantee that they see all the mutations, the
 	// iterator has to be repositioned using a seek operation, after the
 	// mutations were done.
-	ReadWriter
+	Reader
+	WriteBatch
+}
+
+// WriteBatch is the interface for write batch specific operations.
+type WriteBatch interface {
+	Writer
+	// Close closes the batch, freeing up any outstanding resources.
+	Close()
 	// Commit atomically applies any batched updates to the underlying
 	// engine. This is a noop unless the batch was created via NewBatch(). If
 	// sync is true, the batch is synchronously committed to disk.
@@ -1002,15 +1030,7 @@ type Batch interface {
 // *pebble.Metrics struct, which has its own documentation.
 type Metrics struct {
 	*pebble.Metrics
-	// WriteStallCount counts the number of times Pebble intentionally delayed
-	// incoming writes. Currently, the only two reasons for this to happen are:
-	// - "memtable count limit reached"
-	// - "L0 file count limit exceeded"
-	//
-	// We do not split this metric across these two reasons, but they can be
-	// distinguished in the pebble logs.
-	WriteStallCount    int64
-	WriteStallDuration time.Duration
+	Iterator AggregatedIteratorStats
 	// DiskSlowCount counts the number of times Pebble records disk slowness.
 	DiskSlowCount int64
 	// DiskStallCount counts the number of times Pebble observes slow writes
@@ -1020,6 +1040,56 @@ type Metrics struct {
 	SharedStorageWriteBytes int64
 	// SharedStorageReadBytes counts the number of bytes read from shared storage.
 	SharedStorageReadBytes int64
+	// WriteStallCount counts the number of times Pebble intentionally delayed
+	// incoming writes. Currently, the only two reasons for this to happen are:
+	// - "memtable count limit reached"
+	// - "L0 file count limit exceeded"
+	//
+	// We do not split this metric across these two reasons, but they can be
+	// distinguished in the pebble logs.
+	WriteStallCount    int64
+	WriteStallDuration time.Duration
+}
+
+// AggregatedIteratorStats holds cumulative stats, collected and summed over all
+// of an engine's iterators.
+type AggregatedIteratorStats struct {
+	// BlockBytes holds the sum of sizes of all loaded blocks. If the block was
+	// compressed, this is the compressed bytes. This value includes blocks that
+	// were loaded from the cache, and bytes that needed to be read from
+	// persistent storage.
+	//
+	// Currently, there may be some gaps in coverage. (At the time of writing,
+	// 2nd-level index blocks are excluded.)
+	BlockBytes uint64
+	// BlockBytesInCache holds the subset of BlockBytes that were already in the
+	// block cache, requiring no I/O.
+	BlockBytesInCache uint64
+	// BlockReadDuration accumulates the duration spent fetching blocks due to
+	// block cache misses.
+	//
+	// Currently, there may be some gaps in coverage. (At the time of writing,
+	// range deletion and range key blocks, meta index blocks and properties
+	// blocks are all excluded.)
+	BlockReadDuration time.Duration
+	// ExternalSeeks is the total count of seeks in forward and backward
+	// directions performed on pebble.Iterators.
+	ExternalSeeks int
+	// ExternalSteps is the total count of relative positioning operations (eg,
+	// Nexts, Prevs, NextPrefix, NextWithLimit, etc) in forward and backward
+	// directions performed on pebble.Iterators.
+	ExternalSteps int
+	// InternalSeeks is the total count of steps in forward and backward
+	// directions performed on Pebble's internal iterator. If this is high
+	// relative to ExternalSeeks, it's a good indication that there's an
+	// accumulation of garbage within the LSM (NOT MVCC garbage).
+	InternalSeeks int
+	// InternalSteps is the total count of relative positioning operations (eg,
+	// Nexts, Prevs, NextPrefix, etc) in forward and backward directions
+	// performed on pebble's internal iterator. If this is high relative to
+	// ExternalSteps, it's a good indication that there's an accumulation of
+	// garbage within the LSM (NOT MVCC garbage).
+	InternalSteps int
 }
 
 // MetricsForInterval is a set of pebble.Metrics that need to be saved in order to
@@ -1076,6 +1146,9 @@ func (m *Metrics) AsStoreStatsEvent() eventpb.StoreStats {
 		CompactionNumInProgress:    m.Compact.NumInProgress,
 		CompactionMarkedFiles:      int64(m.Compact.MarkedFiles),
 		FlushCount:                 m.Flush.Count,
+		FlushIngestCount:           m.Flush.AsIngestCount,
+		FlushIngestTableCount:      m.Flush.AsIngestTableCount,
+		FlushIngestTableBytes:      m.Flush.AsIngestBytes,
 		MemtableSize:               m.MemTable.Size,
 		MemtableCount:              m.MemTable.Count,
 		MemtableZombieCount:        m.MemTable.ZombieCount,
@@ -1519,7 +1592,7 @@ func iterateOnReader(
 			if err != nil {
 				return err
 			}
-			kv = MVCCKeyValue{Key: it.Key(), Value: v}
+			kv = MVCCKeyValue{Key: it.UnsafeKey().Clone(), Value: v}
 		}
 		if !it.RangeBounds().Key.Equal(rangeKeys.Bounds.Key) {
 			rangeKeys = it.RangeKeys().Clone()
@@ -1652,12 +1725,7 @@ func assertMVCCIteratorInvariants(iter MVCCIterator) error {
 		return err
 	}
 
-	key := iter.Key()
-
-	// Key must equal UnsafeKey.
-	if u := iter.UnsafeKey(); !key.Equal(u) {
-		return errors.AssertionFailedf("Key %s does not match UnsafeKey %s", key, u)
-	}
+	key := iter.UnsafeKey().Clone()
 
 	// UnsafeRawMVCCKey must match Key.
 	if r, err := DecodeMVCCKey(iter.UnsafeRawMVCCKey()); err != nil {
@@ -1726,14 +1794,10 @@ func assertMVCCIteratorInvariants(iter MVCCIterator) error {
 // proceed until the intents are resolved. Intents that don't conflict with the
 // transaction referenced by txnID[1] at the supplied `ts` are ignored.
 //
-// The caller must supply the sequence number of the request on behalf of which
-// the intents are being scanned. This is used to determine if the caller needs
-// to consult intent history when performing a scan over the MVCC keyspace
-// (indicated by the `needIntentHistory` return parameter). Intent history is
-// required to read the correct provisional value when scanning if we encounter
-// an intent written by the `txn` at a higher sequence number than the one
-// supplied or at a higher timestamp than the `ts` supplied (regardless of the
-// sequence number of the intent).
+// The `needsIntentHistory` return value indicates whether the caller needs to
+// consult intent history when performing a scan over the MVCC keyspace to
+// read correct provisional values for at least one of the keys being scanned.
+// Typically, this applies to all transactions that read their own writes.
 //
 // [1] The supplied txnID may be empty (uuid.Nil) if the request on behalf of
 // which the scan is being performed is non-transactional.
@@ -1743,7 +1807,6 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	txnID uuid.UUID,
 	ts hlc.Timestamp,
 	start, end roachpb.Key,
-	seq enginepb.TxnSeq,
 	intents *[]roachpb.Intent,
 	maxIntents int64,
 ) (needIntentHistory bool, err error) {
@@ -1786,14 +1849,36 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		}
 		ownIntent := txnID != uuid.Nil && txnID == meta.Txn.ID
 		if ownIntent {
-			// If we ran into one of our own intents, check whether the intent has a
-			// higher (or equal) sequence number or a higher (or equal) timestamp. If
-			// either of these conditions is true, a corresponding scan over the MVCC
-			// key space will need access to the key's intent history in order to read
-			// the correct provisional value. So we set `needIntentHistory` to true.
-			if seq <= meta.Txn.Sequence || ts.LessEq(meta.Timestamp.ToTimestamp()) {
-				needIntentHistory = true
-			}
+			// If we ran into one of our own intents, a corresponding scan over the
+			// MVCC keyspace will need access to the key's intent history in order to
+			// read the correct provisional value. As such, we set `needsIntentHistory`
+			// to be true.
+			//
+			// This determination is more restrictive than it needs to be. A read
+			// request needs access to the intent history when performing a scan over
+			// the MVCC keyspace only if:
+			// 1. The request is reading at a lower sequence number than the intent's
+			// sequence number.
+			// 2. OR the request is reading at a (strictly) lower timestamp than the
+			// intent timestamp[1]. This can happen if the intent was pushed for some
+			// reason.
+			// 3. OR the found intent should be ignored because it was written as part
+			// of a savepoint which was subsequently rolled back.
+			// 4. OR the found intent and read request belong to different txn epochs.
+			//
+			// The conditions above mirror special case handling for intents by
+			// pebbleMVCCScanner's getOne method. If we find scanning the lock table
+			// twice (once during conflict resolution, and once when interleaving
+			// intents during the MVCC read) is too expensive for transactions that
+			// read their own writes, there's some optimizations to be had here by
+			// being smarter about when we decide to interleave intents or not to.
+			//
+			// [1] Only relevant if the intent has a sequence number less than or
+			// equal to the read request's sequence number. Otherwise, we need access
+			// to the intent history to read the correct provisional value -- one
+			// written at a lower or equal sequence number compared to the read
+			// request's.
+			needIntentHistory = true
 			continue
 		}
 		if conflictingIntent := meta.Timestamp.ToTimestamp().LessEq(ts); !conflictingIntent {

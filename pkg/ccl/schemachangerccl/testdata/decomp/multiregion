@@ -88,7 +88,7 @@ ElementState:
     isHidden: false
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 1
+    pgAttributeNum: 0
     tableId: 110
   Status: PUBLIC
 - Column:
@@ -98,7 +98,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 2
+    pgAttributeNum: 0
     tableId: 110
   Status: PUBLIC
 - Column:
@@ -108,7 +108,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967294e+09
+    pgAttributeNum: 0
     tableId: 110
   Status: PUBLIC
 - Column:
@@ -118,13 +118,14 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967295e+09
+    pgAttributeNum: 0
     tableId: 110
   Status: PUBLIC
 - PrimaryIndex:
     constraintId: 1
     geoConfig: null
     indexId: 1
+    invisibility: 0
     isConcurrently: false
     isCreatedExplicitly: false
     isInverted: false
@@ -338,9 +339,9 @@ ElementState:
     userName: root
     withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 110
-    parentSchemaId: 105
+- SchemaChild:
+    childObjectId: 110
+    schemaId: 105
   Status: PUBLIC
 
 decompose
@@ -364,7 +365,7 @@ ElementState:
     isHidden: false
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 1
+    pgAttributeNum: 0
     tableId: 109
   Status: PUBLIC
 - Column:
@@ -374,7 +375,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 2
+    pgAttributeNum: 0
     tableId: 109
   Status: PUBLIC
 - Column:
@@ -384,7 +385,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967294e+09
+    pgAttributeNum: 0
     tableId: 109
   Status: PUBLIC
 - Column:
@@ -394,13 +395,14 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967295e+09
+    pgAttributeNum: 0
     tableId: 109
   Status: PUBLIC
 - PrimaryIndex:
     constraintId: 1
     geoConfig: null
     indexId: 1
+    invisibility: 0
     isConcurrently: false
     isCreatedExplicitly: false
     isInverted: false
@@ -616,9 +618,9 @@ ElementState:
     userName: root
     withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 109
-    parentSchemaId: 105
+- SchemaChild:
+    childObjectId: 109
+    schemaId: 105
   Status: PUBLIC
 
 decompose
@@ -642,7 +644,7 @@ ElementState:
     isHidden: false
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 1
+    pgAttributeNum: 0
     tableId: 108
   Status: PUBLIC
 - Column:
@@ -652,7 +654,7 @@ ElementState:
     isHidden: false
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 2
+    pgAttributeNum: 0
     tableId: 108
   Status: PUBLIC
 - Column:
@@ -662,7 +664,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: false
-    pgAttributeNum: 3
+    pgAttributeNum: 0
     tableId: 108
   Status: PUBLIC
 - Column:
@@ -672,7 +674,7 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967294e+09
+    pgAttributeNum: 0
     tableId: 108
   Status: PUBLIC
 - Column:
@@ -682,13 +684,14 @@ ElementState:
     isHidden: true
     isInaccessible: false
     isSystemColumn: true
-    pgAttributeNum: 4.294967295e+09
+    pgAttributeNum: 0
     tableId: 108
   Status: PUBLIC
 - PrimaryIndex:
     constraintId: 1
     geoConfig: null
     indexId: 1
+    invisibility: 0
     isConcurrently: false
     isCreatedExplicitly: false
     isInverted: false
@@ -704,6 +707,21 @@ ElementState:
     tableId: 108
   Status: PUBLIC
 - TableZoneConfig:
+    tableId: 108
+  Status: PUBLIC
+- IndexZoneConfig:
+    indexId: 1
+    partitionName: us-east1
+    tableId: 108
+  Status: PUBLIC
+- IndexZoneConfig:
+    indexId: 1
+    partitionName: us-east2
+    tableId: 108
+  Status: PUBLIC
+- IndexZoneConfig:
+    indexId: 1
+    partitionName: us-east3
     tableId: 108
   Status: PUBLIC
 - TableData:
@@ -1006,9 +1024,9 @@ ElementState:
     userName: root
     withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 108
-    parentSchemaId: 105
+- SchemaChild:
+    childObjectId: 108
+    schemaId: 105
   Status: PUBLIC
 
 decompose
@@ -1051,9 +1069,9 @@ ElementState:
     userName: public
     withGrantOption: "0"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 106
-    parentSchemaId: 105
+- SchemaChild:
+    childObjectId: 106
+    schemaId: 105
   Status: PUBLIC
 - EnumTypeValue:
     logicalRepresentation: us-east1

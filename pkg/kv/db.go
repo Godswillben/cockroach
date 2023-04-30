@@ -287,6 +287,11 @@ func (db *DB) Clock() *hlc.Clock {
 	return db.clock
 }
 
+// Context returns the DB's DBContext.
+func (db *DB) Context() DBContext {
+	return db.ctx
+}
+
 // NewDB returns a new DB.
 func NewDB(
 	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, stopper *stop.Stopper,
@@ -894,10 +899,10 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 // callback may return either nil or the retryable error. Txn is responsible for
 // resetting the transaction and retrying the callback.
 //
-// TODO(irfansharif): Audit uses of this since API since it bypasses AC. Make
-// the other variant (TxnWithAdmissionControl) the default, or maybe rename this
-// to be more explicit (TxnWithoutAdmissionControl) so new callers have to be
-// conscious about what they want.
+// TODO(irfansharif): Audit uses of this since API since it bypasses AC for the
+// system tenant. Make the other variant (TxnWithAdmissionControl) the default,
+// or maybe rename this to be more explicit (TxnWithoutAdmissionControl) so new
+// callers have to be conscious about what they want.
 func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
 	return db.TxnWithAdmissionControl(
 		ctx, kvpb.AdmissionHeader_OTHER, admissionpb.NormalPri,

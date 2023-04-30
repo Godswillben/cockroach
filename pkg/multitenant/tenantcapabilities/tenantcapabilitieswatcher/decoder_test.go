@@ -36,7 +36,7 @@ func TestDecodeCapabilities(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			DisableDefaultTestTenant: true, // system.tenants only exists for the system tenant
+			DefaultTestTenant: base.TestTenantDisabled, // system.tenants only exists for the system tenant
 		},
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -54,7 +54,7 @@ func TestDecodeCapabilities(t *testing.T) {
 	require.NoError(t, err)
 	info := mtinfopb.ProtoInfo{
 		Capabilities: tenantcapabilitiespb.TenantCapabilities{
-			CanAdminSplit: true,
+			DisableAdminSplit: true,
 		},
 	}
 	buf, err := protoutil.Marshal(&info)
@@ -80,5 +80,5 @@ func TestDecodeCapabilities(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, tenantID, got.TenantID)
-	require.Equal(t, info.Capabilities, got.TenantCapabilities)
+	require.Equal(t, &info.Capabilities, got.TenantCapabilities)
 }

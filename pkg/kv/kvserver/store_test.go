@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -180,12 +181,13 @@ func createTestStoreWithoutStart(
 
 	rpcContext := rpc.NewContext(ctx,
 		rpc.ContextOptions{
-			TenantID:        roachpb.SystemTenantID,
-			Config:          &base.Config{Insecure: true},
-			Clock:           cfg.Clock.WallClock(),
-			ToleratedOffset: cfg.Clock.ToleratedOffset(),
-			Stopper:         stopper,
-			Settings:        cfg.Settings,
+			TenantID:            roachpb.SystemTenantID,
+			Config:              &base.Config{Insecure: true},
+			Clock:               cfg.Clock.WallClock(),
+			ToleratedOffset:     cfg.Clock.ToleratedOffset(),
+			Stopper:             stopper,
+			Settings:            cfg.Settings,
+			TenantRPCAuthorizer: tenantcapabilitiesauthorizer.NewAllowEverythingAuthorizer(),
 		})
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
 	server, err := rpc.NewServer(rpcContext) // never started
@@ -200,6 +202,9 @@ func createTestStoreWithoutStart(
 	}
 	if cfg.StorePool == nil {
 		cfg.StorePool = NewTestStorePool(*cfg)
+	}
+	if cfg.RPCContext == nil {
+		cfg.RPCContext = rpcContext
 	}
 	// Many tests using this test harness (as opposed to higher-level
 	// ones like multiTestContext or TestServer) want to micro-manage
@@ -379,7 +384,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 
 	type seenT struct {
 		rangeID   roachpb.RangeID
-		tombstone roachpb.RangeTombstone
+		tombstone kvserverpb.RangeTombstone
 	}
 
 	// Next, write the keys we're planning to see again.
@@ -393,7 +398,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 				continue
 			}
 
-			tombstone := roachpb.RangeTombstone{
+			tombstone := kvserverpb.RangeTombstone{
 				NextReplicaID: roachpb.ReplicaID(rng.Int31n(100)),
 			}
 
@@ -418,7 +423,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	})
 
 	var seen []seenT
-	var tombstone roachpb.RangeTombstone
+	var tombstone kvserverpb.RangeTombstone
 
 	handleTombstone := func(rangeID roachpb.RangeID) error {
 		seen = append(seen, seenT{rangeID: rangeID, tombstone: tombstone})
@@ -492,12 +497,6 @@ func TestInitializeEngineErrors(t *testing.T) {
 	eng := storage.NewDefaultInMemForTesting()
 	stopper.AddCloser(eng)
 
-	// Bootstrap should fail if engine has no cluster version yet.
-	err := kvstorage.InitEngine(ctx, eng, testIdent)
-	require.ErrorContains(t, err, "no cluster version")
-
-	require.NoError(t, kvstorage.WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
-
 	// Put some random garbage into the engine.
 	require.NoError(t, eng.PutUnversioned(roachpb.Key("foo"), []byte("bar")))
 
@@ -506,7 +505,7 @@ func TestInitializeEngineErrors(t *testing.T) {
 	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
-	err = store.Start(ctx, stopper)
+	err := store.Start(ctx, stopper)
 	require.ErrorIs(t, err, &kvstorage.NotBootstrappedError{})
 
 	// Bootstrap should fail on non-empty engine.
@@ -2085,7 +2084,7 @@ func TestStoreSkipLockedTSCache(t *testing.T) {
 			t1 := timeutil.Unix(2, 0)
 			manualClock.MustAdvanceTo(t1)
 			lockedKey := roachpb.Key("b")
-			txn := roachpb.MakeTransaction("locker", lockedKey, 0, makeTS(t1.UnixNano(), 0), 0, 0)
+			txn := roachpb.MakeTransaction("locker", lockedKey, 0, 0, makeTS(t1.UnixNano(), 0), 0, 0)
 			txnH := kvpb.Header{Txn: &txn}
 			putArgs := putArgs(lockedKey, []byte("newval"))
 			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), txnH, &putArgs)
@@ -3014,7 +3013,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 			Desc: &roachpb.RangeDescriptor{RangeID: 1},
 		},
 	}
-	newBatch := e.NewBatch
+	newBatch := e.NewWriteBatch
 
 	// Test that a failed Recv() causes a fail throttle
 	{
@@ -3158,7 +3157,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	s := tc.store
 
 	cleanupNonEmpty1, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
-		RangeSize: 1,
+		RangeSize: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3168,6 +3167,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3185,6 +3186,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(2), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3206,6 +3209,10 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 				t.Errorf("unexpected snapshot queue length; expected: %d, got: %d", 1,
 					s.Metrics().RangeSnapshotRecvQueueLength.Value())
 			}
+			if s.Metrics().RangeSnapshotRecvQueueSize.Value() != int64(10) {
+				t.Errorf("unexplected snapshot queue size; expected: %d, got: %d", 1,
+					s.Metrics().RangeSnapshotRecvQueueSize.Value())
+			}
 			if s.Metrics().RangeSnapshotRecvInProgress.Value() != int64(1) {
 				t.Errorf("unexpected snapshots in progress; expected: %d, got: %d", 1,
 					s.Metrics().RangeSnapshotRecvInProgress.Value())
@@ -3217,7 +3224,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	}()
 
 	cleanupNonEmpty3, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
-		RangeSize: 1,
+		RangeSize: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3225,6 +3232,8 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	atomic.StoreInt32(&boom, 1)
 	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
 		"unexpected snapshot queue length")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueSize.Value(),
+		"unexpected snapshot queue size")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
 		"unexpected snapshots in progress")
 	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
@@ -3412,13 +3421,15 @@ type mockSpanConfigReader struct {
 	overrides map[string]roachpb.SpanConfig
 }
 
-func (m *mockSpanConfigReader) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
+func (m *mockSpanConfigReader) NeedsSplit(
+	ctx context.Context, start, end roachpb.RKey,
+) (bool, error) {
 	panic("unimplemented")
 }
 
 func (m *mockSpanConfigReader) ComputeSplitKey(
 	ctx context.Context, start, end roachpb.RKey,
-) roachpb.RKey {
+) (roachpb.RKey, error) {
 	panic("unimplemented")
 }
 
@@ -3468,7 +3479,7 @@ func TestAllocatorCheckRangeUnconfigured(t *testing.T) {
 		} else {
 			// Expect error looking up spanConfig if we can't use the system config span,
 			// as the spanconfig.KVSubscriber infrastructure is not initialized.
-			require.ErrorIs(t, err, errSysCfgUnavailable)
+			require.ErrorIs(t, err, errSpanConfigsUnavailable)
 			require.Equal(t, allocatorimpl.AllocatorNoop, action)
 		}
 	})
@@ -4007,7 +4018,7 @@ func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
 	require.True(t, created)
 	replicaID, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.TODOEngine())
 	require.NoError(t, err)
-	require.Equal(t, &roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
+	require.Equal(t, &kvserverpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

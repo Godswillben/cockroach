@@ -19,7 +19,7 @@ import {
   ExecutionStatus,
 } from "./types";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
-import moment from "moment";
+import moment from "moment-timezone";
 import { TimestampToMoment } from "../util";
 import Long from "long";
 import {
@@ -213,7 +213,6 @@ describe("test activeStatementUtils", () => {
         ],
         errors: [],
         internal_app_name_prefix: INTERNAL_APP_NAME_PREFIX,
-        toJSON: () => ({}),
       };
 
       const statements =
@@ -290,7 +289,6 @@ describe("test activeStatementUtils", () => {
         ],
         errors: [],
         internal_app_name_prefix: INTERNAL_APP_NAME_PREFIX,
-        toJSON: () => ({}),
       };
 
       const activeTransactions =
@@ -344,7 +342,6 @@ describe("test activeStatementUtils", () => {
         ],
         errors: [],
         internal_app_name_prefix: INTERNAL_APP_NAME_PREFIX,
-        toJSON: () => ({}),
       };
 
       const activeExecs = getRecentExecutionsFromSessions(sessionsResponse);

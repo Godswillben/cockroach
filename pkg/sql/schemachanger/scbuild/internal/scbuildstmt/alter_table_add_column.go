@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -45,7 +46,8 @@ func alterTableAddColumn(
 	d := t.ColumnDef
 	// We don't support handling zone config related properties for tables, so
 	// throw an unsupported error.
-	fallBackIfZoneConfigExists(b, d, tbl.TableID)
+	fallBackIfSubZoneConfigExists(b, t, tbl.TableID)
+	fallBackIfRegionalByRowTable(b, t, tbl.TableID)
 	fallBackIfVirtualColumnWithNotNullConstraint(t)
 	// Check column non-existence.
 	{
@@ -122,10 +124,13 @@ func alterTableAddColumn(
 			IsHidden:                desc.Hidden,
 			IsInaccessible:          desc.Inaccessible,
 			GeneratedAsIdentityType: desc.GeneratedAsIdentityType,
-			PgAttributeNum:          desc.GetPGAttributeNum(),
 		},
 		unique:  d.Unique.IsUnique,
 		notNull: !desc.Nullable,
+	}
+	// Only set PgAttributeNum if it differs from ColumnID.
+	if pgAttNum := desc.GetPGAttributeNum(); pgAttNum != catid.PGAttributeNum(desc.ID) {
+		spec.col.PgAttributeNum = pgAttNum
 	}
 	if ptr := desc.GeneratedAsIdentitySequenceOption; ptr != nil {
 		spec.col.GeneratedAsIdentitySequenceOption = *ptr
@@ -408,7 +413,7 @@ func handleAddColumnFreshlyAddedPrimaryIndex(
 		Filter(isColumnFilter).
 		Filter(absentTargetFilter).
 		IsEmpty(); haveDroppingColumn {
-		panic(scerrors.NotImplementedErrorf(n, "DROP COLUMN after ADD COLUMN"))
+		panic(scerrors.NotImplementedErrorf(n, "ADD COLUMN after DROP COLUMN"))
 	}
 
 	var tempIndex *scpb.TemporaryIndex
@@ -567,6 +572,7 @@ func addSecondaryIndexTargetsForAddColumn(
 		IsInverted:    desc.Type == descpb.IndexDescriptor_INVERTED,
 		SourceIndexID: newPrimaryIdx.IndexID,
 		IsNotVisible:  desc.NotVisible,
+		Invisibility:  desc.Invisibility,
 	}
 	tempIndexID := index.IndexID + 1 // this is enforced below
 	index.TemporaryIndexID = tempIndexID

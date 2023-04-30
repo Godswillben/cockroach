@@ -26,18 +26,19 @@ import {
   getInsightsFromProblemsAndCauses,
   InsightExecEnum,
   InsightNameEnum,
+  TransactionStatus,
   TxnContentionInsightDetails,
   TxnInsightDetails,
   TxnInsightEvent,
 } from "src/insights";
-import moment from "moment";
+import moment from "moment-timezone";
 import { FixFingerprintHexValue } from "../util";
 import {
   formatStmtInsights,
   stmtInsightsByTxnExecutionQuery,
   StmtInsightsResponseRow,
 } from "./stmtInsightsApi";
-import { INTERNAL_APP_NAME_PREFIX } from "src/recentExecutions/recentStatementUtils";
+import { INTERNAL_APP_NAME_PREFIX } from "src/util/constants";
 import { getContentionDetailsApi } from "./contentionApi";
 
 export const TXN_QUERY_PREVIEW_MAX = 800;
@@ -109,7 +110,7 @@ type FingerprintStmtsResponseColumns = {
 const fingerprintStmtsQuery = (stmtFingerprintIDs: string[]): string => `
 SELECT
   DISTINCT ON (fingerprint_id) encode(fingerprint_id, 'hex') AS statement_fingerprint_id,
-  prettify_statement(metadata ->> 'query', 108, 1, 1) AS query
+  (metadata ->> 'query') AS query
 FROM crdb_internal.statement_statistics
 WHERE encode(fingerprint_id, 'hex') =
       ANY ARRAY[ ${stmtFingerprintIDs.map(id => `'${id}'`).join(",")} ]`;
@@ -293,6 +294,8 @@ type TxnInsightsResponseRow = {
   causes: string[];
   stmt_execution_ids: string[];
   cpu_sql_nanos: number;
+  last_error_code: string;
+  status: TransactionStatus;
 };
 
 type TxnQueryFilters = {
@@ -326,7 +329,9 @@ last_retry_reason,
 problems,
 causes,
 stmt_execution_ids,
-cpu_sql_nanos`;
+cpu_sql_nanos,
+last_error_code,
+status`;
 
   if (filters?.execID) {
     return `
@@ -379,7 +384,7 @@ function formatTxnInsightsRow(row: TxnInsightsResponseRow): TxnInsightEvent {
     transactionExecutionID: row.txn_id,
     transactionFingerprintID: row.txn_fingerprint_id,
     implicitTxn: row.implicit_txn,
-    query: row.query.split(" ; ").join("\n"),
+    query: row.query?.split(" ; ").join("\n") || "",
     startTime,
     endTime,
     elapsedTimeMillis: endTime.diff(startTime, "milliseconds"),
@@ -394,6 +399,8 @@ function formatTxnInsightsRow(row: TxnInsightsResponseRow): TxnInsightEvent {
     insights,
     stmtExecutionIDs: row.stmt_execution_ids,
     cpuSQLNanos: row.cpu_sql_nanos,
+    errorCode: row.last_error_code,
+    status: row.status,
   };
 }
 
@@ -417,10 +424,14 @@ export async function getTxnInsightsApi(
   const result = await executeInternalSql<TxnInsightsResponseRow>(request);
 
   if (sqlResultsAreEmpty(result)) {
-    return formatApiResult([], result.error, "retrieving insights information");
+    return formatApiResult<TxnInsightEvent[]>(
+      [],
+      result.error,
+      "retrieving insights information",
+    );
   }
 
-  return formatApiResult(
+  return formatApiResult<TxnInsightEvent[]>(
     result.execution.txn_results[0].rows.map(formatTxnInsightsRow),
     result.error,
     "retrieving insights information",

@@ -14,88 +14,95 @@ DROP DATABASE crdb_internal
 query TTTTIT
 SHOW TABLES FROM crdb_internal
 ----
-crdb_internal  active_range_feeds               table  admin  NULL  NULL
-crdb_internal  backward_dependencies            table  admin  NULL  NULL
-crdb_internal  builtin_functions                table  admin  NULL  NULL
-crdb_internal  cluster_contended_indexes        view   admin  NULL  NULL
-crdb_internal  cluster_contended_keys           view   admin  NULL  NULL
-crdb_internal  cluster_contended_tables         view   admin  NULL  NULL
-crdb_internal  cluster_contention_events        table  admin  NULL  NULL
-crdb_internal  cluster_database_privileges      table  admin  NULL  NULL
-crdb_internal  cluster_distsql_flows            table  admin  NULL  NULL
-crdb_internal  cluster_execution_insights       table  admin  NULL  NULL
-crdb_internal  cluster_inflight_traces          table  admin  NULL  NULL
-crdb_internal  cluster_locks                    table  admin  NULL  NULL
-crdb_internal  cluster_queries                  table  admin  NULL  NULL
-crdb_internal  cluster_sessions                 table  admin  NULL  NULL
-crdb_internal  cluster_settings                 table  admin  NULL  NULL
-crdb_internal  cluster_statement_statistics     table  admin  NULL  NULL
-crdb_internal  cluster_transaction_statistics   table  admin  NULL  NULL
-crdb_internal  cluster_transactions             table  admin  NULL  NULL
-crdb_internal  cluster_txn_execution_insights   table  admin  NULL  NULL
-crdb_internal  create_function_statements       table  admin  NULL  NULL
-crdb_internal  create_schema_statements         table  admin  NULL  NULL
-crdb_internal  create_statements                table  admin  NULL  NULL
-crdb_internal  create_type_statements           table  admin  NULL  NULL
-crdb_internal  cross_db_references              table  admin  NULL  NULL
-crdb_internal  databases                        table  admin  NULL  NULL
-crdb_internal  default_privileges               table  admin  NULL  NULL
-crdb_internal  feature_usage                    table  admin  NULL  NULL
-crdb_internal  forward_dependencies             table  admin  NULL  NULL
-crdb_internal  gossip_alerts                    table  admin  NULL  NULL
-crdb_internal  gossip_liveness                  table  admin  NULL  NULL
-crdb_internal  gossip_network                   table  admin  NULL  NULL
-crdb_internal  gossip_nodes                     table  admin  NULL  NULL
-crdb_internal  index_columns                    table  admin  NULL  NULL
-crdb_internal  index_spans                      table  admin  NULL  NULL
-crdb_internal  index_usage_statistics           table  admin  NULL  NULL
-crdb_internal  invalid_objects                  table  admin  NULL  NULL
-crdb_internal  jobs                             table  admin  NULL  NULL
-crdb_internal  kv_catalog_comments              table  admin  NULL  NULL
-crdb_internal  kv_catalog_descriptor            table  admin  NULL  NULL
-crdb_internal  kv_catalog_namespace             table  admin  NULL  NULL
-crdb_internal  kv_catalog_zones                 table  admin  NULL  NULL
-crdb_internal  kv_dropped_relations             view   admin  NULL  NULL
-crdb_internal  kv_node_liveness                 table  admin  NULL  NULL
-crdb_internal  kv_node_status                   table  admin  NULL  NULL
-crdb_internal  kv_store_status                  table  admin  NULL  NULL
-crdb_internal  leases                           table  admin  NULL  NULL
-crdb_internal  lost_descriptors_with_data       table  admin  NULL  NULL
-crdb_internal  node_build_info                  table  admin  NULL  NULL
-crdb_internal  node_contention_events           table  admin  NULL  NULL
-crdb_internal  node_distsql_flows               table  admin  NULL  NULL
-crdb_internal  node_execution_insights          table  admin  NULL  NULL
-crdb_internal  node_inflight_trace_spans        table  admin  NULL  NULL
-crdb_internal  node_memory_monitors             table  admin  NULL  NULL
-crdb_internal  node_metrics                     table  admin  NULL  NULL
-crdb_internal  node_queries                     table  admin  NULL  NULL
-crdb_internal  node_runtime_info                table  admin  NULL  NULL
-crdb_internal  node_sessions                    table  admin  NULL  NULL
-crdb_internal  node_statement_statistics        table  admin  NULL  NULL
-crdb_internal  node_transaction_statistics      table  admin  NULL  NULL
-crdb_internal  node_transactions                table  admin  NULL  NULL
-crdb_internal  node_txn_execution_insights      table  admin  NULL  NULL
-crdb_internal  node_txn_stats                   table  admin  NULL  NULL
-crdb_internal  partitions                       table  admin  NULL  NULL
-crdb_internal  pg_catalog_table_is_implemented  table  admin  NULL  NULL
-crdb_internal  ranges                           view   admin  NULL  NULL
-crdb_internal  ranges_no_leases                 table  admin  NULL  NULL
-crdb_internal  regions                          table  admin  NULL  NULL
-crdb_internal  schema_changes                   table  admin  NULL  NULL
-crdb_internal  session_trace                    table  admin  NULL  NULL
-crdb_internal  session_variables                table  admin  NULL  NULL
-crdb_internal  statement_statistics             view   admin  NULL  NULL
-crdb_internal  super_regions                    table  admin  NULL  NULL
-crdb_internal  system_jobs                      table  admin  NULL  NULL
-crdb_internal  table_columns                    table  admin  NULL  NULL
-crdb_internal  table_indexes                    table  admin  NULL  NULL
-crdb_internal  table_row_statistics             table  admin  NULL  NULL
-crdb_internal  table_spans                      table  admin  NULL  NULL
-crdb_internal  tables                           table  admin  NULL  NULL
-crdb_internal  tenant_usage_details             view   admin  NULL  NULL
-crdb_internal  transaction_contention_events    table  admin  NULL  NULL
-crdb_internal  transaction_statistics           view   admin  NULL  NULL
-crdb_internal  zones                            table  admin  NULL  NULL
+crdb_internal  active_range_feeds                      table  admin  NULL  NULL
+crdb_internal  backward_dependencies                   table  admin  NULL  NULL
+crdb_internal  builtin_functions                       table  admin  NULL  NULL
+crdb_internal  cluster_contended_indexes               view   admin  NULL  NULL
+crdb_internal  cluster_contended_keys                  view   admin  NULL  NULL
+crdb_internal  cluster_contended_tables                view   admin  NULL  NULL
+crdb_internal  cluster_contention_events               table  admin  NULL  NULL
+crdb_internal  cluster_database_privileges             table  admin  NULL  NULL
+crdb_internal  cluster_distsql_flows                   table  admin  NULL  NULL
+crdb_internal  cluster_execution_insights              table  admin  NULL  NULL
+crdb_internal  cluster_inflight_traces                 table  admin  NULL  NULL
+crdb_internal  cluster_locks                           table  admin  NULL  NULL
+crdb_internal  cluster_queries                         table  admin  NULL  NULL
+crdb_internal  cluster_sessions                        table  admin  NULL  NULL
+crdb_internal  cluster_settings                        table  admin  NULL  NULL
+crdb_internal  cluster_statement_statistics            table  admin  NULL  NULL
+crdb_internal  cluster_transaction_statistics          table  admin  NULL  NULL
+crdb_internal  cluster_transactions                    table  admin  NULL  NULL
+crdb_internal  cluster_txn_execution_insights          table  admin  NULL  NULL
+crdb_internal  create_function_statements              table  admin  NULL  NULL
+crdb_internal  create_schema_statements                table  admin  NULL  NULL
+crdb_internal  create_statements                       table  admin  NULL  NULL
+crdb_internal  create_type_statements                  table  admin  NULL  NULL
+crdb_internal  cross_db_references                     table  admin  NULL  NULL
+crdb_internal  databases                               table  admin  NULL  NULL
+crdb_internal  default_privileges                      table  admin  NULL  NULL
+crdb_internal  feature_usage                           table  admin  NULL  NULL
+crdb_internal  forward_dependencies                    table  admin  NULL  NULL
+crdb_internal  gossip_alerts                           table  admin  NULL  NULL
+crdb_internal  gossip_liveness                         table  admin  NULL  NULL
+crdb_internal  gossip_network                          table  admin  NULL  NULL
+crdb_internal  gossip_nodes                            table  admin  NULL  NULL
+crdb_internal  index_columns                           table  admin  NULL  NULL
+crdb_internal  index_spans                             table  admin  NULL  NULL
+crdb_internal  index_usage_statistics                  table  admin  NULL  NULL
+crdb_internal  invalid_objects                         table  admin  NULL  NULL
+crdb_internal  jobs                                    table  admin  NULL  NULL
+crdb_internal  kv_catalog_comments                     table  admin  NULL  NULL
+crdb_internal  kv_catalog_descriptor                   table  admin  NULL  NULL
+crdb_internal  kv_catalog_namespace                    table  admin  NULL  NULL
+crdb_internal  kv_catalog_zones                        table  admin  NULL  NULL
+crdb_internal  kv_dropped_relations                    view   admin  NULL  NULL
+crdb_internal  kv_node_liveness                        table  admin  NULL  NULL
+crdb_internal  kv_node_status                          table  admin  NULL  NULL
+crdb_internal  kv_store_status                         table  admin  NULL  NULL
+crdb_internal  leases                                  table  admin  NULL  NULL
+crdb_internal  lost_descriptors_with_data              table  admin  NULL  NULL
+crdb_internal  node_build_info                         table  admin  NULL  NULL
+crdb_internal  node_contention_events                  table  admin  NULL  NULL
+crdb_internal  node_distsql_flows                      table  admin  NULL  NULL
+crdb_internal  node_execution_insights                 table  admin  NULL  NULL
+crdb_internal  node_inflight_trace_spans               table  admin  NULL  NULL
+crdb_internal  node_memory_monitors                    table  admin  NULL  NULL
+crdb_internal  node_metrics                            table  admin  NULL  NULL
+crdb_internal  node_queries                            table  admin  NULL  NULL
+crdb_internal  node_runtime_info                       table  admin  NULL  NULL
+crdb_internal  node_sessions                           table  admin  NULL  NULL
+crdb_internal  node_statement_statistics               table  admin  NULL  NULL
+crdb_internal  node_tenant_capabilities_cache          table  admin  NULL  NULL
+crdb_internal  node_transaction_statistics             table  admin  NULL  NULL
+crdb_internal  node_transactions                       table  admin  NULL  NULL
+crdb_internal  node_txn_execution_insights             table  admin  NULL  NULL
+crdb_internal  node_txn_stats                          table  admin  NULL  NULL
+crdb_internal  partitions                              table  admin  NULL  NULL
+crdb_internal  pg_catalog_table_is_implemented         table  admin  NULL  NULL
+crdb_internal  ranges                                  view   admin  NULL  NULL
+crdb_internal  ranges_no_leases                        table  admin  NULL  NULL
+crdb_internal  regions                                 table  admin  NULL  NULL
+crdb_internal  schema_changes                          table  admin  NULL  NULL
+crdb_internal  session_trace                           table  admin  NULL  NULL
+crdb_internal  session_variables                       table  admin  NULL  NULL
+crdb_internal  statement_activity                      view   admin  NULL  NULL
+crdb_internal  statement_statistics                    view   admin  NULL  NULL
+crdb_internal  statement_statistics_persisted          view   admin  NULL  NULL
+crdb_internal  statement_statistics_persisted_v22_2    view   admin  NULL  NULL
+crdb_internal  super_regions                           table  admin  NULL  NULL
+crdb_internal  system_jobs                             table  admin  NULL  NULL
+crdb_internal  table_columns                           table  admin  NULL  NULL
+crdb_internal  table_indexes                           table  admin  NULL  NULL
+crdb_internal  table_row_statistics                    table  admin  NULL  NULL
+crdb_internal  table_spans                             table  admin  NULL  NULL
+crdb_internal  tables                                  table  admin  NULL  NULL
+crdb_internal  tenant_usage_details                    view   admin  NULL  NULL
+crdb_internal  transaction_activity                    view   admin  NULL  NULL
+crdb_internal  transaction_contention_events           table  admin  NULL  NULL
+crdb_internal  transaction_statistics                  view   admin  NULL  NULL
+crdb_internal  transaction_statistics_persisted        view   admin  NULL  NULL
+crdb_internal  transaction_statistics_persisted_v22_2  view   admin  NULL  NULL
+crdb_internal  zones                                   table  admin  NULL  NULL
 
 statement ok
 CREATE DATABASE testdb; CREATE TABLE testdb.foo(x INT)
@@ -377,6 +384,59 @@ SELECT  * FROM crdb_internal.cluster_transactions WHERE node_id < 0
 ----
 id  node_id  session_id  start  txn_string  application_name  num_stmts  num_retries  num_auto_retries  last_auto_retry_reason
 
+# Accessing the tables should error for a user without a privilege.
+user testuser
+
+statement error user testuser does not have VIEWACTIVITY or VIEWACTIVITYREDACTED privilege
+SELECT  * FROM crdb_internal.node_transactions WHERE node_id < 0
+
+statement error user testuser does not have VIEWACTIVITY or VIEWACTIVITYREDACTED privilege
+SELECT  * FROM crdb_internal.cluster_transactions WHERE node_id < 0
+
+user root
+
+statement ok
+GRANT SYSTEM VIEWACTIVITY TO testuser
+
+# Now testuser can query transactions since it has the VIEWACTIVITY privilege.
+user testuser
+
+query TITTTTIIIT colnames
+SELECT  * FROM crdb_internal.node_transactions WHERE node_id < 0
+----
+id  node_id  session_id  start  txn_string  application_name  num_stmts  num_retries  num_auto_retries  last_auto_retry_reason
+
+query TITTTTIIIT colnames
+SELECT  * FROM crdb_internal.cluster_transactions WHERE node_id < 0
+----
+id  node_id  session_id  start  txn_string  application_name  num_stmts  num_retries  num_auto_retries  last_auto_retry_reason
+
+user root
+
+statement ok
+REVOKE SYSTEM VIEWACTIVITY FROM testuser
+
+statement ok
+GRANT SYSTEM VIEWACTIVITYREDACTED TO testuser
+
+# testuser can query transactions since it has the VIEWACTIVITYREDACTED privilege.
+user testuser
+
+query TITTTTIIIT colnames
+SELECT  * FROM crdb_internal.node_transactions WHERE node_id < 0
+----
+id  node_id  session_id  start  txn_string  application_name  num_stmts  num_retries  num_auto_retries  last_auto_retry_reason
+
+query TITTTTIIIT colnames
+SELECT  * FROM crdb_internal.cluster_transactions WHERE node_id < 0
+----
+id  node_id  session_id  start  txn_string  application_name  num_stmts  num_retries  num_auto_retries  last_auto_retry_reason
+
+user root
+
+statement ok
+REVOKE SYSTEM VIEWACTIVITYREDACTED FROM testuser
+
 query ITTTTTTTTTTTTTT colnames
 SELECT * FROM crdb_internal.node_sessions WHERE node_id < 0
 ----
@@ -402,20 +462,20 @@ SELECT * FROM crdb_internal.builtin_functions WHERE function = ''
 ----
 function  signature  category  details  schema
 
-query ITTITTTTTTTBBBB colnames
+query ITTITTTTTTTTBBBB colnames
 SELECT * FROM crdb_internal.create_statements WHERE database_name = ''
 ----
-database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name  create_statement  state  create_nofks  alter_statements  validate_statements  has_partitions  is_multi_region  is_virtual  is_temporary
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name  create_statement  state  create_nofks  alter_statements  validate_statements  create_redactable  has_partitions  is_multi_region  is_virtual  is_temporary
 
 query ITITTBTB colnames
 SELECT * FROM crdb_internal.table_columns WHERE descriptor_name = ''
 ----
 descriptor_id  descriptor_name  column_id  column_name  column_type  nullable  default_expr  hidden
 
-query ITITTBBBBITT colnames
+query ITITTBBBBFITT colnames
 SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
 ----
-descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted  is_sharded  is_visible  shard_bucket_count  created_at  create_statement
+descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted  is_sharded  is_visible  visibility  shard_bucket_count  created_at  create_statement
 
 query ITITTITTB colnames
 SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
@@ -462,16 +522,16 @@ SELECT * FROM crdb_internal.ranges_no_leases WHERE range_id < 0
 ----
 range_id  start_key  start_pretty  end_key  end_pretty  replicas  replica_localities  voting_replicas  non_voting_replicas  learner_replicas  split_enforced_until
 
-query TTTBTTTTTIITITTTTTI colnames
+query TTTBTTTTTIITITTTTTITT colnames
 SELECT * FROM crdb_internal.cluster_txn_execution_insights WHERE query = ''
 ----
-txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_time  user_name  app_name  rows_read  rows_written  priority  retries  last_retry_reason  contention  problems  causes  stmt_execution_ids cpu_sql_nanos
+txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_time  user_name  app_name  rows_read  rows_written  priority  retries  last_retry_reason  contention  problems  causes  stmt_execution_ids cpu_sql_nanos last_error_code status
 
 
-query TTTBTTTTTIITITTTTTI colnames
+query TTTBTTTTTIITITTTTTITT colnames
 SELECT * FROM crdb_internal.node_txn_execution_insights WHERE query = ''
 ----
-txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_time  user_name  app_name  rows_read  rows_written  priority  retries  last_retry_reason  contention  problems  causes  stmt_execution_ids cpu_sql_nanos
+txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_time  user_name  app_name  rows_read  rows_written  priority  retries  last_retry_reason  contention  problems  causes  stmt_execution_ids cpu_sql_nanos last_error_code status
 
 
 statement ok
@@ -487,6 +547,7 @@ INSERT INTO system.zones (id, config) VALUES
   ($testdb_foo_id, (SELECT raw_config_protobuf FROM crdb_internal.zones WHERE zone_id = 0)),
   ($schema_bar_id, (SELECT raw_config_protobuf FROM crdb_internal.zones WHERE zone_id = 0))
 
+skipif config local-mixed-22.2-23.1
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
 ----
@@ -498,8 +559,12 @@ SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
 22   RANGE liveness
 25   TABLE system.public.replication_constraint_stats
 27   TABLE system.public.replication_stats
+42   TABLE system.public.statement_statistics
+43   TABLE system.public.transaction_statistics
 45   TABLE system.public.tenant_usage
 57   TABLE system.public.span_stats_tenant_boundaries
+60   TABLE system.public.statement_activity
+61   TABLE system.public.transaction_activity
 106  DATABASE testdb
 108  TABLE testdb.public.foo
 111  TABLE test.schema.bar
@@ -557,7 +622,7 @@ select crdb_internal.get_vmodule()
 query T
 select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-1000022.2
+1000023.1
 
 query ITTT colnames
 select node_id, component, field, regexp_replace(regexp_replace(value, '^\d+$', '<port>'), e':\\d+', ':<port>') as value from crdb_internal.node_runtime_info
@@ -677,10 +742,10 @@ select crdb_internal.get_vmodule()
 query error pq: only users with the admin role are allowed to access the node runtime information
 select * from crdb_internal.node_runtime_info
 
-query error pq: only users with the ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases
+query error pq: only users with the VIEWACTIVITY or VIEWACTIVITYREDACTED or ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases
 select * from crdb_internal.ranges
 
-query error pq: only users with the ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases
+query error pq: only users with the VIEWACTIVITY or VIEWACTIVITYREDACTED or ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases
 SHOW RANGES FROM TABLE foo
 
 query error pq: only users with the admin role are allowed to read crdb_internal.gossip_nodes
@@ -711,7 +776,7 @@ SELECT * FROM crdb_internal.check_consistency(true, b'\x02', b'\x04')
 query T
 select regexp_replace(crdb_internal.node_executable_version()::string, '(-\d+)?$', '');
 ----
-1000022.2
+1000023.1
 
 user root
 
@@ -1179,7 +1244,7 @@ SELECT crdb_internal.unsafe_clear_gossip_info('unknown key')
 ----
 false
 
-# Verify users with VIEWCLUSTERSETTING or MODIFYCLUSTERSETTING can view non sql.defaults cluster settings.
+# Verify users with VIEWCLUSTERSETTING, MODIFYCLUSTERSETTING or MODIFYSQLCLUSTERSETTING can view non sql.defaults cluster settings.
 
 user root
 
@@ -1249,3 +1314,21 @@ user testuser
 awaitstatement sleepQuery
 
 user root
+
+skipif config local-mixed-22.2-23.1
+statement ok
+GRANT SYSTEM MODIFYSQLCLUSTERSETTING TO testuser
+
+user testuser
+
+skipif config local-mixed-22.2-23.1
+query T
+SELECT value FROM crdb_internal.cluster_settings WHERE variable IN ('diagnostics.reporting.enabled')
+----
+true
+
+user root
+
+skipif config local-mixed-22.2-23.1
+statement ok
+REVOKE SYSTEM MODIFYSQLCLUSTERSETTING FROM testuser

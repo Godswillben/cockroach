@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -32,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -205,9 +206,9 @@ func fetchSpansForTables(
 
 	// SessionData is nil if the changefeed was created prior to
 	// clusterversion.V23_1_ChangefeedExpressionProductionReady
-	var sd sessiondatapb.SessionData
+	sd := sql.NewInternalSessionData(ctx, execCtx.ExecCfg().Settings, "changefeed-fetchSpansForTables")
 	if details.SessionData != nil {
-		sd = *details.SessionData
+		sd.SessionData = *details.SessionData
 	}
 	return cdceval.SpansForExpression(ctx, execCtx.ExecCfg(), execCtx.User(),
 		sd, tableDescs[0], initialHighwater, target, sc)
@@ -301,7 +302,7 @@ func startDistChangefeed(
 		)
 		defer recv.Release()
 
-		var finishedSetupFn func()
+		var finishedSetupFn func(flowinfra.Flow)
 		if details.SinkURI != `` {
 			// We abuse the job's results channel to make CREATE CHANGEFEED wait for
 			// this before returning to the user to ensure the setup went okay. Job
@@ -310,8 +311,10 @@ func startDistChangefeed(
 			// meaningful so that if we start doing anything with the results
 			// returned by resumed jobs, then it breaks instead of returning
 			// nonsense.
-			finishedSetupFn = func() { resultsCh <- tree.Datums(nil) }
+			finishedSetupFn = func(flowinfra.Flow) { resultsCh <- tree.Datums(nil) }
 		}
+
+		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, jobID)
 
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *evalCtx
@@ -352,8 +355,15 @@ func makePlan(
 			distMode = sql.DistributionTypeNone
 		}
 
-		planCtx := dsp.NewPlanningCtx(ctx, execCtx.ExtendedEvalContext(), nil /* planner */, blankTxn,
-			sql.DistributionType(distMode))
+		var locFilter roachpb.Locality
+		if loc := details.Opts[changefeedbase.OptExecutionLocality]; loc != "" {
+			if err := locFilter.Set(loc); err != nil {
+				return nil, nil, err
+			}
+		}
+
+		planCtx := dsp.NewPlanningCtxWithOracle(ctx, execCtx.ExtendedEvalContext(), nil /* planner */, blankTxn,
+			sql.DistributionType(distMode), physicalplan.DefaultReplicaChooser, locFilter)
 		spanPartitions, err := dsp.PartitionSpans(ctx, planCtx, trackedSpans)
 		if err != nil {
 			return nil, nil, err
@@ -481,8 +491,8 @@ func (w *changefeedResultWriter) AddRow(ctx context.Context, row tree.Datums) er
 		return nil
 	}
 }
-func (w *changefeedResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
-	w.rowsAffected += n
+func (w *changefeedResultWriter) SetRowsAffected(ctx context.Context, n int) {
+	w.rowsAffected = n
 }
 func (w *changefeedResultWriter) SetError(err error) {
 	w.err = err
@@ -512,7 +522,8 @@ type distResolver struct {
 func (r *distResolver) getRangesForSpans(
 	ctx context.Context, spans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	return kvfeed.AllRangeSpans(ctx, r.DistSender, spans)
+	spans, _, err := kvfeed.AllRangeSpans(ctx, r.DistSender, spans)
+	return spans, err
 }
 
 func rebalanceSpanPartitions(

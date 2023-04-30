@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -40,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -1037,7 +1039,10 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 					typeNameStr := tree.NewDString(typeDesc.GetName())
 					// TODO(knz): This should filter for the current user, see
 					// https://github.com/cockroachdb/cockroach/issues/35572
-					privs := typeDesc.GetPrivileges().Show(privilege.Type, true /* showImplicitOwnerPrivs */)
+					privs, err := typeDesc.GetPrivileges().Show(privilege.Type, true /* showImplicitOwnerPrivs */)
+					if err != nil {
+						return err
+					}
 					for _, u := range privs {
 						userNameStr := tree.NewDString(u.User.Normalized())
 						for _, priv := range u.Privileges {
@@ -1076,7 +1081,10 @@ var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
 			func(db catalog.DatabaseDescriptor) error {
 				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
-					privs := sc.GetPrivileges().Show(privilege.Schema, true /* showImplicitOwnerPrivs */)
+					privs, err := sc.GetPrivileges().Show(privilege.Schema, true /* showImplicitOwnerPrivs */)
+					if err != nil {
+						return err
+					}
 					dbNameStr := tree.NewDString(db.GetName())
 					scNameStr := tree.NewDString(sc.GetName())
 					// TODO(knz): This should filter for the current user, see
@@ -1170,21 +1178,23 @@ var informationSchemaStatisticsTable = virtualSchemaTable{
 				appendRow := func(index catalog.Index, colName string, sequence int,
 					direction tree.Datum, isStored, isImplicit bool,
 				) error {
+					idxInvisibility := index.GetInvisibility()
 					return addRow(
-						dbNameStr,                           // table_catalog
-						scNameStr,                           // table_schema
-						tbNameStr,                           // table_name
-						yesOrNoDatum(!index.IsUnique()),     // non_unique
-						scNameStr,                           // index_schema
-						tree.NewDString(index.GetName()),    // index_name
-						tree.NewDInt(tree.DInt(sequence)),   // seq_in_index
-						tree.NewDString(colName),            // column_name
-						tree.DNull,                          // collation
-						tree.DNull,                          // cardinality
-						direction,                           // direction
-						yesOrNoDatum(isStored),              // storing
-						yesOrNoDatum(isImplicit),            // implicit
-						yesOrNoDatum(!index.IsNotVisible()), // is_visible
+						dbNameStr,                            // table_catalog
+						scNameStr,                            // table_schema
+						tbNameStr,                            // table_name
+						yesOrNoDatum(!index.IsUnique()),      // non_unique
+						scNameStr,                            // index_schema
+						tree.NewDString(index.GetName()),     // index_name
+						tree.NewDInt(tree.DInt(sequence)),    // seq_in_index
+						tree.NewDString(colName),             // column_name
+						tree.DNull,                           // collation
+						tree.DNull,                           // cardinality
+						direction,                            // direction
+						yesOrNoDatum(isStored),               // storing
+						yesOrNoDatum(isImplicit),             // implicit
+						yesOrNoDatum(idxInvisibility == 0.0), // is_visible
+						tree.NewDFloat(tree.DFloat(1-idxInvisibility)), // visibility
 					)
 				}
 
@@ -1348,7 +1358,11 @@ var informationSchemaUserPrivileges = virtualSchemaTable{
 				dbNameStr := tree.NewDString(dbDesc.GetName())
 				for _, u := range []string{username.RootUser, username.AdminRole} {
 					grantee := tree.NewDString(u)
-					for _, p := range privilege.GetValidPrivilegesForObject(privilege.Table).SortedNames() {
+					validPrivs, err := privilege.GetValidPrivilegesForObject(privilege.Table)
+					if err != nil {
+						return err
+					}
+					for _, p := range validPrivs.SortedNames() {
 						if err := addRow(
 							grantee,            // grantee
 							dbNameStr,          // table_catalog
@@ -1392,7 +1406,11 @@ func populateTablePrivileges(
 			if err != nil {
 				return err
 			}
-			for _, u := range desc.Show(tableType, true /* showImplicitOwnerPrivs */) {
+			showPrivs, err := desc.Show(tableType, true /* showImplicitOwnerPrivs */)
+			if err != nil {
+				return err
+			}
+			for _, u := range showPrivs {
 				granteeNameStr := tree.NewDString(u.User.Normalized())
 				for _, priv := range u.Privileges {
 					// We use this function to check for the grant option so that the
@@ -2740,6 +2758,18 @@ func forEachRole(
 		if err := fn(userName, bool(*isRole), options, defaultSettings); err != nil {
 			return err
 		}
+	}
+
+	// Add a row for the internal `node` user. It does not exist in system.users
+	// since you can't log in as it, but it does own objects like the system
+	// database, so it should be viewable in introspection.
+	nodeOptionsJSON, err := json.MakeJSON(map[string]interface{}{roleoption.NOLOGIN.String(): true})
+	if err != nil {
+		return err
+	}
+	nodeOptions := roleOptions{tree.NewDJSON(nodeOptionsJSON)}
+	if err := fn(username.NodeUserName(), false /* isRole */, nodeOptions, tree.DNull /* settings */); err != nil {
+		return err
 	}
 
 	return nil

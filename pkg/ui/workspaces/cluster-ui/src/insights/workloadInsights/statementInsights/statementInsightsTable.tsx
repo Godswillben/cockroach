@@ -22,7 +22,11 @@ import {
   limitText,
   NO_SAMPLES_FOUND,
 } from "src/util";
-import { InsightExecEnum, StmtInsightEvent } from "src/insights";
+import {
+  InsightExecEnum,
+  StatementStatus,
+  StmtInsightEvent,
+} from "src/insights";
 import {
   InsightCell,
   insightsTableTitles,
@@ -33,8 +37,21 @@ import { Link } from "react-router-dom";
 import classNames from "classnames/bind";
 import styles from "../util/workloadInsights.module.scss";
 import { TimeScale } from "../../../timeScaleDropdown";
+import { Badge } from "src/badge";
+import { Timestamp, Timezone } from "../../../timestamp";
 
 const cx = classNames.bind(styles);
+
+function stmtStatusToString(status: StatementStatus) {
+  switch (status) {
+    case StatementStatus.COMPLETED:
+      return "success";
+    case StatementStatus.FAILED:
+      return "danger";
+    default:
+      return "info";
+  }
+}
 
 interface StatementInsightsTable {
   data: StmtInsightEvent[];
@@ -45,9 +62,7 @@ interface StatementInsightsTable {
   visibleColumns: ColumnDescriptor<StmtInsightEvent>[];
 }
 
-export function makeStatementInsightsColumns(
-  setTimeScale: (ts: TimeScale) => void,
-): ColumnDescriptor<StmtInsightEvent>[] {
+export function makeStatementInsightsColumns(): ColumnDescriptor<StmtInsightEvent>[] {
   const execType = InsightExecEnum.STATEMENT;
   return [
     {
@@ -64,8 +79,7 @@ export function makeStatementInsightsColumns(
     {
       name: "statementFingerprintID",
       title: insightsTableTitles.fingerprintID(execType),
-      cell: (item: StmtInsightEvent) =>
-        StatementDetailsLink(item, setTimeScale),
+      cell: (item: StmtInsightEvent) => StatementDetailsLink(item),
       sort: (item: StmtInsightEvent) => item.statementFingerprintID,
       showByDefault: true,
     },
@@ -78,6 +92,15 @@ export function makeStatementInsightsColumns(
         </Tooltip>
       ),
       sort: (item: StmtInsightEvent) => item.query,
+      showByDefault: true,
+    },
+    {
+      name: "status",
+      title: insightsTableTitles.status(execType),
+      cell: (item: StmtInsightEvent) => (
+        <Badge text={item.status} status={stmtStatusToString(item.status)} />
+      ),
+      sort: (item: StmtInsightEvent) => item.status,
       showByDefault: true,
     },
     {
@@ -95,7 +118,14 @@ export function makeStatementInsightsColumns(
       name: "startTime",
       title: insightsTableTitles.startTime(execType),
       cell: (item: StmtInsightEvent) =>
-        item.startTime?.format(DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT),
+        item.startTime ? (
+          <Timestamp
+            time={item.startTime}
+            format={DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT}
+          />
+        ) : (
+          <>N/A</>
+        ),
       sort: (item: StmtInsightEvent) => item.startTime.unix(),
       showByDefault: true,
     },

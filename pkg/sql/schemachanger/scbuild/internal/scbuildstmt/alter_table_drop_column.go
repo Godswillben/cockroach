@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -32,7 +32,8 @@ import (
 func alterTableDropColumn(
 	b BuildCtx, tn *tree.TableName, tbl *scpb.Table, n *tree.AlterTableDropColumn,
 ) {
-	fallBackIfZoneConfigExists(b, n, tbl.TableID)
+	fallBackIfSubZoneConfigExists(b, n, tbl.TableID)
+	fallBackIfRegionalByRowTable(b, n, tbl.TableID)
 	checkSafeUpdatesForDropColumn(b)
 	checkRegionalByRowColumnConflict(b, tbl, n)
 	col, elts, done := resolveColumnForDropColumn(b, tn, tbl, n)
@@ -80,7 +81,7 @@ func checkRowLevelTTLColumn(
 	if rowLevelTTL == nil {
 		return
 	}
-	if rowLevelTTL.DurationExpr != "" && n.Column == colinfo.TTLDefaultExpirationColumnName {
+	if rowLevelTTL.DurationExpr != "" && n.Column == catpb.TTLDefaultExpirationColumnName {
 		panic(errors.WithHintf(
 			pgerror.Newf(
 				pgcode.InvalidTableDefinition,
@@ -159,6 +160,8 @@ func resolveColumnForDropColumn(
 		}
 		return nil, nil, true
 	}
+	// Block drops on system columns.
+	panicIfSystemColumn(col, n.Column.String())
 	return col, elts, false
 }
 
@@ -207,7 +210,10 @@ func dropColumn(
 			})
 		case *scpb.SecondaryIndex:
 			indexElts := b.QueryByID(e.TableID).Filter(hasIndexIDAttrFilter(e.IndexID))
-			_, _, indexName := scpb.FindIndexName(indexElts.Filter(publicTargetFilter))
+			_, indexTargetStatus, indexName := scpb.FindIndexName(indexElts)
+			if indexTargetStatus == scpb.ToAbsent {
+				return
+			}
 			name := tree.TableIndexName{
 				Table: *tn,
 				Index: tree.UnrestrictedName(indexName.Name),

@@ -21,6 +21,7 @@ type metrics struct {
 	ClientDisconnectCount  *metric.Counter
 	CurConnCount           *metric.Gauge
 	RoutingErrCount        *metric.Counter
+	AcceptedConnCount      *metric.Counter
 	RefusedConnCount       *metric.Counter
 	SuccessfulConnCount    *metric.Counter
 	ConnectionLatency      metric.IHistogram
@@ -42,6 +43,8 @@ type metrics struct {
 	QueryCancelForwarded      *metric.Counter
 	QueryCancelIgnored        *metric.Counter
 	QueryCancelSuccessful     *metric.Counter
+
+	AccessControlFileErrorCount *metric.Gauge
 }
 
 // MetricStruct implements the metrics.Struct interface.
@@ -100,6 +103,12 @@ var (
 		Name:        "proxy.err.client_disconnect",
 		Help:        "Number of disconnects initiated by clients",
 		Measurement: "Client Disconnects",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaAcceptedConnCount = metric.Metadata{
+		Name:        "proxy.sql.accepted_conns",
+		Help:        "Number of accepted connections",
+		Measurement: "Accepted connections",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaRefusedConnCount = metric.Metadata{
@@ -209,6 +218,12 @@ var (
 		Measurement: "Query Cancel Requests",
 		Unit:        metric.Unit_COUNT,
 	}
+	accessControlFileErrorCount = metric.Metadata{
+		Name:        "proxy.access_control.errors",
+		Help:        "Numbers of access control list files that are currently having errors",
+		Measurement: "Access Control File Errors",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // makeProxyMetrics instantiates the metrics holder for proxy monitoring.
@@ -221,6 +236,7 @@ func makeProxyMetrics() metrics {
 		ClientDisconnectCount:  metric.NewCounter(metaClientDisconnectCount),
 		CurConnCount:           metric.NewGauge(metaCurConnCount),
 		RoutingErrCount:        metric.NewCounter(metaRoutingErrCount),
+		AcceptedConnCount:      metric.NewCounter(metaAcceptedConnCount),
 		RefusedConnCount:       metric.NewCounter(metaRefusedConnCount),
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
 		ConnectionLatency: metric.NewHistogram(metric.HistogramOptions{
@@ -262,6 +278,8 @@ func makeProxyMetrics() metrics {
 		QueryCancelIgnored:        metric.NewCounter(metaQueryCancelIgnored),
 		QueryCancelForwarded:      metric.NewCounter(metaQueryCancelForwarded),
 		QueryCancelSuccessful:     metric.NewCounter(metaQueryCancelSuccessful),
+
+		AccessControlFileErrorCount: metric.NewGauge(accessControlFileErrorCount),
 	}
 }
 

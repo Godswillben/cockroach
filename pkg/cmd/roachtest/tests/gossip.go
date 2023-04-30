@@ -285,6 +285,7 @@ func runGossipPeerings(ctx context.Context, t test.Test, c cluster.Cluster) {
 	deadline := timeutil.Now().Add(time.Minute)
 
 	for i := 1; timeutil.Now().Before(deadline); i++ {
+		WaitForReady(ctx, t, c, c.All())
 		if err := g.check(ctx, c, g.hasPeers(c.Spec().NodeCount)); err != nil {
 			t.Fatal(err)
 		}
@@ -308,8 +309,6 @@ func runGossipPeerings(ctx context.Context, t test.Test, c cluster.Cluster) {
 }
 
 func runGossipRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
-	t.Skip("skipping flaky acceptance/gossip/restart", "https://github.com/cockroachdb/cockroach/issues/48423")
-
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
@@ -322,6 +321,7 @@ func runGossipRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
 	deadline := timeutil.Now().Add(time.Minute)
 
 	for i := 1; timeutil.Now().Before(deadline); i++ {
+		WaitForReady(ctx, t, c, c.All())
 		g.checkConnectedAndFunctional(ctx, t, c)
 		t.L().Printf("%d: OK\n", i)
 
@@ -430,7 +430,7 @@ SELECT count(replicas)
 	// connections. This will require node 1 to reach out to the other nodes in
 	// the cluster for gossip info.
 	err := c.RunE(ctx, c.Node(1),
-		`./cockroach start --insecure --background --store={store-dir} `+
+		` ./cockroach start --insecure --background --store={store-dir} `+
 			`--log-dir={log-dir} --cache=10% --max-sql-memory=10% `+
 			`--listen-addr=:$[{pgport:1}+10000] --http-port=$[{pgport:1}+1] `+
 			`--join={pghost:1}:{pgport:1}`+

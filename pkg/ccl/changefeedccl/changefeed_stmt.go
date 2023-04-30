@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -51,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -173,8 +175,12 @@ func changefeedPlanHook(
 	rowFn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer span.Finish()
-
-		if err := validateSettings(ctx, p); err != nil {
+		opts := changefeedbase.MakeStatementOptions(rawOpts)
+		st, err := opts.GetInitialScanType()
+		if err != nil {
+			return err
+		}
+		if err := validateSettings(ctx, st != changefeedbase.OnlyInitialScan, p.ExecCfg()); err != nil {
 			return err
 		}
 
@@ -183,8 +189,6 @@ func changefeedPlanHook(
 			// already sent the wrong result column headers.
 			return errors.New(`omit the SINK clause for inline results`)
 		}
-
-		opts := changefeedbase.MakeStatementOptions(rawOpts)
 
 		jr, err := createChangefeedJobRecord(
 			ctx,
@@ -480,7 +484,7 @@ func createChangefeedJobRecord(
 		}
 	}
 	if checkPrivs {
-		if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables); err != nil {
+		if err := authorizeUserToCreateChangefeed(ctx, p, sinkURI, hasSelectPrivOnAllTables, hasChangefeedPrivOnAllTables, opts.GetConfluentSchemaRegistry()); err != nil {
 			return nil, err
 		}
 	}
@@ -506,10 +510,18 @@ func createChangefeedJobRecord(
 			}
 			opts.ForceDiff()
 		} else if opts.IsSet(changefeedbase.OptDiff) {
-			opts.ClearDiff()
-			p.BufferClientNotice(ctx, pgnotice.Newf(
-				"turning off unused %s option (expression <%s> does not use cdc_prev)",
-				changefeedbase.OptDiff, tree.AsString(normalized)))
+			// Expression didn't reference cdc_prev, but the diff option was specified.
+			// This only makes sense if we have wrapped envelope.
+			encopts, err := opts.GetEncodingOptions()
+			if err != nil {
+				return nil, err
+			}
+			if encopts.Envelope != changefeedbase.OptEnvelopeWrapped {
+				opts.ClearDiff()
+				p.BufferClientNotice(ctx, pgnotice.Newf(
+					"turning off unused %s option (expression <%s> does not use cdc_prev)",
+					changefeedbase.OptDiff, tree.AsString(normalized)))
+			}
 		}
 
 		// TODO: Set the default envelope to row here when using a sink and format
@@ -562,11 +574,13 @@ func createChangefeedJobRecord(
 		return nil, err
 	}
 
+	// Validate the encoder. We can pass an empty slimetrics struct here since the encoder will not be used.
 	encodingOpts, err := opts.GetEncodingOptions()
 	if err != nil {
 		return nil, err
 	}
-	if _, err := getEncoder(encodingOpts, AllTargets(details)); err != nil {
+	if _, err := getEncoder(encodingOpts, AllTargets(details), details.Select != "",
+		makeExternalConnectionProvider(ctx, p.ExecCfg().InternalDB), nil); err != nil {
 		return nil, err
 	}
 
@@ -590,7 +604,7 @@ func createChangefeedJobRecord(
 			p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
 		); err != nil {
 			return nil, errors.Wrapf(err,
-				"use of %q option requires enterprise license.", changefeedbase.OptMetricsScope)
+				"use of %q option requires an enterprise license.", changefeedbase.OptMetricsScope)
 		}
 
 		if scope == defaultSLIScope {
@@ -613,6 +627,15 @@ func createChangefeedJobRecord(
 	}
 
 	if details.SinkURI == `` {
+
+		if details.Select != `` {
+			if err := utilccl.CheckEnterpriseEnabled(
+				p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(), "CHANGEFEED",
+			); err != nil {
+				return nil, errors.Wrap(err, "use of AS SELECT requires an enterprise license.")
+			}
+		}
+
 		details.Opts = opts.AsMap()
 		// Jobs should not be created for sinkless changefeeds. However, note that
 		// we create and return a job record for sinkless changefeeds below. This is
@@ -655,6 +678,23 @@ func createChangefeedJobRecord(
 	}
 	details.Opts = opts.AsMap()
 
+	if locFilter := details.Opts[changefeedbase.OptExecutionLocality]; locFilter != "" {
+		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1) {
+			return nil, pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"cannot create new changefeed with %s until upgrade to version %s is complete",
+				changefeedbase.OptExecutionLocality, clusterversion.V23_1.String(),
+			)
+		}
+		var executionLocality roachpb.Locality
+		if err := executionLocality.Set(locFilter); err != nil {
+			return nil, err
+		}
+		if _, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, executionLocality); err != nil {
+			return nil, err
+		}
+	}
+
 	ptsExpiration, err := opts.GetPTSExpiration()
 	if err != nil {
 		return nil, err
@@ -690,10 +730,10 @@ func createChangefeedJobRecord(
 	return jr, nil
 }
 
-func validateSettings(ctx context.Context, p sql.PlanHookState) error {
+func validateSettings(ctx context.Context, needsRangeFeed bool, execCfg *sql.ExecutorConfig) error {
 	if err := featureflag.CheckEnabled(
 		ctx,
-		p.ExecCfg(),
+		execCfg,
 		featureChangefeedEnabled,
 		"CHANGEFEED",
 	); err != nil {
@@ -702,7 +742,7 @@ func validateSettings(ctx context.Context, p sql.PlanHookState) error {
 
 	// Changefeeds are based on the Rangefeed abstraction, which
 	// requires the `kv.rangefeed.enabled` setting to be true.
-	if !kvserver.RangefeedEnabled.Get(&p.ExecCfg().Settings.SV) {
+	if needsRangeFeed && !kvserver.RangefeedEnabled.Get(&execCfg.Settings.SV) {
 		return errors.Errorf("rangefeeds require the kv.rangefeed.enabled setting. See %s",
 			docs.URL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
@@ -1032,9 +1072,50 @@ func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) err
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	progress := b.job.Progress()
 
+	if createdBy := b.job.Payload().CreationClusterID; !jobExec.ExtendedEvalContext().ClusterID.Equal(createdBy) {
+		return errors.Newf("this changefeed was orignally created by cluster %s; it must be recreated on this cluster if this cluster is now expected to emit to the same destination", createdBy)
+	}
+
 	err := b.resumeWithRetries(ctx, jobExec, jobID, details, progress, execCfg)
 	if err != nil {
 		return b.handleChangefeedError(ctx, err, details, jobExec)
+	}
+	return nil
+}
+
+// TODO(dt): remove this copy pasta from backupResumer in favor of a shared func
+// somewhere in pkg/jobs or the job registry.
+func (b *changefeedResumer) maybeRelocateJobExecution(
+	ctx context.Context, p sql.JobExecContext, locality roachpb.Locality,
+) error {
+	if locality.NonEmpty() {
+		current, err := p.DistSQLPlanner().GetSQLInstanceInfo(p.ExecCfg().JobRegistry.ID())
+		if err != nil {
+			return err
+		}
+		if ok, missedTier := current.Locality.Matches(locality); !ok {
+			log.Infof(ctx,
+				"CHANGEFEED job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
+				b.job.ID(), current.NodeID, missedTier.String(),
+			)
+
+			instancesInRegion, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, locality)
+			if err != nil {
+				return err
+			}
+			rng, _ := randutil.NewPseudoRand()
+			dest := instancesInRegion[rng.Intn(len(instancesInRegion))]
+
+			var res error
+			if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				var err error
+				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, b.job.ID(), dest.InstanceID, dest.SessionID)
+				return err
+			}); err != nil {
+				return errors.Wrapf(err, "failed to relocate job coordinator to %d", dest.InstanceID)
+			}
+			return res
+		}
 	}
 	return nil
 }
@@ -1045,6 +1126,11 @@ func (b *changefeedResumer) handleChangefeedError(
 	details jobspb.ChangefeedDetails,
 	jobExec sql.JobExecContext,
 ) error {
+	// Execution relocation errors just get returned immediately, as they indicate
+	// another node has taken over execution and this execution should end now.
+	if jobs.IsLeaseRelocationError(changefeedErr) {
+		return changefeedErr
+	}
 	opts := changefeedbase.MakeStatementOptions(details.Opts)
 	onError, errErr := opts.GetOnError()
 	if errErr != nil {
@@ -1087,6 +1173,19 @@ func (b *changefeedResumer) resumeWithRetries(
 	progress jobspb.Progress,
 	execCfg *sql.ExecutorConfig,
 ) error {
+	// If execution needs to be and is relocated, the resulting error should be
+	// returned without retry, as it indicates _this_ execution should cease now
+	// that execution is elsewhere, so check this before the retry loop.
+	if filter := details.Opts[changefeedbase.OptExecutionLocality]; filter != "" {
+		var loc roachpb.Locality
+		if err := loc.Set(filter); err != nil {
+			return err
+		}
+		if err := b.maybeRelocateJobExecution(ctx, jobExec, loc); err != nil {
+			return err
+		}
+	}
+
 	// We'd like to avoid failing a changefeed unnecessarily, so when an error
 	// bubbles up to this level, we'd like to "retry" the flow if possible. This
 	// could be because the sink is down or because a cockroach node has crashed
@@ -1124,7 +1223,8 @@ func (b *changefeedResumer) resumeWithRetries(
 		}
 
 		// All other errors retry.
-		log.Warningf(ctx, `WARNING: CHANGEFEED job %d encountered retryable error: %v`, jobID, err)
+		log.Warningf(ctx, `WARNING: CHANGEFEED job %d encountered retryable error: %v (attempt %d)`,
+			jobID, err, 1+r.CurrentAttempt())
 		lastRunStatusUpdate = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "retryable error: %s", err)
 		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
 			sli, err := metrics.getSLIMetrics(details.Opts[changefeedbase.OptMetricsScope])
@@ -1137,8 +1237,11 @@ func (b *changefeedResumer) resumeWithRetries(
 		// been updated by the changeFrontier processor since the flow started.
 		reloadedJob, reloadErr := execCfg.JobRegistry.LoadClaimedJob(ctx, jobID)
 		if reloadErr != nil {
-			if ctx.Err() != nil {
+			switch {
+			case ctx.Err() != nil:
 				return ctx.Err()
+			case jobs.HasJobNotFoundError(reloadErr):
+				return reloadErr
 			}
 			log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress; `+
 				`continuing from last known high-water of %s: %v`,

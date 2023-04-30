@@ -33,7 +33,7 @@ import {
 import * as format from "src/util/format";
 import {
   DATE_FORMAT,
-  DATE_FORMAT_24_UTC,
+  DATE_FORMAT_24_TZ,
   EncodeDatabaseTableUri,
   EncodeDatabaseUri,
   EncodeUriName,
@@ -49,7 +49,7 @@ import {
 import styles from "./databaseTablePage.module.scss";
 import { commonStyles } from "src/common";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
-import moment, { Moment } from "moment";
+import moment, { Moment } from "moment-timezone";
 import { Search as IndexIcon } from "@cockroachlabs/icons";
 import booleanSettingStyles from "../settings/booleanSetting.module.scss";
 import { CircleFilled } from "../icon";
@@ -60,6 +60,8 @@ import { RecommendationType } from "../indexDetailsPage";
 import LoadingError from "../sqlActivity/errorComponent";
 import { Loading } from "../loading";
 import { UIConfigState } from "../store";
+import { QuoteIdentifier } from "../api/safesql";
+import { Timestamp, Timezone } from "../timestamp";
 
 const cx = classNames.bind(styles);
 const booleanSettingCx = classnames.bind(booleanSettingStyles);
@@ -111,7 +113,6 @@ export interface DatabaseTablePageData {
   databaseName: string;
   name: string;
   details: DatabaseTablePageDataDetails;
-  stats: DatabaseTablePageDataStats;
   indexStats: DatabaseTablePageIndexStats;
   showNodeRegionsSection?: boolean;
   automaticStatsCollectionEnabled?: boolean;
@@ -130,6 +131,9 @@ export interface DatabaseTablePageDataDetails {
   totalBytes: number;
   liveBytes: number;
   livePercentage: number;
+  sizeInBytes: number;
+  rangeCount: number;
+  nodesByRegionString?: string;
 }
 
 export interface DatabaseTablePageIndexStats {
@@ -158,18 +162,8 @@ interface Grant {
   privileges: string[];
 }
 
-export interface DatabaseTablePageDataStats {
-  loading: boolean;
-  loaded: boolean;
-  lastError: Error;
-  sizeInBytes: number;
-  rangeCount: number;
-  nodesByRegionString?: string;
-}
-
 export interface DatabaseTablePageActions {
   refreshTableDetails: (database: string, table: string) => void;
-  refreshTableStats: (database: string, table: string) => void;
   refreshSettings: () => void;
   refreshIndexStats?: (database: string, table: string) => void;
   resetIndexUsageStats?: (database: string, table: string) => void;
@@ -272,17 +266,6 @@ export class DatabaseTablePage extends React.Component<
       );
     }
 
-    if (
-      !this.props.stats.loaded &&
-      !this.props.stats.loading &&
-      this.props.stats.lastError === undefined
-    ) {
-      return this.props.refreshTableStats(
-        this.props.databaseName,
-        this.props.name,
-      );
-    }
-
     if (!this.props.indexStats.loaded && !this.props.indexStats.loading) {
       return this.props.refreshIndexStats(
         this.props.databaseName,
@@ -321,24 +304,31 @@ export class DatabaseTablePage extends React.Component<
     history.replace(history.location);
   }
 
-  private getLastResetString() {
+  private getLastReset() {
     const lastReset = this.props.indexStats.lastReset;
     if (lastReset.isSame(this.minDate)) {
-      return "Last reset: Never";
+      return <>Last reset: Never</>;
     } else {
-      return "Last reset: " + lastReset.format(DATE_FORMAT_24_UTC);
+      return (
+        <>
+          Last reset: <Timestamp time={lastReset} format={DATE_FORMAT_24_TZ} />
+        </>
+      );
     }
   }
 
-  private getLastUsedString(indexStat: IndexStat) {
+  private getLastUsed(indexStat: IndexStat) {
     // This case only occurs when we have no reads, resets, or creation time on
     // the index.
     if (indexStat.lastUsed.isSame(this.minDate)) {
-      return "Never";
+      return <>Never</>;
     }
-    return `Last ${indexStat.lastUsedType}: ${indexStat.lastUsed.format(
-      DATE_FORMAT,
-    )}`;
+    return (
+      <>
+        Last {indexStat.lastUsedType}:{" "}
+        <Timestamp time={indexStat.lastUsed} format={DATE_FORMAT} />
+      </>
+    );
   }
 
   private renderIndexRecommendations = (
@@ -394,7 +384,9 @@ export class DatabaseTablePage extends React.Component<
     const query = indexStat.indexRecommendations.map(recommendation => {
       switch (recommendation.type) {
         case "DROP_UNUSED":
-          return `DROP INDEX ${this.props.name}@${indexStat.indexName};`;
+          return `DROP INDEX ${QuoteIdentifier(
+            this.props.name,
+          )}@${QuoteIdentifier(indexStat.indexName)};`;
       }
     });
     if (query.length === 0) {
@@ -436,10 +428,14 @@ export class DatabaseTablePage extends React.Component<
     },
     {
       name: "last used",
-      title: "Last Used (UTC)",
+      title: (
+        <>
+          Last Used <Timezone />
+        </>
+      ),
       hideTitleUnderline: true,
       className: cx("index-stats-table__col-last-used"),
-      cell: indexStat => this.getLastUsedString(indexStat),
+      cell: indexStat => this.getLastUsed(indexStat),
       sort: indexStat => indexStat.lastUsed,
     },
     {
@@ -549,11 +545,9 @@ export class DatabaseTablePage extends React.Component<
               className={cx("tab-pane")}
             >
               <Loading
-                loading={this.props.details.loading && this.props.stats.loading}
+                loading={this.props.details.loading}
                 page={"table_details"}
-                error={
-                  this.props.details.lastError || this.props.stats.lastError
-                }
+                error={this.props.details.lastError}
                 render={() => (
                   <>
                     <Row gutter={18}>
@@ -567,7 +561,7 @@ export class DatabaseTablePage extends React.Component<
                         <SummaryCard className={cx("summary-card")}>
                           <SummaryCardItem
                             label="Size"
-                            value={format.Bytes(this.props.stats.sizeInBytes)}
+                            value={format.Bytes(this.props.details.sizeInBytes)}
                           />
                           <SummaryCardItem
                             label="Replicas"
@@ -575,7 +569,7 @@ export class DatabaseTablePage extends React.Component<
                           />
                           <SummaryCardItem
                             label="Ranges"
-                            value={this.props.stats.rangeCount}
+                            value={this.props.details.rangeCount}
                           />
                           <SummaryCardItem
                             label="% of Live Data"
@@ -584,9 +578,12 @@ export class DatabaseTablePage extends React.Component<
                           {this.props.details.statsLastUpdated && (
                             <SummaryCardItem
                               label="Table Stats Last Updated"
-                              value={this.props.details.statsLastUpdated.format(
-                                DATE_FORMAT_24_UTC,
-                              )}
+                              value={
+                                <Timestamp
+                                  time={this.props.details.statsLastUpdated}
+                                  format={DATE_FORMAT_24_TZ}
+                                />
+                              }
                             />
                           )}
                           {this.props.automaticStatsCollectionEnabled !=
@@ -621,7 +618,7 @@ export class DatabaseTablePage extends React.Component<
                           {this.props.showNodeRegionsSection && (
                             <SummaryCardItem
                               label="Regions/Nodes"
-                              value={this.props.stats.nodesByRegionString}
+                              value={this.props.details.nodesByRegionString}
                             />
                           )}
                           <SummaryCardItem
@@ -658,7 +655,7 @@ export class DatabaseTablePage extends React.Component<
                                   "underline",
                                 )}
                               >
-                                {this.getLastResetString()}
+                                {this.getLastReset()}
                               </div>
                             </Tooltip>
                             {hasAdminRole && (
@@ -699,13 +696,9 @@ export class DatabaseTablePage extends React.Component<
                 renderError={() =>
                   LoadingError({
                     statsType: "databases",
-                    timeout:
-                      this.props.details.lastError?.name
-                        ?.toLowerCase()
-                        .includes("timeout") ||
-                      this.props.stats.lastError?.name
-                        ?.toLowerCase()
-                        .includes("timeout"),
+                    timeout: this.props.details.lastError?.name
+                      ?.toLowerCase()
+                      .includes("timeout"),
                   })
                 }
               />
@@ -722,6 +715,7 @@ export class DatabaseTablePage extends React.Component<
                     sortSetting={this.state.grantSortSetting}
                     onChangeSortSetting={this.changeGrantSortSetting.bind(this)}
                     loading={this.props.details.loading}
+                    tableWrapperClassName={cx("sorted-table")}
                   />
                 )}
                 renderError={() =>

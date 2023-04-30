@@ -15,7 +15,17 @@ import {
   idAttr,
   statementAttr,
   txnFingerprintIdAttr,
+  unset,
+  ExecutionStatistics,
+  queryByName,
+  appAttr,
+  flattenStatementStats,
+  FixFingerprintHexValue,
 } from "src/util";
+import { createSelector } from "@reduxjs/toolkit";
+import { SqlStatsResponse } from "../api";
+import { AggregateStatistics } from "src/statementsTable";
+import { StatementDiagnosticsDictionary } from "src/store/statementDiagnostics";
 
 // The functions in this file are agnostic to the different shape of each
 // state in db-console and cluster-ui. This file contains selector functions
@@ -24,14 +34,14 @@ import {
 // between db-console and cluster-ui.
 
 export const selectExecutionID = (
-  _state: any,
+  _state: unknown,
   props: RouteComponentProps,
 ): string | null => {
   return getMatchParamByName(props.match, executionIdAttr);
 };
 
 export const selectID = (
-  _state: any,
+  _state: unknown,
   props: RouteComponentProps,
 ): string | null => {
   return getMatchParamByName(props.match, idAttr);

@@ -66,7 +66,7 @@ analyze_stmt ::=
 copy_stmt ::=
 	'COPY' table_name opt_column_list 'FROM' 'STDIN' opt_with_copy_options opt_where_clause
 	| 'COPY' table_name opt_column_list 'TO' 'STDOUT' opt_with_copy_options
-	| 'COPY' '(' preparable_stmt ')' 'TO' 'STDOUT' opt_with_copy_options
+	| 'COPY' '(' copy_to_stmt ')' 'TO' 'STDOUT' opt_with_copy_options
 
 comment_stmt ::=
 	'COMMENT' 'ON' 'DATABASE' database_name 'IS' comment_text
@@ -331,6 +331,13 @@ opt_with_copy_options ::=
 opt_where_clause ::=
 	where_clause
 	| 
+
+copy_to_stmt ::=
+	delete_stmt
+	| insert_stmt
+	| select_stmt
+	| update_stmt
+	| upsert_stmt
 
 database_name ::=
 	name
@@ -781,8 +788,8 @@ show_backup_stmt ::=
 	| 'SHOW' 'BACKUP' 'FILES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'RANGES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'VALIDATE' string_or_placeholder opt_with_show_backup_options
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder opt_with_show_backup_options
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder 'WITH' 'TRANSFER' '=' string_or_placeholder
+	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder
+	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder 'WITH' show_backup_connection_options_list
 
 show_columns_stmt ::=
 	'SHOW' 'COLUMNS' 'FROM' table_name with_comment
@@ -792,7 +799,7 @@ show_constraints_stmt ::=
 	| 'SHOW' 'CONSTRAINTS' 'FROM' table_name with_comment
 
 show_create_stmt ::=
-	'SHOW' 'CREATE' table_name
+	'SHOW' 'CREATE' table_name opt_show_create_format_options
 	| 'SHOW' 'CREATE' 'ALL' 'SCHEMAS'
 	| 'SHOW' 'CREATE' 'ALL' 'TABLES'
 	| 'SHOW' 'CREATE' 'ALL' 'TYPES'
@@ -846,12 +853,15 @@ show_partitions_stmt ::=
 show_jobs_stmt ::=
 	'SHOW' 'AUTOMATIC' 'JOBS'
 	| 'SHOW' 'JOBS'
+	| 'SHOW' 'JOBS' 'WITH' show_job_options_list
 	| 'SHOW' 'CHANGEFEED' 'JOBS'
 	| 'SHOW' 'JOBS' select_stmt
+	| 'SHOW' 'JOBS' select_stmt 'WITH' show_job_options_list
 	| 'SHOW' 'JOBS' 'WHEN' 'COMPLETE' select_stmt
 	| 'SHOW' 'JOBS' for_schedules_clause
 	| 'SHOW' 'CHANGEFEED' 'JOBS' select_stmt
 	| 'SHOW' 'JOB' a_expr
+	| 'SHOW' 'JOB' a_expr 'WITH' show_job_options_list
 	| 'SHOW' 'CHANGEFEED' 'JOB' a_expr
 	| 'SHOW' 'JOB' 'WHEN' 'COMPLETE' a_expr
 
@@ -1034,6 +1044,7 @@ unreserved_keyword ::=
 	| 'BUNDLE'
 	| 'BY'
 	| 'CACHE'
+	| 'CALL'
 	| 'CALLED'
 	| 'CANCEL'
 	| 'CANCELQUERY'
@@ -1063,7 +1074,6 @@ unreserved_keyword ::=
 	| 'CONTROLJOB'
 	| 'CONVERSION'
 	| 'CONVERT'
-	| 'COORDINATOR_LOCALITY'
 	| 'COPY'
 	| 'COST'
 	| 'COVERING'
@@ -1210,6 +1220,7 @@ unreserved_keyword ::=
 	| 'MINUTE'
 	| 'MINVALUE'
 	| 'MODIFYCLUSTERSETTING'
+	| 'MODIFYSQLCLUSTERSETTING'
 	| 'MULTILINESTRING'
 	| 'MULTILINESTRINGM'
 	| 'MULTILINESTRINGZ'
@@ -1249,7 +1260,6 @@ unreserved_keyword ::=
 	| 'NOVIEWACTIVITY'
 	| 'NOVIEWACTIVITYREDACTED'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'NOVIEWJOB'
 	| 'NOWAIT'
 	| 'NULLS'
 	| 'IGNORE_FOREIGN_KEYS'
@@ -1291,6 +1301,7 @@ unreserved_keyword ::=
 	| 'PRIOR'
 	| 'PRIORITY'
 	| 'PRIVILEGES'
+	| 'PROCEDURE'
 	| 'PUBLIC'
 	| 'PUBLICATION'
 	| 'QUERIES'
@@ -1303,6 +1314,7 @@ unreserved_keyword ::=
 	| 'REASSIGN'
 	| 'RECURRING'
 	| 'RECURSIVE'
+	| 'REDACT'
 	| 'REF'
 	| 'REFRESH'
 	| 'REGION'
@@ -1426,6 +1438,7 @@ unreserved_keyword ::=
 	| 'UNKNOWN'
 	| 'UNLISTEN'
 	| 'UNLOGGED'
+	| 'UNSAFE_RESTORE_INCOMPATIBLE_VERSION'
 	| 'UNSET'
 	| 'UNSPLIT'
 	| 'UNTIL'
@@ -1444,8 +1457,8 @@ unreserved_keyword ::=
 	| 'VIEWCLUSTERMETADATA'
 	| 'VIEWCLUSTERSETTING'
 	| 'VIEWDEBUG'
-	| 'VIEWJOB'
 	| 'VISIBLE'
+	| 'VISIBILITY'
 	| 'VOLATILE'
 	| 'VOTERS'
 	| 'WITHIN'
@@ -1697,7 +1710,7 @@ for_schedules_clause ::=
 
 create_database_stmt ::=
 	'CREATE' 'DATABASE' database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_owner_clause opt_super_region_clause opt_secondary_region_clause
-	| 'CREATE' 'DATABASE' 'IF' 'NOT' 'EXISTS' database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_super_region_clause opt_secondary_region_clause
+	| 'CREATE' 'DATABASE' 'IF' 'NOT' 'EXISTS' database_name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause opt_connection_limit opt_primary_region_clause opt_regions_list opt_survival_goal_clause opt_placement_clause opt_owner_clause opt_super_region_clause opt_secondary_region_clause
 
 create_index_stmt ::=
 	'CREATE' opt_unique 'INDEX' opt_concurrently opt_index_name 'ON' table_name opt_index_access_method '(' index_params ')' opt_hash_sharded opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
@@ -1832,7 +1845,7 @@ drop_func_stmt ::=
 
 tenant_spec ::=
 	d_expr
-	| '[' d_expr ']'
+	| '[' a_expr ']'
 
 opt_immediate ::=
 	'IMMEDIATE'
@@ -1929,9 +1942,15 @@ opt_with_show_backup_options ::=
 	| 'WITH' 'OPTIONS' '(' show_backup_options_list ')'
 	| 
 
+show_backup_connection_options_list ::=
+	( show_backup_connection_options ) ( ( ',' show_backup_connection_options ) )*
+
 with_comment ::=
 	'WITH' 'COMMENT'
 	| 
+
+opt_show_create_format_options ::=
+	'WITH' 'REDACT'
 
 show_csettings_stmt ::=
 	'SHOW' 'CLUSTER' 'SETTING' var_name
@@ -1947,6 +1966,9 @@ opt_on_targets_roles ::=
 for_grantee_clause ::=
 	'FOR' role_spec_list
 	| 
+
+show_job_options_list ::=
+	( show_job_options ) ( ( ',' show_job_options ) )*
 
 opt_schedule_executor_type ::=
 	'FOR' 'BACKUP'
@@ -2290,7 +2312,7 @@ backup_options ::=
 	| 'DETACHED' '=' 'FALSE'
 	| 'KMS' '=' string_or_placeholder_opt_list
 	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
-	| 'COORDINATOR_LOCALITY' '=' string_or_placeholder
+	| 'EXECUTION' 'LOCALITY' '=' string_or_placeholder
 	| 'INCLUDE_ALL_SECONDARY_TENANTS'
 	| 'INCLUDE_ALL_SECONDARY_TENANTS' '=' a_expr
 
@@ -2418,6 +2440,7 @@ opt_index_visible ::=
 	'NOT' 'VISIBLE'
 	| 'INVISIBLE'
 	| 'VISIBLE'
+	| 'VISIBILITY' 'FCONST'
 	| 
 
 opt_schema_name ::=
@@ -2658,6 +2681,7 @@ restore_options ::=
 	| 'TENANT' '=' string_or_placeholder
 	| 'SCHEMA_ONLY'
 	| 'VERIFY_BACKUP_TABLE_DATA'
+	| 'UNSAFE_RESTORE_INCOMPATIBLE_VERSION'
 
 scrub_option_list ::=
 	( scrub_option ) ( ( ',' scrub_option ) )*
@@ -2696,12 +2720,20 @@ extra_var_value ::=
 show_backup_options_list ::=
 	( show_backup_options ) ( ( ',' show_backup_options ) )*
 
+show_backup_connection_options ::=
+	'TRANSFER' '=' string_or_placeholder
+	| 'TIME' '=' string_or_placeholder
+	| 'CONCURRENTLY' '=' a_expr
+
 targets_roles ::=
 	'ROLE' role_spec_list
 	| 'SCHEMA' schema_name_list
 	| 'SCHEMA' schema_wildcard
 	| 'TYPE' type_name_list
 	| grant_targets
+
+show_job_options ::=
+	'EXECUTION' 'DETAILS'
 
 show_ranges_options ::=
 	( 'TABLES' | 'INDEXES' | 'DETAILS' | 'KEYS' | 'EXPLAIN' ) ( ( ',' 'TABLES' | ',' 'INDEXES' | ',' 'DETAILS' | ',' 'EXPLAIN' | ',' 'KEYS' ) )*
@@ -2868,6 +2900,7 @@ alter_index_visible ::=
 	'NOT' 'VISIBLE'
 	| 'INVISIBLE'
 	| 'VISIBLE'
+	| 'VISIBILITY' 'FCONST'
 
 sequence_option_list ::=
 	( sequence_option_elem ) ( ( sequence_option_elem ) )*
@@ -2964,8 +2997,6 @@ role_option ::=
 	| 'NOSQLLOGIN'
 	| 'VIEWCLUSTERSETTING'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'VIEWJOB'
-	| 'NOVIEWJOB'
 	| password_clause
 	| valid_until_clause
 
@@ -3438,7 +3469,7 @@ func_param_with_default ::=
 	| func_param '=' a_expr
 
 create_func_opt_item ::=
-	'AS' func_as
+	'AS' func_as opt_link_sym
 	| 'LANGUAGE' non_reserved_word_or_sconst
 	| common_func_opt_item
 
@@ -3492,6 +3523,7 @@ bare_label_keywords ::=
 	| 'BUNDLE'
 	| 'BY'
 	| 'CACHE'
+	| 'CALL'
 	| 'CALLED'
 	| 'CANCEL'
 	| 'CANCELQUERY'
@@ -3530,7 +3562,6 @@ bare_label_keywords ::=
 	| 'CONTROLJOB'
 	| 'CONVERSION'
 	| 'CONVERT'
-	| 'COORDINATOR_LOCALITY'
 	| 'COPY'
 	| 'COST'
 	| 'COVERING'
@@ -3728,6 +3759,7 @@ bare_label_keywords ::=
 	| 'METHOD'
 	| 'MINVALUE'
 	| 'MODIFYCLUSTERSETTING'
+	| 'MODIFYSQLCLUSTERSETTING'
 	| 'MOVE'
 	| 'MULTILINESTRING'
 	| 'MULTILINESTRINGM'
@@ -3767,7 +3799,6 @@ bare_label_keywords ::=
 	| 'NOVIEWACTIVITY'
 	| 'NOVIEWACTIVITYREDACTED'
 	| 'NOVIEWCLUSTERSETTING'
-	| 'NOVIEWJOB'
 	| 'NOWAIT'
 	| 'NO_FULL_SCAN'
 	| 'NO_INDEX_JOIN'
@@ -3822,6 +3853,7 @@ bare_label_keywords ::=
 	| 'PRIOR'
 	| 'PRIORITY'
 	| 'PRIVILEGES'
+	| 'PROCEDURE'
 	| 'PUBLIC'
 	| 'PUBLICATION'
 	| 'QUERIES'
@@ -3835,6 +3867,7 @@ bare_label_keywords ::=
 	| 'REASSIGN'
 	| 'RECURRING'
 	| 'RECURSIVE'
+	| 'REDACT'
 	| 'REF'
 	| 'REFERENCES'
 	| 'REFRESH'
@@ -3980,6 +4013,7 @@ bare_label_keywords ::=
 	| 'UNKNOWN'
 	| 'UNLISTEN'
 	| 'UNLOGGED'
+	| 'UNSAFE_RESTORE_INCOMPATIBLE_VERSION'
 	| 'UNSET'
 	| 'UNSPLIT'
 	| 'UNTIL'
@@ -4003,9 +4037,9 @@ bare_label_keywords ::=
 	| 'VIEWCLUSTERMETADATA'
 	| 'VIEWCLUSTERSETTING'
 	| 'VIEWDEBUG'
-	| 'VIEWJOB'
 	| 'VIRTUAL'
 	| 'VISIBLE'
+	| 'VISIBILITY'
 	| 'VOLATILE'
 	| 'VOTERS'
 	| 'WHEN'
@@ -4315,6 +4349,10 @@ create_as_constraint_elem ::=
 
 func_as ::=
 	'SCONST'
+
+opt_link_sym ::=
+	',' 'SCONST'
+	| 
 
 col_def_list_no_types ::=
 	( name ) ( ( ',' name ) )*

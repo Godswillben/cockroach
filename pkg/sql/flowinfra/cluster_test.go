@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -95,13 +96,15 @@ func runTestClusterFlow(
 	txnProto := roachpb.MakeTransaction(
 		"cluster-test",
 		nil, // baseKey
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		now.ToTimestamp(),
 		0, // maxOffsetNs
 		int32(servers[0].SQLInstanceID()),
 	)
 	txn := kv.NewTxnFromProto(ctx, kvDB, roachpb.NodeID(servers[0].SQLInstanceID()), now, kv.RootTxn, &txnProto)
-	leafInputState := txn.GetLeafTxnInputState(ctx)
+	leafInputState, err := txn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 
 	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(&spec, codec, desc, desc.ActiveIndexes()[1], []descpb.ColumnID{1, 2}); err != nil {
@@ -412,6 +415,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	txnProto := roachpb.MakeTransaction(
 		"deadlock-test",
 		nil, // baseKey
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		now.ToTimestamp(),
 		0, // maxOffsetNs
@@ -420,7 +424,8 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	txn := kv.NewTxnFromProto(
 		context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
 		now, kv.RootTxn, &txnProto)
-	leafInputState := txn.GetLeafTxnInputState(context.Background())
+	leafInputState, err := txn.GetLeafTxnInputState(context.Background())
+	require.NoError(t, err)
 
 	req := execinfrapb.SetupFlowRequest{
 		Version:           execinfra.Version,
@@ -705,6 +710,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 					txnProto := roachpb.MakeTransaction(
 						"cluster-test",
 						nil, // baseKey
+						isolation.Serializable,
 						roachpb.NormalUserPriority,
 						now.ToTimestamp(),
 						0, // maxOffsetNs
@@ -713,7 +719,8 @@ func BenchmarkInfrastructure(b *testing.B) {
 					txn := kv.NewTxnFromProto(
 						context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
 						now, kv.RootTxn, &txnProto)
-					leafInputState := txn.GetLeafTxnInputState(context.Background())
+					leafInputState, err := txn.GetLeafTxnInputState(context.Background())
+					require.NoError(b, err)
 					for i := range reqs {
 						reqs[i] = execinfrapb.SetupFlowRequest{
 							Version:           execinfra.Version,

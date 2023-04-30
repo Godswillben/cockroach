@@ -13,6 +13,7 @@ package bench
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -28,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -967,6 +967,28 @@ CREATE TABLE bench.insert_distinct (
 `
 	db.Exec(b, schema)
 
+	// When running against SQL databases, create all the connections in advance.
+	// Without this, if the workers use the connection pool directly, on OSX and
+	// FreeBSD the server cannot accept connections fast enough and so opening
+	// some connections fails. This happens when we attempt to open 1000
+	// connections concurrently because of the default kernel limit of
+	// kern.ipc.somaxconn=128.
+	ctx := context.Background()
+	conns := make([]sqlutils.DBHandle, numUsers)
+	for i := 0; i < numUsers; i++ {
+		sqldb, ok := db.DB.(*gosql.DB)
+		if ok {
+			conn, err := sqldb.Conn(ctx)
+			require.NoError(b, err)
+			defer func() {
+				_ = conn.Close()
+			}()
+			conns[i] = conn
+		} else {
+			conns[i] = db.DB
+		}
+	}
+
 	b.ResetTimer()
 
 	errChan := make(chan error)
@@ -1000,7 +1022,7 @@ CREATE TABLE bench.insert_distinct (
 						fmt.Fprintf(&buf, "(%d, %d)", zipf.Uint64(), n)
 					}
 
-					if _, err := db.DB.ExecContext(context.Background(), buf.String()); err != nil {
+					if _, err := conns[i].ExecContext(context.Background(), buf.String()); err != nil {
 						return err
 					}
 				}
@@ -1452,14 +1474,15 @@ func BenchmarkFuncExprTypeCheck(b *testing.B) {
 
 	ctx := context.Background()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-	p, cleanup := sql.NewInternalPlanner("type-check-benchmark",
+	sd := sql.NewInternalSessionData(ctx, execCfg.Settings, "type-check-benchmark")
+	sd.Database = "defaultdb"
+	p, cleanup := sql.NewInternalPlanner(
+		"type-check-benchmark",
 		kvDB.NewTxn(ctx, "type-check-benchmark-planner"),
 		username.RootUserName(),
 		&sql.MemoryMetrics{},
 		&execCfg,
-		sessiondatapb.SessionData{
-			Database: "defaultdb",
-		},
+		sd,
 	)
 
 	defer cleanup()

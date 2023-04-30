@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -21,8 +22,8 @@ import (
 )
 
 // TxnType specifies whether a transaction is the root (parent)
-// transaction, or a leaf (child) in a tree of client.Txns, as
-// is used in a DistSQL flow.
+// transaction, or a leaf (child) in a tree of kv.Txns, as is
+// used in a DistSQL flow.
 type TxnType int
 
 const (
@@ -51,8 +52,8 @@ const (
 // the "client" and the "server", involved in passing along and
 // ultimately evaluating requests (batches). The interface is now
 // considered regrettable because it's too narrow and at times leaky.
-// Notable implementors: client.Txn, kv.TxnCoordSender, storage.Node,
-// storage.Store, storage.Replica.
+// Notable implementors: kv.Txn, kvcoord.TxnCoordSender, server.Node,
+// kvserver.Store, kvserver.Replica.
 type Sender interface {
 	// Send sends a batch for evaluation. Either a response or an error is
 	// returned.
@@ -77,7 +78,7 @@ type Sender interface {
 	//
 	// TODO(andrei): The client does not currently use this last
 	// guarantee; it clones the txn for every request. Given that a
-	// client.Txn can be used concurrently, in order for the client to
+	// kv.Txn can be used concurrently, in order for the client to
 	// take advantage of this, it would need to switch to a
 	// copy-on-write scheme so that its updates to the txn do not race
 	// with the server reading it. We should do this to avoid the
@@ -94,25 +95,28 @@ type Sender interface {
 // TxnSender is the interface used to call into a CockroachDB instance
 // when sending transactional requests. In addition to the usual
 // Sender interface, TxnSender facilitates marshaling of transaction
-// metadata between the "root" client.Txn and "leaf" instances.
+// metadata between the "root" kv.Txn and "leaf" instances.
 type TxnSender interface {
 	Sender
 
 	// GetLeafTxnInputState retrieves the input state necessary and
 	// sufficient to initialize a LeafTxn from the current RootTxn.
-	//
-	// If AnyTxnStatus is passed, then this function never returns
-	// errors.
-	GetLeafTxnInputState(context.Context, TxnStatusOpt) (*roachpb.LeafTxnInputState, error)
+	GetLeafTxnInputState(context.Context) (*roachpb.LeafTxnInputState, error)
 
 	// GetLeafTxnFinalState retrieves the final state of a LeafTxn
 	// necessary and sufficient to update a RootTxn with progress made
 	// on its behalf by the LeafTxn.
-	GetLeafTxnFinalState(context.Context, TxnStatusOpt) (*roachpb.LeafTxnFinalState, error)
+	GetLeafTxnFinalState(context.Context) (*roachpb.LeafTxnFinalState, error)
 
 	// UpdateRootWithLeafFinalState updates a RootTxn using the final
 	// state of a LeafTxn.
-	UpdateRootWithLeafFinalState(context.Context, *roachpb.LeafTxnFinalState)
+	UpdateRootWithLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error
+
+	// SetIsoLevel sets the txn's isolation level.
+	SetIsoLevel(isolation.Level) error
+
+	// IsoLevel returns the txn's isolation level.
+	IsoLevel() isolation.Level
 
 	// SetUserPriority sets the txn's priority.
 	SetUserPriority(roachpb.UserPriority) error
@@ -125,6 +129,11 @@ type TxnSender interface {
 
 	// TxnStatus exports the txn's status.
 	TxnStatus() roachpb.TransactionStatus
+
+	// ClientFinalized returns true is the client has issued an EndTxn
+	// request in an attempt to finalize the transaction. Once finalized,
+	// further batches except EndTxn(commit=false) will be rejected.
+	ClientFinalized() bool
 
 	// CreateSavepoint establishes a savepoint.
 	// This method is only valid when called on RootTxns.
@@ -276,6 +285,9 @@ type TxnSender interface {
 	// The method is idempotent.
 	Step(context.Context) error
 
+	// GetReadSeqNum gets the read sequence point for the current transaction.
+	GetReadSeqNum() enginepb.TxnSeq
+
 	// SetReadSeqNum sets the read sequence point for the current transaction.
 	SetReadSeqNum(seq enginepb.TxnSeq) error
 
@@ -293,20 +305,6 @@ type TxnSender interface {
 	// GetSteppingMode accompanies ConfigureStepping. It is provided
 	// for use in tests and assertion checks.
 	GetSteppingMode(ctx context.Context) (curMode SteppingMode)
-
-	// ManualRefresh attempts to refresh a transactions read timestamp up to its
-	// provisional commit timestamp. In the case that the two are already the
-	// same, it is a no-op. The reason one might want to do that is to ensure
-	// that a transaction can commit without experiencing another push.
-	//
-	// A transaction which has proven all of its intents and has been fully
-	// refreshed and does not perform any additional reads or writes that does not
-	// contend with any other transactions will not be pushed further. This
-	// method's reason for existence is to ensure that range merge requests can
-	// be pushed but then can later commit without the possibility of needing to
-	// refresh reads performed on the RHS after the RHS has been subsumed but
-	// before the merge transaction completed.
-	ManualRefresh(ctx context.Context) error
 
 	// DeferCommitWait defers the transaction's commit-wait operation, passing
 	// responsibility of commit-waiting from the TxnSender to the caller of this
@@ -358,21 +356,6 @@ type SavepointToken interface {
 	// forwarded without a refresh.
 	Initial() bool
 }
-
-// TxnStatusOpt represents options for TxnSender.GetMeta().
-type TxnStatusOpt int
-
-const (
-	// AnyTxnStatus means GetMeta() will return the info without
-	// checking the txn's status.
-	AnyTxnStatus TxnStatusOpt = iota
-	// OnlyPending means GetMeta() will return an error if the
-	// transaction is not in the pending state.
-	// This is used when sending the txn from root to leaves so that we
-	// don't create leaves that start up in an aborted state - which is
-	// not allowed.
-	OnlyPending
-)
 
 // TxnSenderFactory is the interface used to create new instances
 // of TxnSender.

@@ -539,7 +539,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 				RangeLeaseRenewalFraction: -1,
 				// Also make expiration-based leases last for a long time, as the test
 				// wants a valid lease after cluster start.
-				RaftElectionTimeoutTicks: 1000,
+				RangeLeaseDuration: time.Minute,
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
@@ -779,7 +779,7 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 			scan := kvpb.ScanRequest{
 				RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 			}
-			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, resTS, 0, 0)
+			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, 0, resTS, 0, 0)
 			scanHeader := kvpb.Header{
 				RangeID:         rangeID,
 				ReadConsistency: kvpb.CONSISTENT,

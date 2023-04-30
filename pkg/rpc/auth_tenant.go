@@ -18,6 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"google.golang.org/grpc"
@@ -50,11 +53,15 @@ func tenantIDFromString(commonName, field string) (roachpb.TenantID, error) {
 // authorize enforces a security boundary around endpoints that tenants
 // request from the host KV node or other tenant SQL pod.
 func (a tenantAuthorizer) authorize(
-	ctx context.Context, tenID roachpb.TenantID, fullMethod string, req interface{},
+	ctx context.Context,
+	sv *settings.Values,
+	tenID roachpb.TenantID,
+	fullMethod string,
+	req interface{},
 ) error {
 	switch fullMethod {
 	case "/cockroach.roachpb.Internal/Batch":
-		return a.authBatch(ctx, tenID, req.(*kvpb.BatchRequest))
+		return a.authBatch(ctx, sv, tenID, req.(*kvpb.BatchRequest))
 
 	case "/cockroach.roachpb.Internal/RangeLookup":
 		return a.authRangeLookup(tenID, req.(*kvpb.RangeLookupRequest))
@@ -149,7 +156,14 @@ func (a tenantAuthorizer) authorize(
 		return a.capabilitiesAuthorizer.HasNodeStatusCapability(ctx, tenID)
 
 	case "/cockroach.ts.tspb.TimeSeries/Query":
-		return a.capabilitiesAuthorizer.HasTSDBQueryCapability(ctx, tenID)
+		return a.authTSDBQuery(ctx, tenID, req.(*tspb.TimeSeriesQueryRequest))
+
+	case "/cockroach.blobs.Blob/List",
+		"/cockroach.blobs.Blob/Delete",
+		"/cockroach.blobs.Blob/Stat",
+		"/cockroach.blobs.Blob/GetStream",
+		"/cockroach.blobs.Blob/PutStream":
+		return a.capabilitiesAuthorizer.HasNodelocalStorageCapability(ctx, tenID)
 
 	default:
 		return authErrorf("unknown method %q", fullMethod)
@@ -166,51 +180,13 @@ func checkSpanBounds(rSpan, tenSpan roachpb.RSpan) error {
 // authBatch authorizes the provided tenant to invoke the Batch RPC with the
 // provided args.
 func (a tenantAuthorizer) authBatch(
-	ctx context.Context, tenID roachpb.TenantID, args *kvpb.BatchRequest,
+	ctx context.Context, sv *settings.Values, tenID roachpb.TenantID, args *kvpb.BatchRequest,
 ) error {
 	if err := a.capabilitiesAuthorizer.HasCapabilityForBatch(ctx, tenID, args); err != nil {
-		return authError(err.Error())
-	}
-
-	// TODO(ecwall): This list isn't exhaustive. For any request that isn't
-	// contained in here, there should be a corresponding capability. Once that's
-	// done, we can get rid of this loop entirely and perform all checks inside
-	// the capabilities Authorizer above.
-	for _, ru := range args.Requests {
-		switch ru.GetInner().(type) {
-		case
-			*kvpb.AddSSTableRequest,
-			*kvpb.AdminChangeReplicasRequest,
-			*kvpb.AdminRelocateRangeRequest,
-			*kvpb.AdminScatterRequest,
-			*kvpb.AdminSplitRequest,
-			*kvpb.AdminTransferLeaseRequest,
-			*kvpb.AdminUnsplitRequest,
-			*kvpb.ClearRangeRequest,
-			*kvpb.ConditionalPutRequest,
-			*kvpb.DeleteRangeRequest,
-			*kvpb.DeleteRequest,
-			*kvpb.EndTxnRequest,
-			*kvpb.ExportRequest,
-			*kvpb.GetRequest,
-			*kvpb.HeartbeatTxnRequest,
-			*kvpb.IncrementRequest,
-			*kvpb.InitPutRequest,
-			*kvpb.IsSpanEmptyRequest,
-			*kvpb.LeaseInfoRequest,
-			*kvpb.PutRequest,
-			*kvpb.QueryIntentRequest,
-			*kvpb.QueryLocksRequest,
-			*kvpb.QueryTxnRequest,
-			*kvpb.RangeStatsRequest,
-			*kvpb.RefreshRangeRequest,
-			*kvpb.RefreshRequest,
-			*kvpb.ReverseScanRequest,
-			*kvpb.RevertRangeRequest,
-			*kvpb.ScanRequest:
-			continue
+		if errors.HasAssertionFailure(err) {
+			logcrash.ReportOrPanic(ctx, sv, "%v", err)
 		}
-		return authErrorf("request [%s] not permitted", args.Summary())
+		return authError(err.Error())
 	}
 
 	// All keys in the request must reside within the tenant's keyspace.
@@ -231,10 +207,13 @@ func (a tenantAuthorizer) authGetRangeDescriptors(
 func (a tenantAuthorizer) authSpanStats(
 	tenID roachpb.TenantID, args *roachpb.SpanStatsRequest,
 ) error {
-	return validateSpan(tenID, roachpb.Span{
-		Key:    args.StartKey.AsRawKey(),
-		EndKey: args.EndKey.AsRawKey(),
-	})
+	for _, span := range args.Spans {
+		err := validateSpan(tenID, span)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // authRangeLookup authorizes the provided tenant to invoke the RangeLookup RPC
@@ -407,6 +386,26 @@ func (a tenantAuthorizer) authSpanConfigConformance(
 		if err := validateSpan(tenID, sp); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// authTSDBQuery authorizes the provided tenant to invoke the TSDB Query RPC
+// with the provided args. A non-system tenant is only allowed to query its own
+// time series.
+func (a tenantAuthorizer) authTSDBQuery(
+	ctx context.Context, id roachpb.TenantID, request *tspb.TimeSeriesQueryRequest,
+) error {
+	for _, query := range request.Queries {
+		if !query.TenantID.IsSet() {
+			return authError("tsdb query with unspecified tenant not permitted")
+		}
+		if !query.TenantID.Equal(id) {
+			return authErrorf("tsdb query with invalid tenant not permitted")
+		}
+	}
+	if err := a.capabilitiesAuthorizer.HasTSDBQueryCapability(ctx, id); err != nil {
+		return authError(err.Error())
 	}
 	return nil
 }

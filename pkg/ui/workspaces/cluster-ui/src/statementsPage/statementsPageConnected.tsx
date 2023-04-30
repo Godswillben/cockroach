@@ -15,7 +15,11 @@ import { Dispatch } from "redux";
 import { AppState, uiConfigActions } from "src/store";
 import { actions as statementDiagnosticsActions } from "src/store/statementDiagnostics";
 import { actions as analyticsActions } from "src/store/analytics";
-import { actions as localStorageActions } from "src/store/localStorage";
+import {
+  actions as localStorageActions,
+  updateStmtsPageLimitAction,
+  updateStmsPageReqSortAction,
+} from "src/store/localStorage";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
 import { actions as databasesListActions } from "src/store/databasesList";
 import { actions as nodesActions } from "../store/nodes";
@@ -24,20 +28,17 @@ import {
   StatementsPageStateProps,
 } from "./statementsPage";
 import {
-  selectApps,
   selectDatabases,
-  selectLastReset,
-  selectStatements,
-  selectStatementsDataValid,
-  selectStatementsLastError,
-  selectTotalFingerprints,
   selectColumns,
   selectSortSetting,
   selectFilters,
   selectSearch,
-  selectStatementsLastUpdated,
 } from "./statementsPage.selectors";
-import { selectTimeScale } from "../store/utils/selectors";
+import {
+  selectTimeScale,
+  selectStmtsPageLimit,
+  selectStmtsPageReqSort,
+} from "../store/utils/selectors";
 import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
@@ -61,6 +62,7 @@ import {
 import {
   InsertStmtDiagnosticRequest,
   StatementDiagnosticsReport,
+  SqlStatsSortType,
 } from "../api";
 
 type StateProps = {
@@ -83,7 +85,6 @@ export const ConnectedStatementsPage = withRouter(
     (state: AppState, props: RouteComponentProps) => ({
       fingerprintsPageProps: {
         ...props,
-        apps: selectApps(state),
         columns: selectColumns(state),
         databases: selectDatabases(state),
         timeScale: selectTimeScale(state),
@@ -91,15 +92,14 @@ export const ConnectedStatementsPage = withRouter(
         isTenant: selectIsTenant(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
         hasAdminRole: selectHasAdminRole(state),
-        lastReset: selectLastReset(state),
         nodeRegions: nodeRegionsByIDSelector(state),
         search: selectSearch(state),
         sortSetting: selectSortSetting(state),
-        statements: selectStatements(state, props),
-        isDataValid: selectStatementsDataValid(state),
-        lastUpdated: selectStatementsLastUpdated(state),
-        statementsError: selectStatementsLastError(state),
-        totalFingerprints: selectTotalFingerprints(state),
+        limit: selectStmtsPageLimit(state),
+        reqSortSetting: selectStmtsPageReqSort(state),
+        stmtsTotalRuntimeSecs:
+          state.adminUI?.statements?.data?.stmts_total_runtime_secs ?? 0,
+        statementsResponse: state.adminUI.statements,
       },
       activePageProps: mapStateToRecentStatementsPageProps(state),
     }),
@@ -120,8 +120,7 @@ export const ConnectedStatementsPage = withRouter(
         refreshNodes: () => dispatch(nodesActions.refresh()),
         refreshUserSQLRoles: () =>
           dispatch(uiConfigActions.refreshUserSQLRoles()),
-        resetSQLStats: (req: StatementsRequest) =>
-          dispatch(sqlStatsActions.reset(req)),
+        resetSQLStats: () => dispatch(sqlStatsActions.reset()),
         dismissAlertMessage: () =>
           dispatch(
             localStorageActions.update({
@@ -238,6 +237,20 @@ export const ConnectedStatementsPage = withRouter(
               key: "showColumns/StatementsPage",
               value:
                 selectedColumns.length === 0 ? " " : selectedColumns.join(","),
+            }),
+          ),
+        onChangeLimit: (limit: number) =>
+          dispatch(updateStmtsPageLimitAction(limit)),
+        onChangeReqSort: (sort: SqlStatsSortType) =>
+          dispatch(updateStmsPageReqSortAction(sort)),
+        onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) =>
+          dispatch(
+            analyticsActions.track({
+              name: "Apply Search Criteria",
+              page: "Statements",
+              tsValue: ts.key,
+              limitValue: limit,
+              sortValue: sort,
             }),
           ),
       },

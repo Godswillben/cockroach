@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -151,13 +152,13 @@ type TestServerArgs struct {
 	// config span.
 	DisableSpanConfigs bool
 
-	// TestServer will probabilistically start a single test tenant on each
-	// node for multi-tenant testing, and default all connections through that
-	// tenant. Use this flag to disable that behavior. You might want/need to
-	// disable this behavior if your test case is already leveraging tenants,
-	// or if some of the functionality being tested is not accessible from
-	// within tenants.
-	DisableDefaultTestTenant bool
+	// TestServer will probabilistically start a single test tenant on each node
+	// for multi-tenant testing, and default all connections through that tenant.
+	// Use this flag to change this behavior. You might want/need to alter this
+	// behavior if your test case is already leveraging tenants, or if some of the
+	// functionality being tested is not accessible from within tenants. See
+	// DefaultTestTenantOptions for alternative options that suits your test case.
+	DefaultTestTenant DefaultTestTenantOptions
 
 	// StartDiagnosticsReporting checks cluster.TelemetryOptOut(), and
 	// if not disabled starts the asynchronous goroutine that checks for
@@ -168,6 +169,10 @@ type TestServerArgs struct {
 	// ObsServiceAddr is the address to which events will be exported over OTLP.
 	// If empty, exporting events is inhibited.
 	ObsServiceAddr string
+
+	// AutoConfigProvider provides auto-configuration tasks to apply on
+	// the cluster during server initialization.
+	AutoConfigProvider acprovider.Provider
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -206,6 +211,28 @@ type TestClusterArgs struct {
 	// See testutils.ListenerRegistry.
 	ReusableListeners bool
 }
+
+// DefaultTestTenantOptions specifies the conditions under which the default
+// test tenant will be started.
+type DefaultTestTenantOptions int
+
+const (
+	// TestTenantProbabilisticOnly will start the default test tenant on a
+	// probabilistic basis. It will also prevent the starting of additional
+	// tenants by raising an error if it is attempted.
+	// This is the default behavior.
+	TestTenantProbabilisticOnly DefaultTestTenantOptions = iota
+	// TestTenantProbabilistic will start the default test tenant on a
+	// probabilistic basis. It allows the starting of additional tenants.
+	TestTenantProbabilistic
+	// TestTenantEnabled will always start the default test tenant. This is useful
+	// for quickly verifying that a test works with tenants enabled.
+	TestTenantEnabled
+	// TestTenantDisabled will disable the implicit starting of the default test
+	// tenant. This is useful for tests that want to explicitly control the
+	// starting of tenants, or currently don't work with tenants.
+	TestTenantDisabled
+)
 
 var (
 	// DefaultTestStoreSpec is just a single in memory store of 512 MiB

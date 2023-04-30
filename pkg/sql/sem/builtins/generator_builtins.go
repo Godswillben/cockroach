@@ -20,7 +20,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -35,12 +34,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randident"
 	"github.com/cockroachdb/cockroach/pkg/util/randident/randidentcfg"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -1255,6 +1254,20 @@ func EmptyGenerator() eval.ValueGenerator {
 	return &arrayValueGenerator{array: tree.NewDArray(types.Any)}
 }
 
+// NullGenerator returns a new generator that returns a single row of nulls
+// corresponding to the types stored in the tuple typ.
+func NullGenerator(typ *types.T) (eval.ValueGenerator, error) {
+	if typ.Family() != types.TupleFamily {
+		return nil, errors.AssertionFailedf("generator expected to return multiple columns")
+	}
+	arrs := make([]*tree.DArray, len(typ.TupleContents()))
+	for i := range typ.TupleContents() {
+		arrs[i] = &tree.DArray{}
+		arrs[i].Array = tree.Datums{tree.DNull}
+	}
+	return &multipleArrayValueGenerator{arrays: arrs}, nil
+}
+
 // unaryValueGenerator supports the execution of crdb_internal.unary_table().
 type unaryValueGenerator struct {
 	done bool
@@ -1931,7 +1944,7 @@ func (j *jsonRecordSetGenerator) Next(ctx context.Context) (bool, error) {
 type checkConsistencyGenerator struct {
 	txn                *kv.Txn // to load range descriptors
 	consistencyChecker eval.ConsistencyCheckRunner
-	from, to           roachpb.Key
+	rangeDescIterator  rangedesc.Iterator
 	mode               kvpb.ChecksumMode
 
 	// The descriptors for which we haven't yet emitted rows. Rows are consumed
@@ -1956,11 +1969,6 @@ var _ eval.ValueGenerator = &checkConsistencyGenerator{}
 func makeCheckConsistencyGenerator(
 	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
-	if !evalCtx.Codec.ForSystemTenant() {
-		return nil, errorutil.UnsupportedWithMultiTenancy(
-			errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
-	}
-
 	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
@@ -1972,23 +1980,28 @@ func makeCheckConsistencyGenerator(
 	keyFrom := roachpb.Key(*args[1].(*tree.DBytes))
 	keyTo := roachpb.Key(*args[2].(*tree.DBytes))
 
-	if len(keyFrom) == 0 {
-		// NB: you'd expect LocalMax here but when we go and call ScanMetaKVs, it
-		// would interpret LocalMax as Meta1Prefix and translate that to KeyMin,
-		// then fail on the scan. That method should really handle this better
-		// but also we should use IterateRangeDescriptors instead.
-		keyFrom = keys.Meta2Prefix
-	}
-	if len(keyTo) == 0 {
-		keyTo = roachpb.KeyMax
+	minKey := evalCtx.Codec.TenantPrefix()
+	maxKey := minKey.PrefixEnd()
+	if minKey.Compare(keys.LocalMax) < 0 {
+		// Consistency checks cannot run on the local keyspace [/Min, /LocalMax).
+		// The keys in the local keyspace are "virtual" - they exist in the logical
+		// keyspace, but are invisible to the KV replication layer because they
+		// correspond to per-node local storage and are therefore not consistent.
+		minKey = keys.LocalMax
 	}
 
-	if bytes.Compare(keyFrom, keys.LocalMax) <= 0 {
-		return nil, errors.Errorf("start key must be > %q", []byte(keys.LocalMax))
+	if len(keyFrom) == 0 {
+		keyFrom = minKey
+	} else if bytes.Compare(keyFrom, minKey) < 0 {
+		return nil, errors.Errorf("start key must be >= %q", []byte(minKey))
 	}
-	if bytes.Compare(keyTo, roachpb.KeyMax) > 0 {
-		return nil, errors.Errorf("end key must be < %q", []byte(roachpb.KeyMax))
+
+	if len(keyTo) == 0 {
+		keyTo = maxKey
+	} else if bytes.Compare(keyTo, maxKey) > 0 {
+		return nil, errors.Errorf("end key must be <= %q", []byte(maxKey))
 	}
+
 	if bytes.Compare(keyFrom, keyTo) >= 0 {
 		return nil, errors.New("start key must be less than end key")
 	}
@@ -2005,11 +2018,17 @@ func makeCheckConsistencyGenerator(
 		)
 	}
 
+	rangeDescIterator, err := evalCtx.Planner.GetRangeDescIterator(ctx, roachpb.Span{
+		Key:    keyFrom,
+		EndKey: keyTo,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &checkConsistencyGenerator{
 		txn:                evalCtx.Txn,
 		consistencyChecker: evalCtx.ConsistencyChecker,
-		from:               keyFrom,
-		to:                 keyTo,
+		rangeDescIterator:  rangeDescIterator,
 		mode:               mode,
 	}, nil
 }
@@ -2026,29 +2045,13 @@ func (*checkConsistencyGenerator) ResolvedType() *types.T {
 
 // Start is part of the tree.ValueGenerator interface.
 func (c *checkConsistencyGenerator) Start(ctx context.Context, _ *kv.Txn) error {
-	span := roachpb.Span{Key: c.from, EndKey: c.to}
-	// NB: should use IterateRangeDescriptors here which is in the 'upgrade'
-	// package to avoid pulling all into memory. That needs a refactor, though.
-	// kvprober also has some code to iterate in batches.
-	descs, err := kvclient.ScanMetaKVs(ctx, c.txn, span)
-	if err != nil {
-		return err
-	}
-	for _, v := range descs {
-		var desc roachpb.RangeDescriptor
-		if err := v.ValueProto(&desc); err != nil {
-			return err
-		}
+	for c.rangeDescIterator.Valid() {
+		desc := c.rangeDescIterator.CurRangeDescriptor()
 		if len(desc.StartKey) == 0 {
 			desc.StartKey = keys.MustAddr(keys.LocalMax)
-			// Elide potential second copy we might be getting for r1
-			// if meta1 and meta2 haven't split.
-			// This too should no longer be necessary with IterateRangeDescriptors.
-			if len(c.descs) == 1 {
-				continue
-			}
 		}
 		c.descs = append(c.descs, desc)
+		c.rangeDescIterator.Next()
 	}
 	return nil
 }
@@ -2158,6 +2161,10 @@ type spanKeyIterator struct {
 	// the iterator maintains a small set of K/V pairs in the span,
 	// and accesses more in a streaming fashion.
 	kvs []roachpb.KeyValue
+
+	// resumeSpan is the resume span from the last ScanRequest.
+	resumeSpan *roachpb.Span
+
 	// index maintains the current position of the iterator in kvs.
 	index int
 	// A buffer to avoid allocating an array on every call to Values().
@@ -2189,15 +2196,14 @@ func (sp *spanKeyIterator) Next(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// If we don't have any K/V pairs at all, then we're out of results.
-	if len(sp.kvs) == 0 {
+	// If we don't have a resume span, then we're out of results.
+	if sp.resumeSpan == nil {
 		return false, nil
 	}
 
 	// If we had some K/V pairs already, use the last key to constrain
 	// the result of the next scan.
-	startKey := sp.kvs[len(sp.kvs)-1].Key.Next()
-	err := sp.scan(ctx, startKey, sp.span.EndKey)
+	err := sp.scan(ctx, sp.resumeSpan.Key, sp.span.EndKey)
 	if err != nil {
 		return false, err
 	}
@@ -2224,6 +2230,7 @@ func (sp *spanKeyIterator) scan(
 	}
 	resp := br.Responses[0].GetScan()
 	sp.kvs = resp.Rows
+	sp.resumeSpan = resp.ResumeSpan
 	// The user of the generator first calls Next(), then Values(), so the index
 	// managing the iterator's position needs to start at -1 instead of 0.
 	sp.index = -1
@@ -2927,24 +2934,34 @@ func makeIdentGenerator(
 	}, nil
 }
 
-type tableSpanStatsIterator struct {
-	it                eval.InternalRows
-	codec             keys.SQLCodec
-	p                 eval.Planner
-	currDbId          int
-	currTableId       int
-	currStatsResponse *roachpb.SpanStatsResponse
-	singleTableReq    bool
+type spanStatsDetails struct {
+	dbId    int
+	tableId int
 }
 
-func newTableSpanStatsIterator(eval *eval.Context, dbId int, tableId int) *tableSpanStatsIterator {
-	return &tableSpanStatsIterator{codec: eval.Codec, p: eval.Planner, currDbId: dbId, currTableId: tableId, singleTableReq: tableId != 0}
+type tableSpanStatsIterator struct {
+	argDbId             int
+	argTableId          int
+	it                  eval.InternalRows
+	codec               keys.SQLCodec
+	p                   eval.Planner
+	spanStatsBatchLimit int
+	// Each iter
+	iterSpanIdx       int
+	spanStatsDetails  []spanStatsDetails
+	currStatsResponse *roachpb.SpanStatsResponse
+}
+
+func newTableSpanStatsIterator(
+	eval *eval.Context, dbId int, tableId int, spanBatchLimit int,
+) *tableSpanStatsIterator {
+	return &tableSpanStatsIterator{codec: eval.Codec, p: eval.Planner, argDbId: dbId, argTableId: tableId, spanStatsBatchLimit: spanBatchLimit}
 }
 
 // Start implements the tree.ValueGenerator interface.
 func (tssi *tableSpanStatsIterator) Start(ctx context.Context, _ *kv.Txn) error {
 	var err error = nil
-	tssi.it, err = tssi.p.GetDetailsForSpanStats(ctx, tssi.currDbId, tssi.currTableId)
+	tssi.it, err = tssi.p.GetDetailsForSpanStats(ctx, tssi.argDbId, tssi.argTableId)
 	return err
 }
 
@@ -2953,41 +2970,101 @@ func (tssi *tableSpanStatsIterator) Next(ctx context.Context) (bool, error) {
 	if tssi.it == nil {
 		return false, errors.AssertionFailedf("Start must be called before Next")
 	}
-	next, err := tssi.it.Next(ctx)
-	if err != nil || !next {
-		return false, err
+	// Check if we can iterate through the span details buffer.
+	if tssi.iterSpanIdx+1 < len(tssi.spanStatsDetails) {
+		tssi.iterSpanIdx++
+		return true, nil
 	}
-	// Pull the current row.
-	row := tssi.it.Cur()
-	tssi.currDbId = int(tree.MustBeDInt(row[0]))
-	tssi.currTableId = int(tree.MustBeDInt(row[1]))
 
-	// Set our current stats response.
-	startKey := roachpb.RKey(tssi.codec.TablePrefix(uint32(tssi.currTableId)))
-	tssi.currStatsResponse, err = tssi.p.SpanStats(ctx, startKey, startKey.PrefixEnd())
+	// There are no more span details to iterate in the buffer.
+	// Instead, we continue to fetch more span stats (if possible).
+	hasMoreRows, err := tssi.fetchSpanStats(ctx)
 	if err != nil {
 		return false, err
 	}
-	return next, err
+	// After fetching new span stats, reset the index.
+	tssi.iterSpanIdx = 0
+	return hasMoreRows || len(tssi.spanStatsDetails) != 0, nil
+}
+
+func (tssi *tableSpanStatsIterator) fetchSpanStats(ctx context.Context) (bool, error) {
+	// Reset span details.
+	tssi.spanStatsDetails = tssi.spanStatsDetails[:0]
+
+	var ok bool
+	var err error
+	var spans []roachpb.Span
+	// While we have more rows
+	for ok, err = tssi.it.Next(ctx); ok; ok, err = tssi.it.Next(ctx) {
+
+		// Pull the current row.
+		row := tssi.it.Cur()
+		dbId := int(tree.MustBeDInt(row[0]))
+		tableId := int(tree.MustBeDInt(row[1]))
+
+		// Add the row data to span stats details
+		tssi.spanStatsDetails = append(tssi.spanStatsDetails, spanStatsDetails{
+			dbId:    dbId,
+			tableId: tableId,
+		})
+
+		// Gather the span for the current span stats request.
+		tableStartKey := tssi.codec.TablePrefix(uint32(tableId))
+		spans = append(spans, roachpb.Span{
+			Key:    tableStartKey,
+			EndKey: tableStartKey.PrefixEnd(),
+		})
+
+		// Exit the loop if we're reached our limit of spans
+		// for the span stats request.
+		if len(tssi.spanStatsDetails) >= tssi.spanStatsBatchLimit {
+			break
+		}
+	}
+
+	// If we encounter an error while iterating over rows,
+	// return error before fetching span stats.
+	if err != nil {
+		return false, err
+	}
+
+	// If we have spans, request span stats
+	if len(spans) > 0 {
+		tssi.currStatsResponse, err = tssi.p.SpanStats(ctx, spans)
+	}
+
+	if err != nil {
+		return false, err
+	}
+	return ok, err
 }
 
 // Values implements the tree.ValueGenerator interface.
 func (tssi *tableSpanStatsIterator) Values() (tree.Datums, error) {
-	liveBytes := tssi.currStatsResponse.TotalStats.LiveBytes
-	totalBytes := tssi.currStatsResponse.TotalStats.KeyBytes +
-		tssi.currStatsResponse.TotalStats.ValBytes +
-		tssi.currStatsResponse.TotalStats.RangeKeyBytes +
-		tssi.currStatsResponse.TotalStats.RangeValBytes
+	// Get the current span details.
+	spanDetails := tssi.spanStatsDetails[tssi.iterSpanIdx]
+	startKey := tssi.codec.TablePrefix(uint32(spanDetails.tableId))
+	tableSpan := roachpb.Span{Key: startKey, EndKey: startKey.PrefixEnd()}
+	// Get the current span stats.
+	spanStats, found := tssi.currStatsResponse.SpanToStats[tableSpan.String()]
+	if !found {
+		return nil, errors.Errorf("could not find span stats for table span: %s", tableSpan.String())
+	}
+
+	totalBytes := spanStats.TotalStats.KeyBytes +
+		spanStats.TotalStats.ValBytes +
+		spanStats.TotalStats.RangeKeyBytes +
+		spanStats.TotalStats.RangeValBytes
 	livePercentage := float64(0)
 	if totalBytes > 0 {
-		livePercentage = float64(liveBytes) / float64(totalBytes)
+		livePercentage = float64(spanStats.TotalStats.LiveBytes) / float64(totalBytes)
 	}
 	return []tree.Datum{
-		tree.NewDInt(tree.DInt(tssi.currDbId)),
-		tree.NewDInt(tree.DInt(tssi.currTableId)),
-		tree.NewDInt(tree.DInt(tssi.currStatsResponse.RangeCount)),
-		tree.NewDInt(tree.DInt(tssi.currStatsResponse.ApproximateDiskBytes)),
-		tree.NewDInt(tree.DInt(liveBytes)),
+		tree.NewDInt(tree.DInt(spanDetails.dbId)),
+		tree.NewDInt(tree.DInt(spanDetails.tableId)),
+		tree.NewDInt(tree.DInt(spanStats.RangeCount)),
+		tree.NewDInt(tree.DInt(spanStats.ApproximateDiskBytes)),
+		tree.NewDInt(tree.DInt(spanStats.TotalStats.LiveBytes)),
 		tree.NewDInt(tree.DInt(totalBytes)),
 		tree.NewDFloat(tree.DFloat(livePercentage)),
 	}, nil
@@ -3031,5 +3108,7 @@ func makeTableSpanStatsGenerator(
 			return nil, errors.New("provided table id must be greater than or equal to 1")
 		}
 	}
-	return newTableSpanStatsIterator(evalCtx, dbId, tableId), nil
+
+	spanBatchLimit := roachpb.SpanStatsBatchLimit.Get(&evalCtx.Settings.SV)
+	return newTableSpanStatsIterator(evalCtx, dbId, tableId, int(spanBatchLimit)), nil
 }

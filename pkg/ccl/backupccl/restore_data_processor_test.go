@@ -9,6 +9,7 @@
 package backupccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	math "math"
@@ -126,7 +127,7 @@ func slurpSSTablesLatestKey(
 		if err != nil {
 			t.Fatal(err)
 		}
-		kvs = append(kvs, storage.MVCCKeyValue{Key: it.Key(), Value: val.Value.RawBytes})
+		kvs = append(kvs, storage.MVCCKeyValue{Key: it.UnsafeKey().Clone(), Value: val.Value.RawBytes})
 	}
 	return kvs
 }
@@ -190,8 +191,8 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 	writeSST := func(t *testing.T, offsets []int) string {
 		path := strconv.FormatInt(timeutil.Now().UnixNano(), 10)
 
-		sstFile := &storage.MemFile{}
-		sst := storage.MakeBackupSSTWriter(ctx, cs, sstFile)
+		var sstFile bytes.Buffer
+		sst := storage.MakeBackupSSTWriter(ctx, cs, &sstFile)
 		defer sst.Close()
 		ts := hlc.NewClockForTesting(nil).Now()
 		value := roachpb.MakeValueFromString("bar")
@@ -206,7 +207,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		if err := sst.Finish(); err != nil {
 			t.Fatalf("%+v", err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "foo", path), sstFile.Data(), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "foo", path), sstFile.Bytes(), 0644); err != nil {
 			t.Fatalf("%+v", err)
 		}
 		return path
@@ -271,7 +272,7 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 		},
 	}
 
-	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://0/foo", username.RootUserName())
+	storage, err := cloud.ExternalStorageConfFromURI("nodelocal://1/foo", username.RootUserName())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -393,10 +394,8 @@ func runTestIngest(t *testing.T, init func(*cluster.Settings)) {
 
 			mockRestoreDataProcessor, err := newTestingRestoreDataProcessor(&evalCtx, &flowCtx, mockRestoreDataSpec)
 			require.NoError(t, err)
-			ssts := make(chan mergedSST, 1)
-			require.NoError(t, mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry, ssts))
-			close(ssts)
-			sst := <-ssts
+			sst, err := mockRestoreDataProcessor.openSSTs(ctx, restoreSpanEntry)
+			require.NoError(t, err)
 			rewriter, err := MakeKeyRewriterFromRekeys(flowCtx.Codec(), mockRestoreDataSpec.TableRekeys,
 				mockRestoreDataSpec.TenantRekeys, false /* restoreTenantFromStream */)
 			require.NoError(t, err)

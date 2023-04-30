@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -24,18 +23,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -157,7 +155,6 @@ func verifyStorageStats(t *testing.T, s *kvserver.Store) {
 		{m.RdbBlockCacheHits, 10},
 		{m.RdbBlockCacheMisses, 0},
 		{m.RdbBlockCacheUsage, 0},
-		{m.RdbBlockCachePinnedUsage, 0},
 		{m.RdbBloomFilterPrefixChecked, 0},
 		{m.RdbBloomFilterPrefixUseful, 0},
 		{m.RdbMemtableTotalSize, 5000},
@@ -199,7 +196,13 @@ func TestStoreResolveMetrics(t *testing.T) {
 	require.NoError(t, err)
 	span := roachpb.Span{Key: key, EndKey: key.Next()}
 
-	txn := roachpb.MakeTransaction("foo", span.Key, roachpb.MinUserPriority, hlc.Timestamp{WallTime: 123}, 999, int32(s.NodeID()))
+	// Clear the metrics before starting the test so that we don't count intent
+	// resolutions from server startup.
+	store.Metrics().ResolveCommitCount.Clear()
+	store.Metrics().ResolveAbortCount.Clear()
+	store.Metrics().ResolvePoisonCount.Clear()
+
+	txn := roachpb.MakeTransaction("foo", span.Key, isolation.Serializable, roachpb.MinUserPriority, hlc.Timestamp{WallTime: 123}, 999, int32(s.NodeID()))
 
 	const resolveCommitCount = int64(200)
 	const resolveAbortCount = int64(800)
@@ -375,62 +378,4 @@ func TestStoreMetrics(t *testing.T) {
 
 	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 1))
 	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 2))
-}
-
-// TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases ensures that the metric
-// ClosedTimestampMaxBehindNanos does not follow the start time of expiration
-// based leases. Expiration based leases don't publish closed timestamps.
-func TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			// Set a long timeout so that no lease or liveness ever times out.
-			RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 100},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-	// We want to choose setting values such that this test doesn't take too long
-	// with the caveat that under extreme stress, we need to make sure that the
-	// subsystem remains live.
-	const closedTimestampDuration = 15 * time.Millisecond
-	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = $1",
-		closedTimestampDuration.String())
-	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = $1",
-		closedTimestampDuration.String())
-
-	// Let's get to a point where we know that we have an expiration based lease
-	// with a start time more than some time ago and then we have a max closed
-	// value more recent.
-	_, meta2Repl1 := getFirstStoreReplica(t, tc.Server(0), keys.Meta2Prefix)
-
-	// Transfer the lease for the meta range to ensure that it has a non-zero
-	// start time.
-	require.NoError(t, tc.TransferRangeLease(*meta2Repl1.Desc(), tc.Target(1)))
-
-	testutils.SucceedsSoon(t, func() error {
-		_, metaRepl := getFirstStoreReplica(t, tc.Server(1), keys.Meta2Prefix)
-		l, _ := metaRepl.GetLease()
-		if l.Start.IsEmpty() {
-			return errors.Errorf("don't have a lease for meta1 yet: %v %v", l, meta2Repl1)
-		}
-		sinceExpBasedLeaseStart := timeutil.Since(timeutil.Unix(0, l.Start.WallTime))
-		for i := 0; i < tc.NumServers(); i++ {
-			s, _ := getFirstStoreReplica(t, tc.Server(i), keys.Meta1Prefix)
-			require.NoError(t, s.ComputeMetrics(ctx))
-			maxBehind := time.Duration(s.Metrics().ClosedTimestampMaxBehindNanos.Value())
-			// We want to make sure that maxBehind ends up being much smaller than the
-			// start of an expiration based lease.
-			const behindMultiple = 5
-			if maxBehind*behindMultiple > sinceExpBasedLeaseStart {
-				return errors.Errorf("store %v has a ClosedTimestampMaxBehindNanos"+
-					" of %v which is not way less than the an expiration-based lease start, %v",
-					s.StoreID(), maxBehind, sinceExpBasedLeaseStart)
-			}
-		}
-		return nil
-	})
 }

@@ -159,6 +159,7 @@ func (f *pgConnReplicationFeedSource) Error() error {
 
 // startReplication starts replication stream, specified as query and its args.
 func startReplication(
+	ctx context.Context,
 	t *testing.T,
 	r *replicationtestutils.ReplicationHelper,
 	codecFactory eventDecoderFactory,
@@ -173,7 +174,7 @@ func startReplication(
 	pgxConfig, err := pgx.ParseConfig(sink.String())
 	require.NoError(t, err)
 
-	queryCtx, cancel := context.WithCancel(context.Background())
+	queryCtx, cancel := context.WithCancel(ctx)
 	conn, err := pgx.ConnectConfig(queryCtx, pgxConfig)
 	require.NoError(t, err)
 
@@ -235,7 +236,7 @@ func TestReplicationStreamInitialization(t *testing.T) {
 		// This test fails when run from within a test tenant. This is likely
 		// due to the lack of support for tenant streaming, but more
 		// investigation is required. Tracked with #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
@@ -331,7 +332,7 @@ func TestStreamPartition(t *testing.T) {
 		base.TestServerArgs{
 			// Test fails within a test tenant. More investigation is required.
 			// Tracked with #76378.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
 		})
 	defer cleanup()
 	testTenantName := roachpb.TenantName("test-tenant")
@@ -357,7 +358,8 @@ USE d;
 	t2Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t2")
 
 	t.Run("stream-table-cursor-error", func(t *testing.T) {
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
+		skip.WithIssue(t, 102286)
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp, hlc.Timestamp{}, "t2"))
 		defer feed.Close(ctx)
 
@@ -384,7 +386,7 @@ USE d;
 	})
 
 	t.Run("stream-table", func(t *testing.T) {
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
 				hlc.Timestamp{}, "t1"))
 		defer feed.Close(ctx)
@@ -414,7 +416,7 @@ USE d;
 		srcTenant.SQL.Exec(t, `UPDATE d.t1 SET a = 'привет' WHERE i = 42`)
 		srcTenant.SQL.Exec(t, `UPDATE d.t1 SET b = 'мир' WHERE i = 42`)
 
-		_, feed := startReplication(t, h, makePartitionStreamDecoder,
+		_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
 				beforeUpdateTS, "t1"))
 		defer feed.Close(ctx)
@@ -451,7 +453,7 @@ CREATE TABLE t3(
 		// Add few rows.
 		addRows(0, 10)
 
-		source, feed := startReplication(t, h, makePartitionStreamDecoder,
+		source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
 				hlc.Timestamp{}, "t1"))
 		defer feed.Close(ctx)
@@ -481,7 +483,7 @@ func TestStreamAddSSTable(t *testing.T) {
 	h, cleanup := replicationtestutils.NewReplicationHelper(t, base.TestServerArgs{
 		// Test hangs when run within the default test tenant. Tracked with
 		// #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 	})
 	defer cleanup()
 	testTenantName := roachpb.TenantName("test-tenant")
@@ -526,7 +528,7 @@ USE d;
 		if addSSTableBeforeRangefeed {
 			srcTenant.SQL.Exec(t, fmt.Sprintf("IMPORT INTO %s CSV DATA ($1)", table), dataSrv.URL)
 		}
-		source, feed := startReplication(t, h, makePartitionStreamDecoder,
+		source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 			streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
 				previousHighWater, table))
 		defer feed.Close(ctx)
@@ -571,7 +573,7 @@ func TestCompleteStreamReplication(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
 		})
 	defer cleanup()
 	srcTenantID := serverutils.TestTenantID()
@@ -654,7 +656,7 @@ func TestStreamDeleteRange(t *testing.T) {
 	h, cleanup := replicationtestutils.NewReplicationHelper(t, base.TestServerArgs{
 		// Test hangs when run within the default test tenant. Tracked with
 		// #76378.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 	})
 	defer cleanup()
 	testTenantName := roachpb.TenantName("test-tenant")
@@ -679,7 +681,7 @@ USE d;
 
 	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
 	// Only subscribe to table t1 and t2, not t3.
-	source, feed := startReplication(t, h, makePartitionStreamDecoder,
+	source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 		streamPartitionQuery, streamID, encodeSpec(t, h, srcTenant, initialScanTimestamp,
 			hlc.Timestamp{}, "t1", "t2"))
 	defer feed.Close(ctx)

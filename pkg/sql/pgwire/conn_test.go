@@ -1570,6 +1570,15 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				require.Equal(t, "ISO,YMD", args.SessionDefaults["datestyle"])
 			},
 		},
+		{
+			// Regression test for issue #98301.
+			desc:  "special characters that look like urlencoded must not be decoded during option parsing",
+			query: "options=-c application_name=%2566%256f%256f",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.Equal(t, "%66%6f%6f", args.SessionDefaults["application_name"])
+			},
+		},
 	}
 
 	baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
@@ -1610,6 +1619,112 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	}
 }
 
+func TestParseSearchPathInConnectionString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		desc               string
+		query              string
+		expectedErr        string
+		expectedSearchPath string
+	}{
+		{
+			desc:               "mixed-case schemas require double quotes",
+			query:              `options=-c search_path="Abc",Def,Ghi`,
+			expectedSearchPath: `"Abc", def, ghi`,
+		},
+		{
+			desc:               "commas can be used in schemas in the search_path",
+			query:              `options=-c search_path="a,b",other_schema`,
+			expectedSearchPath: `"a,b", other_schema`,
+		},
+		{
+			desc:        "search_path cannot have an empty element",
+			query:       `options=-c search_path="Abc",Def,,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,,"`,
+		},
+		{
+			// Note: This is more permissive than Postgres. But this behaves the same
+			// as `SET search_path = "",Def;` so this is acceptable.
+			desc:               "search_path can have a quoted empty element",
+			query:              `options=-c search_path="",Def`,
+			expectedSearchPath: `"", def`,
+		},
+
+		{
+			desc:        "search_path cannot have a quoted whitespace element",
+			query:       `options=-c search_path="  ",Def`,
+			expectedErr: `option "\",Def" is invalid`,
+		},
+		{
+			desc:               "search_path can have a quoted whitespace element if not in the options param",
+			query:              `search_path="  ",Def`,
+			expectedSearchPath: `"  ", def`,
+		},
+		{
+			// This is a slight departure from Postgres. For some reason, Postgres
+			// will just ignore the backslashes, even though it doesn't ignore the
+			// hyphens.
+			desc:               "search_path can handle backslashes and other special characters",
+			query:              `search_path=a-b-c,d\ef,"g-hi","j\kl"`,
+			expectedSearchPath: `"a-b-c", "d\ef", "g-hi", "j\kl"`,
+		},
+		{
+			desc:        "search_path cannot end in a comma",
+			query:       `options=-c search_path="Abc",Def,`,
+			expectedErr: `invalid value for parameter "search_path": ""Abc",Def,"`,
+		},
+		{
+			desc:        "space cannot be in search_path",
+			query:       `options=-c search_path="Abc",Def,  Ghi`,
+			expectedErr: `option "Ghi" is invalid`,
+		},
+		{
+			desc:        "empty search_path is not allowed",
+			query:       `options=-c search_path=`,
+			expectedErr: `invalid value for parameter "search_path": ""`,
+		},
+		{
+			desc:        "unbalanced quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b","other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b","other_schema"`,
+		},
+		{
+			desc:        "out-of-place quotes in search_path are not allowed",
+			query:       `options=-c search_path="a,b",""other_schema`,
+			expectedErr: `invalid value for parameter "search_path": ""a,b",""other_schema"`,
+		},
+	}
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+	defer db.Close()
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			pgURL, cleanupFunc := sqlutils.PGUrl(
+				t, s.ServingSQLAddr(), "TestParseSearchPathInConnectionString" /* prefix */, url.User(username.RootUser),
+			)
+			defer cleanupFunc()
+
+			pgURL.RawQuery += "&" + tc.query
+			c, connErr := pgx.Connect(ctx, pgURL.String())
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, connErr, tc.expectedErr)
+				return
+			}
+			require.NoError(t, connErr)
+
+			var sp string
+			err := c.QueryRow(ctx, `SHOW search_path`).Scan(&sp)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedSearchPath, sp)
+		})
+	}
+}
+
 func TestSetSessionArguments(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1623,14 +1738,12 @@ func TestSetSessionArguments(t *testing.T) {
 	)
 	defer cleanupFunc()
 
-	q := pgURL.Query()
-	q.Add("options", "  --user=test -c    search_path=public,testsp %20 "+
-		"--default-transaction-isolation=read\\ uncommitted   "+
-		"-capplication_name=test  "+
-		"--DateStyle=ymd\\ ,\\ iso\\  "+
-		"-c intervalstyle%3DISO_8601 "+
-		"-ccustom_option.custom_option=test2")
-	pgURL.RawQuery = q.Encode()
+	pgURL.RawQuery += `&options=` + `  --user=test -c    search_path=public,testsp,"Abc",Def %20 ` +
+		"--default-transaction-isolation=read\\ uncommitted   " +
+		"-capplication_name=test  " +
+		"--DateStyle=ymd\\ ,\\ iso\\  " +
+		"-c intervalstyle%3DISO_8601 " +
+		"-ccustom_option.custom_option=test2"
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
 
 	if err != nil {
@@ -1654,7 +1767,7 @@ func TestSetSessionArguments(t *testing.T) {
 	}
 
 	expectedOptions := map[string]string{
-		"search_path": "public, testsp",
+		"search_path": "public, testsp, \"Abc\", def",
 		// setting an isolation level is a noop:
 		// all transactions execute with serializable isolation.
 		"default_transaction_isolation": "serializable",
@@ -1860,8 +1973,9 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	defer testServer.Stopper().Stop(ctx)
 
 	// Users.
-	admin := username.RootUser
+	rootUser := username.RootUser
 	nonAdmin := username.TestUser
+	admin := "testadmin"
 
 	// openConnWithUser opens a connection to the testServer for the given user
 	// and always returns an associated cleanup function, even in case of error,
@@ -1872,7 +1986,7 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 			testServer.ServingSQLAddr(),
 			t.Name(),
 			url.UserPassword(user, user),
-			user == admin,
+			user == rootUser,
 		)
 		defer cleanup()
 		conn, err := pgx.Connect(ctx, pgURL.String())
@@ -1916,7 +2030,7 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	}
 
 	getMaxConnections := func() int {
-		conn, cleanup := openConnWithUserSuccess(admin)
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
 		var maxConnections int
 		err := conn.QueryRow(ctx, "SHOW CLUSTER SETTING server.max_connections_per_gateway").Scan(&maxConnections)
@@ -1925,21 +2039,41 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 	}
 
 	setMaxConnections := func(maxConnections int) {
-		conn, cleanup := openConnWithUserSuccess(admin)
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
 		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.max_connections_per_gateway = $1", maxConnections)
 		require.NoError(t, err)
 	}
 
-	createUser := func(user string) {
-		conn, cleanup := openConnWithUserSuccess(admin)
+	setMaxNonRootConnections := func(maxConnections int) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
 		defer cleanup()
-		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %[1]s WITH PASSWORD '%[1]s'", user))
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway = $1", maxConnections)
 		require.NoError(t, err)
 	}
 
+	setMaxNonRootConnectionsReason := func(reason string) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, "SET CLUSTER SETTING server.cockroach_cloud.max_client_connections_per_gateway_reason = $1", reason)
+		require.NoError(t, err)
+	}
+
+	createUser := func(user string, isAdmin bool) {
+		conn, cleanup := openConnWithUserSuccess(rootUser)
+		defer cleanup()
+		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE USER %[1]s WITH PASSWORD '%[1]s'", user))
+		require.NoError(t, err)
+
+		if isAdmin {
+			_, err := conn.Exec(ctx, fmt.Sprintf("grant admin to %[1]s", user))
+			require.NoError(t, err)
+		}
+	}
+
 	// create nonAdmin
-	createUser(nonAdmin)
+	createUser(nonAdmin, false)
+	createUser(admin, true)
 	requireConnectionCount(t, 0)
 
 	// assert default value
@@ -2004,6 +2138,46 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 		requireConnectionCount(t, 1)
 		nonAdminCleanup2()
 		requireConnectionCount(t, 0)
+	})
+
+	t.Run("0 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can't connect with non root
+		openConnWithUserError(admin)
+		requireConnectionCount(t, 1)
+		rootCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("1 max_non_root_connections", func(t *testing.T) {
+		setMaxNonRootConnections(1)
+		requireConnectionCount(t, 0)
+		// can connect with root
+		_, rootCleanup := openConnWithUserSuccess(rootUser)
+		requireConnectionCount(t, 1)
+		// can connect with non root
+		_, nonAdminCleanup := openConnWithUserSuccess(nonAdmin)
+		requireConnectionCount(t, 2)
+		rootCleanup()
+		nonAdminCleanup()
+		requireConnectionCount(t, 0)
+	})
+
+	t.Run("max_non_root_connections_reason", func(t *testing.T) {
+		setMaxNonRootConnections(0)
+		setMaxNonRootConnectionsReason("foobar")
+		requireConnectionCount(t, 0)
+		_, cleanup, err := openConnWithUser(admin)
+		defer cleanup()
+		require.Error(t, err)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, pgcode.TooManyConnections.String(), pgErr.Code)
+		require.Regexp(t, "foobar", pgErr.Error())
 	})
 }
 

@@ -192,11 +192,15 @@ func showBackupTypeCheck(
 	}
 	if err := exprutil.TypeCheck(
 		ctx, "SHOW BACKUP", p.SemaCtx(),
+		exprutil.Ints{
+			backup.Options.CheckConnectionConcurrency,
+		},
 		exprutil.Strings{
 			backup.Path,
 			backup.Options.EncryptionPassphrase,
 			backup.Options.EncryptionInfoDir,
-			backup.Options.TransferSize,
+			backup.Options.CheckConnectionTransferSize,
+			backup.Options.CheckConnectionDuration,
 		},
 		exprutil.StringArrays{
 			tree.Exprs(backup.InCollection),
@@ -229,9 +233,9 @@ func showBackupPlanHook(
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
-		var transferSize int64
-		if showStmt.Options.TransferSize != nil {
-			transferSizeStr, err := exprEval.String(ctx, showStmt.Options.TransferSize)
+		var params cloudcheck.Params
+		if showStmt.Options.CheckConnectionTransferSize != nil {
+			transferSizeStr, err := exprEval.String(ctx, showStmt.Options.CheckConnectionTransferSize)
 			if err != nil {
 				return nil, nil, nil, false, err
 			}
@@ -239,9 +243,27 @@ func showBackupPlanHook(
 			if err != nil {
 				return nil, nil, nil, false, err
 			}
-			transferSize = parsed
+			params.TransferSize = parsed
 		}
-		return cloudcheck.ShowCloudStorageTestPlanHook(ctx, p, loc, transferSize)
+		if showStmt.Options.CheckConnectionDuration != nil {
+			durationStr, err := exprEval.String(ctx, showStmt.Options.CheckConnectionDuration)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			parsed, err := time.ParseDuration(durationStr)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			params.MinDuration = parsed
+		}
+		if showStmt.Options.CheckConnectionConcurrency != nil {
+			concurrency, err := exprEval.Int(ctx, showStmt.Options.CheckConnectionConcurrency)
+			if err != nil {
+				return nil, nil, nil, false, err
+			}
+			params.Concurrency = concurrency
+		}
+		return cloudcheck.ShowCloudStorageTestPlanHook(ctx, p, loc, params)
 	}
 
 	if showStmt.Path == nil && showStmt.InCollection != nil {
@@ -911,7 +933,11 @@ func backupShowerDefault(
 						row = append(row, createStmtDatum)
 					}
 					if opts.Privileges {
-						row = append(row, tree.NewDString(showPrivileges(ctx, desc)))
+						showPrivs, err := showPrivileges(ctx, desc)
+						if err != nil {
+							return nil, err
+						}
+						row = append(row, tree.NewDString(showPrivs))
 						owner := desc.GetPrivileges().Owner().SQLIdentifier()
 						row = append(row, tree.NewDString(owner))
 					}
@@ -1128,7 +1154,7 @@ func showRegions(typeDesc catalog.TypeDescriptor, dbname string) (string, error)
 	return regionsStringBuilder.String(), nil
 }
 
-func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
+func showPrivileges(ctx context.Context, desc catalog.Descriptor) (string, error) {
 	ctx, span := tracing.ChildSpan(ctx, "backupccl.showPrivileges")
 	defer span.Finish()
 	_ = ctx // ctx is currently unused, but this new ctx should be used below in the future.
@@ -1136,14 +1162,18 @@ func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
 	var privStringBuilder strings.Builder
 
 	if desc == nil {
-		return ""
+		return "", nil
 	}
 	privDesc := desc.GetPrivileges()
 	objectType := desc.GetObjectType()
 	if privDesc == nil {
-		return ""
+		return "", nil
 	}
-	for _, userPriv := range privDesc.Show(objectType, false /* showImplicitOwnerPrivs */) {
+	showList, err := privDesc.Show(objectType, false /* showImplicitOwnerPrivs */)
+	if err != nil {
+		return "", err
+	}
+	for _, userPriv := range showList {
 		privs := userPriv.Privileges
 		if len(privs) == 0 {
 			continue
@@ -1185,7 +1215,7 @@ func showPrivileges(ctx context.Context, desc catalog.Descriptor) string {
 		}
 	}
 
-	return privStringBuilder.String()
+	return privStringBuilder.String(), nil
 }
 
 var backupShowerRanges = backupShower{

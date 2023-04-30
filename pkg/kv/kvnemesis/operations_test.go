@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -51,7 +52,7 @@ func TestOperationsFormat(t *testing.T) {
 	sstValueHeader.KVNemesisSeq.Set(1)
 	sstSpan := roachpb.Span{Key: roachpb.Key(k1), EndKey: roachpb.Key(k4)}
 	sstTS := hlc.Timestamp{WallTime: 1}
-	sstFile := &storage.MemFile{}
+	sstFile := &storage.MemObject{}
 	{
 		st := cluster.MakeTestingClusterSettings()
 		storage.ValueBlocksEnabled.Override(ctx, &st.SV, false)
@@ -77,6 +78,7 @@ func TestOperationsFormat(t *testing.T) {
 		{
 			step: step(
 				closureTxn(ClosureTxnType_Commit,
+					isolation.Serializable,
 					batch(get(k7), get(k8), del(k9, 1)),
 					delRange(k10, k11, 2),
 					put(k11, 3),

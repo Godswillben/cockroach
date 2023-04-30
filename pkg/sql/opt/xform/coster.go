@@ -189,11 +189,7 @@ const (
 
 	// LargeDistributeCost is the cost to use for Distribute operations when a
 	// session mode is set to error out on access of rows from remote regions.
-	// hugeCost cannot be used for this because index hinting used hugeCost to
-	// "force" use of an index. If a LargeDistributeCost of hugeCost were added to
-	// a plan with the forced index, it may cause a plan with different index to
-	// get selected, and error out.
-	LargeDistributeCost = hugeCost / 100
+	LargeDistributeCost = hugeCost
 
 	// LargeDistributeCostWithHomeRegion is the cost to use for Distribute
 	// operations when a session mode is set to error out on access of rows from
@@ -731,7 +727,7 @@ func (c *coster) computeDistributeCost(
 			return c.distributionCost(source)
 		}
 	}
-	if c.evalCtx != nil && c.evalCtx.SessionData().EnforceHomeRegion && c.evalCtx.Planner.IsANSIDML() {
+	if c.evalCtx != nil && c.evalCtx.Planner.EnforceHomeRegion() {
 		if distribute.HasHomeRegion() {
 			// Query plans with a home region are favored over those without one.
 			return LargeDistributeCostWithHomeRegion
@@ -882,7 +878,7 @@ func (c *coster) distributionCost(regionsAccessed physical.Distribution) (cost m
 		// that case to try and avoid the distribution anyway.
 		extraCost = memo.Cost(SmallDistributeCost)
 	} else if !regionsAccessed.Any() && c.evalCtx != nil &&
-		c.evalCtx.SessionData().EnforceHomeRegion && c.evalCtx.Planner.IsANSIDML() {
+		c.evalCtx.Planner.EnforceHomeRegion() {
 		if len(regionsAccessed.Regions) == 1 {
 			// Query plans with a home region are favored over those without one.
 			extraCost = LargeDistributeCostWithHomeRegion

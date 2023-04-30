@@ -66,6 +66,20 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 	case *memo.UDFExpr:
 		// Do not attempt to hoist UDFs.
 		return false
+
+	case *memo.EqExpr:
+		// Hoist subqueries in expressions like (Eq (Variable) (Subquery)) if
+		// the corresponding session setting is enabled.
+		// TODO(mgartner): We could hoist if we have an IS NOT DISTINCT FROM
+		// expression. But it won't currently lead to a lookup join due to
+		// #100855 and the plan could be worse, so we avoid it for now.
+		if c.f.evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries {
+			_, isLeftVar := scalar.Child(0).(*memo.VariableExpr)
+			_, isRightSubquery := scalar.Child(1).(*memo.SubqueryExpr)
+			if isLeftVar && isRightSubquery {
+				return true
+			}
+		}
 	}
 
 	// If HasHoistableSubquery is true for any child, then it's true for this
@@ -807,7 +821,14 @@ func (r *subqueryHoister) hoistAll(scalar opt.ScalarExpr) opt.ScalarExpr {
 	switch scalar.Op() {
 	case opt.SubqueryOp, opt.ExistsOp, opt.AnyOp, opt.ArrayFlattenOp:
 		subquery := scalar.Child(0).(memo.RelExpr)
-		if subquery.Relational().OuterCols.Empty() {
+		// According to the implementation of deriveHasHoistableSubquery,
+		// Exists, Any, and ArrayFlatten expressions are only hoistable if they
+		// are correlated. Uncorrelated subquery expressions are hoistable if
+		// the corresponding session setting is enabled and they are part of an
+		// equality expression with a variable.
+		uncorrelatedHoistAllowed := scalar.Op() == opt.SubqueryOp &&
+			r.f.evalCtx.SessionData().OptimizerHoistUncorrelatedEqualitySubqueries
+		if subquery.Relational().OuterCols.Empty() && !uncorrelatedHoistAllowed {
 			break
 		}
 
@@ -916,7 +937,25 @@ func (r *subqueryHoister) constructGroupByExists(subquery memo.RelExpr) memo.Rel
 	)
 }
 
-// constructGroupByAny transforms a scalar Any expression like this:
+// constructGroupByAny transforms a scalar Any expression into a scalar GroupBy
+// expression that returns a one row, one column relation. See
+// CustomFuncs.ConstructGroupByAny for more details.
+func (r *subqueryHoister) constructGroupByAny(
+	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
+) memo.RelExpr {
+	// When the scalar value is not a simple variable or constant expression,
+	// then cache its value using a projection, since it will be referenced
+	// multiple times.
+	if scalar.Op() != opt.VariableOp && !opt.IsConstValueOp(scalar) {
+		typ := scalar.DataType()
+		scalarColID := r.f.Metadata().AddColumn("scalar", typ)
+		r.hoisted = r.c.ProjectExtraCol(r.hoisted, scalar, scalarColID)
+		scalar = r.f.ConstructVariable(scalarColID)
+	}
+	return r.c.ConstructGroupByAny(scalar, cmp, input)
+}
+
+// ConstructGroupByAny transforms a scalar Any expression like this:
 //
 //	z = ANY(SELECT x FROM xy)
 //
@@ -990,68 +1029,72 @@ func (r *subqueryHoister) constructGroupByExists(subquery memo.RelExpr) memo.Rel
 // TryDecorrelateScalarGroupBy rule, which will push a left join into the
 // GroupBy. Null values produced by the left join will simply be ignored by
 // BOOL_OR, and so cannot be used for any other purpose.
-func (r *subqueryHoister) constructGroupByAny(
+func (c *CustomFuncs) ConstructGroupByAny(
 	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
 ) memo.RelExpr {
-	// When the scalar value is not a simple variable or constant expression,
-	// then cache its value using a projection, since it will be referenced
-	// multiple times.
-	if scalar.Op() != opt.VariableOp && !opt.IsConstValueOp(scalar) {
-		typ := scalar.DataType()
-		scalarColID := r.f.Metadata().AddColumn("scalar", typ)
-		r.hoisted = r.c.ProjectExtraCol(r.hoisted, scalar, scalarColID)
-		scalar = r.f.ConstructVariable(scalarColID)
+	inputVar := c.f.funcs.referenceSingleColumn(input)
+	notNullColID := c.f.Metadata().AddColumn("notnull", types.Bool)
+	aggColID := c.f.Metadata().AddColumn("bool_or", types.Bool)
+	aggVar := c.f.ConstructVariable(aggColID)
+	caseColID := c.f.Metadata().AddColumn("case", types.Bool)
+
+	var scalarNotNull opt.ScalarExpr
+	if scalar.DataType().Family() == types.TupleFamily {
+		scalarNotNull = c.f.ConstructIsTupleNotNull(scalar)
+	} else {
+		scalarNotNull = c.f.ConstructIsNot(scalar, memo.NullSingleton)
 	}
 
-	inputVar := r.f.funcs.referenceSingleColumn(input)
-	notNullColID := r.f.Metadata().AddColumn("notnull", types.Bool)
-	aggColID := r.f.Metadata().AddColumn("bool_or", types.Bool)
-	aggVar := r.f.ConstructVariable(aggColID)
-	caseColID := r.f.Metadata().AddColumn("case", types.Bool)
+	var inputNotNull opt.ScalarExpr
+	if inputVar.DataType().Family() == types.TupleFamily {
+		inputNotNull = c.f.ConstructIsTupleNotNull(inputVar)
+	} else {
+		inputNotNull = c.f.ConstructIsNot(inputVar, memo.NullSingleton)
+	}
 
-	return r.f.ConstructProject(
-		r.f.ConstructScalarGroupBy(
-			r.f.ConstructProject(
-				r.f.ConstructSelect(
+	return c.f.ConstructProject(
+		c.f.ConstructScalarGroupBy(
+			c.f.ConstructProject(
+				c.f.ConstructSelect(
 					input,
-					memo.FiltersExpr{r.f.ConstructFiltersItem(
-						r.f.ConstructIsNot(
-							r.f.funcs.ConstructBinary(cmp, scalar, inputVar),
+					memo.FiltersExpr{c.f.ConstructFiltersItem(
+						c.f.ConstructIsNot(
+							c.f.funcs.ConstructBinary(cmp, scalar, inputVar),
 							memo.FalseSingleton,
 						),
 					)},
 				),
-				memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-					r.f.ConstructIsNot(inputVar, memo.NullSingleton),
+				memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+					inputNotNull,
 					notNullColID,
 				)},
 				opt.ColSet{},
 			),
-			memo.AggregationsExpr{r.f.ConstructAggregationsItem(
-				r.f.ConstructBoolOr(
-					r.f.ConstructVariable(notNullColID),
+			memo.AggregationsExpr{c.f.ConstructAggregationsItem(
+				c.f.ConstructBoolOr(
+					c.f.ConstructVariable(notNullColID),
 				),
 				aggColID,
 			)},
 			memo.EmptyGroupingPrivate,
 		),
-		memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-			r.f.ConstructCase(
-				r.f.ConstructTrue(),
+		memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+			c.f.ConstructCase(
+				c.f.ConstructTrue(),
 				memo.ScalarListExpr{
-					r.f.ConstructWhen(
-						r.f.ConstructAnd(
+					c.f.ConstructWhen(
+						c.f.ConstructAnd(
 							aggVar,
-							r.f.ConstructIsNot(scalar, memo.NullSingleton),
+							scalarNotNull,
 						),
-						r.f.ConstructTrue(),
+						c.f.ConstructTrue(),
 					),
-					r.f.ConstructWhen(
-						r.f.ConstructIs(aggVar, memo.NullSingleton),
-						r.f.ConstructFalse(),
+					c.f.ConstructWhen(
+						c.f.ConstructIs(aggVar, memo.NullSingleton),
+						c.f.ConstructFalse(),
 					),
 				},
-				r.f.ConstructNull(types.Bool),
+				c.f.ConstructNull(types.Bool),
 			),
 			caseColID,
 		)},

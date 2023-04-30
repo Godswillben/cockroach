@@ -38,7 +38,7 @@ import (
 )
 
 var optimisticEvalLimitedScans = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.concurrency.optimistic_eval_limited_scans.enabled",
 	"when true, limited scans are optimistically evaluated in the sense of not checking for "+
 		"conflicting latches or locks up front for the full key range of the scan, and instead "+
@@ -127,7 +127,7 @@ func (r *Replica) SendWithWriteBytes(
 	if r.store.cfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
 		defer pprof.SetGoroutineLabels(ctx)
 		// Note: the defer statement captured the previous context.
-		ctx = pprof.WithLabels(ctx, pprof.Labels("range_str", r.rangeStr.String()))
+		ctx = pprof.WithLabels(ctx, pprof.Labels("range_str", r.rangeStr.ID()))
 		pprof.SetGoroutineLabels(ctx)
 	}
 	// Add the range log tag.
@@ -306,6 +306,12 @@ func (r *Replica) maybeCommitWaitBeforeCommitTrigger(
 func (r *Replica) maybeAddRangeInfoToResponse(
 	ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse,
 ) {
+	// Ignore lease requests. These are submitted directly to the replica,
+	// bypassing the DistSender. They don't need range info returned, but their
+	// ClientRangeInfo is always empty, so they'll otherwise always get it.
+	if ba.IsSingleRequestLeaseRequest() {
+		return
+	}
 	// Compare the client's info with the replica's info to detect if the client
 	// has stale knowledge. Note that the client can have more recent knowledge
 	// than the replica in case this is a follower.

@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"text/template"
@@ -116,6 +117,10 @@ type StartOpts struct {
 	KVCluster *SyncedCluster
 }
 
+// startSQLTimeout identifies the COCKROACH_CONNECT_TIMEOUT to use (in seconds)
+// for sql cmds within syncedCluster.Start().
+const startSQLTimeout = 1200
+
 // StartTarget identifies what flavor of cockroach we are starting.
 type StartTarget int
 
@@ -179,7 +184,7 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	l.Printf("%s: starting nodes", c.Name)
 
 	// SSH retries are disabled by passing nil RunRetryOpts
-	if err := c.Parallel(l, "", len(nodes), parallelism, func(nodeIdx int) (*RunResultDetails, error) {
+	if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, nodeIdx int) (*RunResultDetails, error) {
 		node := nodes[nodeIdx]
 		res := &RunResultDetails{Node: node}
 		// NB: if cockroach started successfully, we ignore the output as it is
@@ -224,7 +229,7 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 			return res, errors.Wrap(err, "failed to set cluster settings")
 		}
 		return res, nil
-	}, DefaultSSHRetryOpts); err != nil {
+	}, WithConcurrency(parallelism)); err != nil {
 		return err
 	}
 
@@ -325,7 +330,7 @@ func (c *SyncedCluster) ExecSQL(
 	resultChan := make(chan result, len(c.Nodes))
 
 	display := fmt.Sprintf("%s: executing sql", c.Name)
-	if err := c.Parallel(l, display, len(c.Nodes), 0, func(nodeIdx int) (*RunResultDetails, error) {
+	if err := c.Parallel(ctx, l, len(c.Nodes), func(ctx context.Context, nodeIdx int) (*RunResultDetails, error) {
 		node := c.Nodes[nodeIdx]
 
 		var cmd string
@@ -344,11 +349,11 @@ func (c *SyncedCluster) ExecSQL(
 		res.CombinedOut = out
 
 		if res.Err != nil {
-			return res, errors.Wrapf(res.Err, "~ %s\n%s", cmd, res.CombinedOut)
+			res.Err = errors.Wrapf(res.Err, "~ %s\n%s", cmd, res.CombinedOut)
 		}
 		resultChan <- result{node: node, output: string(res.CombinedOut)}
 		return res, nil
-	}, DefaultSSHRetryOpts); err != nil {
+	}, WithDisplay(display)); err != nil {
 		return err
 	}
 
@@ -511,7 +516,7 @@ func (c *SyncedCluster) generateStartArgs(
 	}
 
 	listenHost := ""
-	if c.IsLocal() {
+	if c.IsLocal() && runtime.GOOS == "darwin " {
 		// This avoids annoying firewall prompts on Mac OS X.
 		listenHost = "127.0.0.1"
 	}
@@ -693,12 +698,12 @@ func (c *SyncedCluster) generateClusterSettingCmd(l *logger.Logger, node Node) s
 	// removed in v21.2.
 	clusterSettingCmd += fmt.Sprintf(`
 		if ! test -e %s ; then
-			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "SET CLUSTER SETTING server.remote_debugging.mode = 'any'" || true;
-			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "
+			COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e "SET CLUSTER SETTING server.remote_debugging.mode = 'any'" || true;
+			COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e "
 				SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing';
 				SET CLUSTER SETTING enterprise.license = '%s';" \
 			&& touch %s
-		fi`, path, binary, url, binary, url, config.CockroachDevLicense, path)
+		fi`, path, startSQLTimeout, binary, url, startSQLTimeout, binary, url, config.CockroachDevLicense, path)
 	return clusterSettingCmd
 }
 
@@ -713,8 +718,8 @@ func (c *SyncedCluster) generateInitCmd(node Node) string {
 	binary := cockroachNodeBinary(c, node)
 	initCmd += fmt.Sprintf(`
 		if ! test -e %[1]s ; then
-			COCKROACH_CONNECT_TIMEOUT=0 %[2]s init --url %[3]s && touch %[1]s
-		fi`, path, binary, url)
+			COCKROACH_CONNECT_TIMEOUT=%[4]d %[2]s init --url %[3]s && touch %[1]s
+		fi`, path, binary, url, startSQLTimeout)
 	return initCmd
 }
 
@@ -829,10 +834,10 @@ func (c *SyncedCluster) createFixedBackupSchedule(
 	node := c.Nodes[0]
 	binary := cockroachNodeBinary(c, node)
 	url := c.NodeURL("localhost", c.NodePort(node), "" /* tenantName */)
-	fullCmd := fmt.Sprintf(`COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e %q`,
-		binary, url, createScheduleCmd)
+	fullCmd := fmt.Sprintf(`COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e %q`,
+		startSQLTimeout, binary, url, createScheduleCmd)
 	// Instead of using `c.ExecSQL()`, use the more flexible c.newSession(), which allows us to
-	// 1) prefix the schedule backup cmd with COCKROACH_CONNECT_TIMEOUT=0.
+	// 1) prefix the schedule backup cmd with COCKROACH_CONNECT_TIMEOUT.
 	// 2) run the command against the first node in the cluster target.
 	sess := c.newSession(l, node, fullCmd, withDebugName("init-backup-schedule"))
 	defer sess.Close()

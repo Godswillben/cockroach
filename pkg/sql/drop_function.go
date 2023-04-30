@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -85,8 +86,8 @@ func (p *planner) DropFunction(
 			}
 			return nil, pgerror.Newf(
 				pgcode.DependentObjectsStillExist,
-				"cannot drop function %q because other objects (%v) still depend on it",
-				mut.Name, depNames,
+				"cannot drop function %q because other objects ([%v]) still depend on it",
+				mut.Name, strings.Join(depNames, ", "),
 			)
 		}
 		dropNode.toDrop = append(dropNode.toDrop, mut)
@@ -142,6 +143,8 @@ func (p *planner) matchUDF(
 		}
 		return nil, err
 	}
+	// Note that we don't check ol.HasSQLBody() here, because builtin functions
+	// can't be dropped even if they are defined using a SQL string.
 	if !ol.IsUDF {
 		return nil, errors.Errorf(
 			"cannot drop function %s%s because it is required by the database system",

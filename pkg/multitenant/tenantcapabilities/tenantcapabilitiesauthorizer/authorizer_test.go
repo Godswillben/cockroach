@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiestestutils"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDataDriven runs datadriven tests against the Authorizer interface. The
@@ -53,31 +55,49 @@ import (
 // ----
 // ok
 //
-//
 // "has-tsdb-query-capability": performas a capability check to be able to
 // make TSDB queries. Example:
 //
 // has-tsdb-query-capability ten=11
 // ----
 // ok
-
+//
+// "set-bool-cluster-setting": overrides the specified boolean cluster setting
+// to the given value. Currently, only the authorizerEnabled cluster setting is
+// supported.
+//
+// set-bool-cluster-setting name=tenant_capabilities.authorizer.enabled value=false
+// ----
+// ok
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-		mockReader := mockReader(make(map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities))
-		authorizer := New(cluster.MakeTestingClusterSettings(), nil /* TestingKnobs */)
+		clusterSettings := cluster.MakeTestingClusterSettings()
+		ctx := context.Background()
+		mockReader := mockReader(make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities))
+		authorizer := New(clusterSettings, nil /* TestingKnobs */)
 		authorizer.BindReader(mockReader)
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			tenID := tenantcapabilitiestestutils.GetTenantID(t, d)
+			var tenID roachpb.TenantID
+			if d.HasArg("ten") {
+				tenID = tenantcapabilitiestestutils.GetTenantID(t, d)
+			}
 			switch d.Cmd {
 			case "upsert":
-				update, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
+				_, caps, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
 				if err != nil {
 					return err.Error()
 				}
-				mockReader.updateState([]*tenantcapabilities.Update{update})
+				mockReader.updateState([]*tenantcapabilities.Update{
+					{
+						Entry: tenantcapabilities.Entry{
+							TenantID:           tenID,
+							TenantCapabilities: caps,
+						},
+					},
+				})
 			case "delete":
 				update := tenantcapabilitiestestutils.ParseTenantCapabilityDelete(t, d)
 				mockReader.updateState([]*tenantcapabilities.Update{update})
@@ -100,6 +120,16 @@ func TestDataDriven(t *testing.T) {
 					return "ok"
 				}
 				return err.Error()
+			case "set-authorizer-mode":
+				var valStr string
+				d.ScanArgs(t, "value", &valStr)
+				val, ok := authorizerMode.ParseEnum(valStr)
+				if !ok {
+					t.Fatalf("unknown authorizer mode %s", valStr)
+				}
+				authorizerMode.Override(ctx, &clusterSettings.SV, val)
+			case "is-exempt-from-rate-limiting":
+				return fmt.Sprintf("%t", authorizer.IsExemptFromRateLimiting(context.Background(), tenID))
 			default:
 				return fmt.Sprintf("unknown command %s", d.Cmd)
 			}
@@ -108,7 +138,9 @@ func TestDataDriven(t *testing.T) {
 	})
 }
 
-type mockReader map[roachpb.TenantID]tenantcapabilitiespb.TenantCapabilities
+type mockReader map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities
+
+var _ tenantcapabilities.Reader = mockReader{}
 
 func (m mockReader) updateState(updates []*tenantcapabilities.Update) {
 	for _, update := range updates {
@@ -123,7 +155,33 @@ func (m mockReader) updateState(updates []*tenantcapabilities.Update) {
 // GetCapabilities implements the tenantcapabilities.Reader interface.
 func (m mockReader) GetCapabilities(
 	id roachpb.TenantID,
-) (tenantcapabilitiespb.TenantCapabilities, bool) {
+) (*tenantcapabilitiespb.TenantCapabilities, bool) {
 	cp, found := m[id]
 	return cp, found
+}
+
+// GetGlobalCapabilityState implements the tenantcapabilities.Reader interface.
+func (m mockReader) GetGlobalCapabilityState() map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities {
+	return m
+}
+
+func TestAllBatchCapsAreBoolean(t *testing.T) {
+	for _, capID := range reqMethodToCap {
+		if capID >= tenantcapabilities.MaxCapabilityID {
+			// One of the special values.
+			continue
+		}
+		caps := tenantcapabilities.DefaultCapabilities()
+		var v *tenantcapabilities.BoolValue
+		require.Implements(t, v, tenantcapabilities.MustGetValueByID(caps, capID))
+	}
+}
+
+func TestAllBatchRequestTypesHaveAssociatedCaps(t *testing.T) {
+	for req := kvpb.Method(0); req < kvpb.NumMethods; req++ {
+		_, ok := reqMethodToCap[req]
+		if !ok {
+			t.Errorf("no capability associated with request type %s", req)
+		}
+	}
 }

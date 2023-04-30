@@ -113,6 +113,10 @@ type Builder struct {
 	// are referenced multiple times in the same query.
 	views map[cat.View]*tree.Select
 
+	// sourceViews contains a map with all the views in the current data source
+	// chain. It is used to detect circular dependencies.
+	sourceViews map[string]struct{}
+
 	// subquery contains a pointer to the subquery which is currently being built
 	// (if any).
 	subquery *subquery
@@ -124,6 +128,17 @@ type Builder struct {
 	// If set, we are processing a function definition; in this case catalog caches
 	// are disabled and only statements whitelisted are allowed.
 	insideFuncDef bool
+
+	// insideUDF is true when the current expressions are being built within a
+	// UDF.
+	// TODO(mgartner): Once other UDFs can be referenced from within a UDF, a
+	// boolean will not be sufficient to track whether or not we are in a UDF.
+	// We'll need to track the depth of the UDFs we are building expressions
+	// within.
+	insideUDF bool
+
+	// insideDataSource is true when we are processing a data source.
+	insideDataSource bool
 
 	// If set, we are collecting view dependencies in schemaDeps. This can only
 	// happen inside view/function definitions.
@@ -301,6 +316,12 @@ func (b *Builder) buildStmt(
 		switch stmt := stmt.(type) {
 		case *tree.Select:
 		case tree.SelectStatement:
+		case *tree.Delete:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
+		case *tree.Insert:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
+		case *tree.Update:
+			panic(unimplemented.NewWithIssuef(87289, "%s usage inside a function definition", stmt.StatementTag()))
 		default:
 			panic(unimplemented.Newf("user-defined functions", "%s usage inside a function definition", stmt.StatementTag()))
 		}
@@ -506,7 +527,7 @@ func (o *optTrackingTypeResolver) ResolveType(
 	if err != nil {
 		return nil, err
 	}
-	o.metadata.AddUserDefinedType(typ)
+	o.metadata.AddUserDefinedType(typ, name)
 	return typ, nil
 }
 
@@ -518,6 +539,6 @@ func (o *optTrackingTypeResolver) ResolveTypeByOID(
 	if err != nil {
 		return nil, err
 	}
-	o.metadata.AddUserDefinedType(typ)
+	o.metadata.AddUserDefinedType(typ, nil /* name */)
 	return typ, nil
 }

@@ -29,7 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -38,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -178,6 +181,14 @@ type ClientInterceptorInfo struct {
 	StreamInterceptors []grpc.StreamClientInterceptor
 }
 
+type versionCompatError struct{}
+
+func (versionCompatError) Error() string {
+	return "version compatibility check failed on ping response"
+}
+
+var VersionCompatError = versionCompatError{}
+
 // NewServerEx is like NewServer, but also returns the interceptors that have
 // been registered with gRPC for the server. These interceptors can be used
 // manually when bypassing gRPC to call into the server (like the
@@ -304,9 +315,9 @@ type Connection struct {
 	// err is nil initially; eventually set to the dial or heartbeat error that
 	// tore down the connection.
 	err atomic.Value
-	// initialHeartbeatDone is closed in `runHeartbeat` once grpcConn is
-	// populated. This means that access to that field must read this channel
-	// first.
+	// initialHeartbeatDone is closed in `runHeartbeat` once grpcConn is populated
+	// and a heartbeat is successfully returned. This means that access to that
+	// field must read this channel first.
 	initialHeartbeatDone chan struct{}    // closed after first heartbeat
 	grpcConn             *grpc.ClientConn // present when initialHeartbeatDone is closed; must read that channel first
 }
@@ -351,10 +362,10 @@ func (c *Connection) Health() error {
 		err, _ := c.err.Load().(error)
 		return err
 	default:
-		// TODO(tbg): would be better if this returned ErrNoConnection, as this
-		// is what's happening here. There might be a connection attempt going
-		// on, but not one that has proven conclusively that the peer is even
-		// reachable.
+		// There might be a connection attempt going on, but not one that has proven
+		// conclusively that the peer is reachable and able to connect back to us.
+		// Ideally we could return ErrNoConnection, but it is hard to separate out
+		// these cases.
 		return ErrNotHeartbeated
 	}
 }
@@ -363,6 +374,8 @@ func (c *Connection) Health() error {
 //
 // TODO(tbg): rename at the very least the `ctx` receiver, but possibly the whole
 // thing.
+// TODO(baptist): Remove the inheritance on ContextOptions directly construct
+// the object with what it needs.
 type Context struct {
 	ContextOptions
 	*SecurityContext
@@ -380,6 +393,14 @@ type Context struct {
 	localInternalClient RestrictedInternalClient
 
 	m connMap
+
+	// dialbackMap is a map of currently executing dialback connections. This map
+	// is typically empty or close to empty. It only holds entries that are being
+	// verified for dialback due to failing a health check.
+	dialbackMu struct {
+		syncutil.Mutex
+		m map[roachpb.NodeID]*Connection
+	}
 
 	metrics Metrics
 
@@ -471,9 +492,8 @@ type ContextOptions struct {
 	Settings        *cluster.Settings
 	// OnIncomingPing is called when handling a PingRequest, after
 	// preliminary checks but before recording clock offset information.
-	//
-	// It can inject an error.
-	OnIncomingPing func(context.Context, *PingRequest) error
+	// It can inject an error or modify the response.
+	OnIncomingPing func(context.Context, *PingRequest, *PingResponse) error
 	// OnOutgoingPing intercepts outgoing PingRequests. It may inject an
 	// error.
 	OnOutgoingPing func(context.Context, *PingRequest) error
@@ -513,6 +533,20 @@ type ContextOptions struct {
 	// subsystem. It allows KV nodes to perform capability checks for incoming
 	// tenant requests.
 	TenantRPCAuthorizer tenantcapabilities.Authorizer
+
+	// NeedsDialback indicates that connections created with this RPC context
+	// should be verified after they are established by the recipient having a
+	// backwards connection to us. This is used for KV server to KV server
+	// communication. If there is already a healthy connection, then the
+	// PingResponse is sent like normal, however if there is no connection then a
+	// throwaway reverse TCP connection is made. This is set to true on
+	// node-to-node connections and prevents one-way partitions from occurring by
+	// turing them into two-way partitions.
+	NeedsDialback bool
+
+	// PreferSRVLookup indicates whether SRV records are preferred over A/AAAA
+	// records when dialing network targets.
+	PreferSRVLookup bool
 }
 
 func (c ContextOptions) validate() error {
@@ -639,6 +673,10 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		heartbeatTimeout:    opts.Config.RPCHeartbeatTimeout,
 		logClosingConnEvery: log.Every(time.Second),
 	}
+
+	rpcCtx.dialbackMu.Lock()
+	rpcCtx.dialbackMu.m = map[roachpb.NodeID]*Connection{}
+	rpcCtx.dialbackMu.Unlock()
 
 	if !opts.TenantID.IsSet() {
 		panic("tenant ID not set")
@@ -1084,8 +1122,31 @@ func (a internalClientAdapter) RangeFeed(
 		// create a child span with its different Tracer, which is not allowed.
 		serverCtx = tracing.ContextWithSpan(ctx, nil)
 	}
+
+	// Create a new context from the existing one with the "local request"
+	// field set. This tells the handler that this is an in-process request,
+	// bypassing ctx.Peer checks. This call also overwrites any possibly
+	// existing info in the context. This is important in situations where a
+	// shared-process tenant calls into the local KV node, and that local RPC
+	// ends up performing another RPC to the local node. The inner RPC must
+	// carry the identity of the system tenant, not the one of the client of
+	// the outer RPC.
+	serverCtx = grpcutil.NewLocalRequestContext(serverCtx, a.clientTenantID)
+
+	// Clear any leftover gRPC incoming metadata, if this call
+	// is originating from a RPC handler function called as
+	// a result of a tenant call. This is this case:
+	//
+	//    tenant -(rpc)-> tenant -(rpc)-> KV
+	//                            ^ YOU ARE HERE
+	//
+	// at this point, the left side RPC has left some incoming
+	// metadata in the context, but we need to get rid of it
+	// before we let the call go through KV.
+	serverCtx = grpcutil.ClearIncomingContext(serverCtx)
+
 	rawServerStream := &serverStream{
-		ctx: grpcutil.NewLocalRequestContext(serverCtx, a.clientTenantID),
+		ctx: serverCtx,
 		// RangeFeed is a server-streaming RPC, so the server does not receive
 		// anything.
 		receiver: pipeReader{},
@@ -1208,8 +1269,30 @@ func (a internalClientAdapter) MuxRangeFeed(
 		// create a child span with its different Tracer, which is not allowed.
 		serverCtx = tracing.ContextWithSpan(ctx, nil)
 	}
+	// Create a new context from the existing one with the "local request"
+	// field set. This tells the handler that this is an in-process request,
+	// bypassing ctx.Peer checks. This call also overwrites any possibly
+	// existing info in the context. This is important in situations where a
+	// shared-process tenant calls into the local KV node, and that local RPC
+	// ends up performing another RPC to the local node. The inner RPC must
+	// carry the identity of the system tenant, not the one of the client of
+	// the outer RPC.
+	serverCtx = grpcutil.NewLocalRequestContext(serverCtx, a.clientTenantID)
+
+	// Clear any leftover gRPC incoming metadata, if this call
+	// is originating from a RPC handler function called as
+	// a result of a tenant call. This is this case:
+	//
+	//    tenant -(rpc)-> tenant -(rpc)-> KV
+	//                            ^ YOU ARE HERE
+	//
+	// at this point, the left side RPC has left some incoming
+	// metadata in the context, but we need to get rid of it
+	// before we let the call go through KV.
+	serverCtx = grpcutil.ClearIncomingContext(serverCtx)
+
 	rawServerStream := &serverStream{
-		ctx:      grpcutil.NewLocalRequestContext(serverCtx, a.clientTenantID),
+		ctx:      serverCtx,
 		receiver: requestReader,
 		sender:   eventWriter,
 	}
@@ -1751,6 +1834,12 @@ func (rpcCtx *Context) dialOptsNetwork(
 	// which is only definitely provided during dial.
 	dialer := onlyOnceDialer{}
 	dialerFunc := dialer.dial
+	if rpcCtx.ContextOptions.PreferSRVLookup {
+		dialer := &srvResolvingDialer{
+			dialerFunc: dialerFunc,
+		}
+		dialerFunc = dialer.dial
+	}
 	if rpcCtx.Knobs.InjectedLatencyOracle != nil {
 		latency := rpcCtx.Knobs.InjectedLatencyOracle.GetLatency(target)
 		log.VEventf(ctx, 1, "connecting with simulated latency %dms",
@@ -1763,6 +1852,10 @@ func (rpcCtx *Context) dialOptsNetwork(
 		dialerFunc = dialer.dial
 	}
 	dialOpts = append(dialOpts, grpc.WithContextDialer(dialerFunc))
+
+	// Don't retry on dial errors either, otherwise the onlyOnceDialer will get
+	// into a bad state for connection errors.
+	dialOpts = append(dialOpts, grpc.FailOnNonTempDialError(true))
 
 	return dialOpts, nil
 }
@@ -1880,7 +1973,7 @@ func (ood *onlyOnceDialer) dial(ctx context.Context, addr string) (net.Conn, err
 			// We set up onlyOnceDialer to avoid returning any errors that could look
 			// temporary to gRPC, and so we don't expect it to re-dial a connection
 			// twice (the first re-dial is supposed to surface the permanent error).
-			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "gRPC connection unexpectedly re-dialed")
+			return nil, &notTemporaryError{errors.NewAssertionErrorWithWrappedErrf(err, "gRPC connection unexpectedly re-dialed")}
 		}
 		ood.mu.redialed = true
 		return nil, err
@@ -1924,6 +2017,25 @@ func (ald *artificialLatencyDialer) dial(ctx context.Context, addr string) (net.
 		enabled: ald.enabled,
 		readBuf: new(bytes.Buffer),
 	}, nil
+}
+
+// srvResolvingDialer first queries SRV records for addr, and dials
+// a random member of the result.
+// If the result is empty, it dials the addr directly.
+type srvResolvingDialer struct {
+	dialerFunc dialerFunc
+}
+
+func (srd *srvResolvingDialer) dial(ctx context.Context, addr string) (net.Conn, error) {
+	addrs, err := netutil.SRV(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		// If SRV lookup returns empty, we fallback to addr.
+		addrs = []string{addr}
+	}
+	return srd.dialerFunc(ctx, addrs[int(randutil.FastUint32())%len(addrs)])
 }
 
 type delayingListener struct {
@@ -2062,22 +2174,11 @@ func (rpcCtx *Context) makeDialCtx(
 	return dialCtx
 }
 
-// GRPCDialRaw calls grpc.Dial with options appropriate for the context.
-// Unlike GRPCDialNode, it does not start an RPC heartbeat to validate the
-// connection. This connection will not be reconnected automatically;
-// the returned channel is closed when a reconnection is attempted.
-// This method implies a DefaultClass ConnectionClass for the returned
-// ClientConn.
-func (rpcCtx *Context) GRPCDialRaw(target string) (*grpc.ClientConn, error) {
-	ctx := rpcCtx.makeDialCtx(target, 0, DefaultClass)
-	return rpcCtx.grpcDialRaw(ctx, target, DefaultClass)
-}
-
 // grpcDialRaw connects to the remote node.
 // The ctx passed as argument must be derived from rpcCtx.masterCtx, so
 // that it respects the same cancellation policy.
 func (rpcCtx *Context) grpcDialRaw(
-	ctx context.Context, target string, class ConnectionClass,
+	ctx context.Context, target string, class ConnectionClass, additionalOpts ...grpc.DialOption,
 ) (*grpc.ClientConn, error) {
 	transport := tcpTransport
 	if rpcCtx.Config.AdvertiseAddr == target && !rpcCtx.ClientOnly {
@@ -2089,10 +2190,7 @@ func (rpcCtx *Context) grpcDialRaw(
 		return nil, err
 	}
 
-	// Add testingDialOpts at the end because one of our tests
-	// uses a custom dialer (this disables the only-one-connection
-	// behavior and redialChan will never be closed).
-	dialOpts = append(dialOpts, rpcCtx.testingDialOpts...)
+	dialOpts = append(dialOpts, additionalOpts...)
 
 	return grpc.DialContext(ctx, target, dialOpts...)
 }
@@ -2230,7 +2328,8 @@ func (rpcCtx *Context) grpcDialNodeInternal(
 			// Run the heartbeat; this will block until the connection breaks for
 			// whatever reason. We don't actually have to do anything with the error,
 			// so we ignore it.
-			_ = rpcCtx.runHeartbeat(ctx, conn, target)
+			err := rpcCtx.runHeartbeat(ctx, conn, target)
+			log.Infof(ctx, "connection heartbeat loop ended with err: %v", err)
 			maybeFatal(ctx, rpcCtx.m.Remove(k, conn))
 
 			// Context gets canceled on server shutdown, and if that's likely why
@@ -2272,6 +2371,14 @@ var ErrNotHeartbeated = errors.New("not yet heartbeated")
 // ErrNoConnection is returned by ConnHealth when no connection exists to
 // the node.
 var ErrNoConnection = errors.New("no connection found")
+
+// TODO(baptist): Remove in 23.2 (or 24.1) once validating dialback works for all scenarios.
+var useDialback = settings.RegisterBoolSetting(
+	settings.TenantReadOnly,
+	"rpc.dialback.enabled",
+	"if true, require bidirectional RPC connections between nodes to prevent one-way network unavailability",
+	true,
+)
 
 // runHeartbeat synchronously runs the heartbeat loop for the given RPC
 // connection. The ctx passed as argument must be derived from rpcCtx.masterCtx,
@@ -2327,7 +2434,7 @@ func (rpcCtx *Context) runHeartbeat(
 
 	{
 		var err error
-		conn.grpcConn, err = rpcCtx.grpcDialRaw(ctx, target, conn.class)
+		conn.grpcConn, err = rpcCtx.grpcDialRaw(ctx, target, conn.class, rpcCtx.testingDialOpts...)
 		if err != nil {
 			// Note that grpcConn will actually connect in the background, so it's
 			// unusual to hit this case.
@@ -2344,9 +2451,10 @@ func (rpcCtx *Context) runHeartbeat(
 	// heartbeat to heartbeat: we compute a new .Offset at the end of
 	// the current heartbeat as input to the next one.
 	request := &PingRequest{
-		DeprecatedOriginAddr: rpcCtx.Config.Addr,
-		TargetNodeID:         conn.remoteNodeID,
-		ServerVersion:        rpcCtx.Settings.Version.BinaryVersion(),
+		OriginAddr:      rpcCtx.Config.AdvertiseAddr,
+		TargetNodeID:    conn.remoteNodeID,
+		ServerVersion:   rpcCtx.Settings.Version.BinaryVersion(),
+		LocalityAddress: rpcCtx.Config.LocalityAddresses,
 	}
 
 	heartbeatClient := NewHeartbeatClient(conn.grpcConn)
@@ -2364,7 +2472,8 @@ func (rpcCtx *Context) runHeartbeat(
 	// This simple model should work well in practice and it avoids serious
 	// problems that could arise from keeping unhealthy connections in the pool.
 	connFailedCh := make(chan connectivity.State, 1)
-	for i := 0; ; i++ {
+	first := true
+	for {
 		select {
 		case <-ctx.Done():
 			return nil // server shutting down
@@ -2396,6 +2505,16 @@ func (rpcCtx *Context) runHeartbeat(
 					return err
 				}
 				var err error
+				// Check the setting lazily to allow toggling on/off without a restart.
+				if rpcCtx.NeedsDialback && useDialback.Get(&rpcCtx.Settings.SV) {
+					if first {
+						request.NeedsDialback = PingRequest_BLOCKING
+					} else {
+						request.NeedsDialback = PingRequest_NON_BLOCKING
+					}
+				} else {
+					request.NeedsDialback = PingRequest_NONE
+				}
 				response, err = heartbeatClient.Ping(ctx, request)
 				return err
 			}
@@ -2407,6 +2526,7 @@ func (rpcCtx *Context) runHeartbeat(
 			}
 
 			if err != nil {
+				log.VEventf(ctx, 2, "received error on ping response from n%d, %v", conn.remoteNodeID, err)
 				return err
 			}
 
@@ -2425,18 +2545,19 @@ func (rpcCtx *Context) runHeartbeat(
 				}
 			}
 
-			if err := errors.Wrap(
-				checkVersion(ctx, rpcCtx.Settings.Version, response.ServerVersion),
-				"version compatibility check failed on ping response"); err != nil {
+			err = checkVersion(ctx, rpcCtx.Settings.Version, response.ServerVersion)
+			if err != nil {
+				err := errors.Mark(err, VersionCompatError)
 				return err
 			}
 
-			// Only a server connecting to another server needs to check
-			// clock offsets. A CLI command does not need to update its
-			// local HLC, nor does it care that strictly about
-			// client-server latency, nor does it need to track the
-			// offsets.
-			if rpcCtx.RemoteClocks != nil {
+			// Only a server connecting to another server needs to check clock
+			// offsets. A CLI command does not need to update its local HLC, nor does
+			// it care that strictly about client-server latency, nor does it need to
+			// track the offsets. For BLOCKING requests we can not use this
+			// response for updating our clocks since the observed RTT latency can be
+			// inflated.
+			if rpcCtx.RemoteClocks != nil && request.NeedsDialback != PingRequest_BLOCKING {
 				receiveTime := rpcCtx.Clock.Now()
 
 				// Only update the clock offset measurement if we actually got a
@@ -2467,11 +2588,11 @@ func (rpcCtx *Context) runHeartbeat(
 			return err
 		}
 
-		if i == 0 {
+		if first {
 			// First heartbeat succeeded.
 			rpcCtx.metrics.HeartbeatsNominal.Inc(1)
-			log.Health.Infof(ctx, "connection is now ready")
 			close(conn.initialHeartbeatDone)
+			log.Health.Infof(ctx, "connection is now ready")
 			// The connection should be `Ready` now since we just used it for a
 			// heartbeat RPC. Any additional state transition indicates that we need
 			// to remove it, and we want to do so reactively. Unfortunately, gRPC
@@ -2495,6 +2616,7 @@ func (rpcCtx *Context) runHeartbeat(
 		}
 
 		heartbeatTimer.Reset(rpcCtx.heartbeatInterval)
+		first = false
 	}
 }
 
@@ -2511,4 +2633,134 @@ func (rpcCtx *Context) NewHeartbeatService() *HeartbeatService {
 		onHandlePing:                          rpcCtx.OnIncomingPing,
 		testingAllowNamedRPCToAnonymousServer: rpcCtx.TestingAllowNamedRPCToAnonymousServer,
 	}
+}
+
+// VerifyDialback verifies connectivity from the recipient of a PingRequest back
+// to the sender. If there is already a connection in place, it will return
+// immediately without error. If there is no connection in place and the
+// NeedsDialback on the PingRequest is not set to NONE, then it will establish a
+// connection in either blocking or non-blocking mode.
+// BLOCKING mode delays sending a PingResponse until the connection is
+// validated, and is only used on the first PingRequest after a connection is
+// established.
+// NON_BLOCKING mode will attempt to establish a reverse connection and send the
+// result on the next PingRequest that is sent on this connection.
+// This method keeps track of non blocking attempts in the dialbackMu and will
+// clear out any pending attempts as soon as a successful connection is
+// established.
+func (rpcCtx *Context) VerifyDialback(
+	ctx context.Context, request *PingRequest, response *PingResponse, locality roachpb.Locality,
+) error {
+	if request.NeedsDialback == PingRequest_NONE {
+		return nil
+	}
+
+	baseAddr := util.UnresolvedAddr{NetworkField: "tcp", AddressField: request.OriginAddr}
+	target := locality.LookupAddress(request.LocalityAddress, &baseAddr).AddressField
+	// nodeID may be null for "bootstrapping" requests. In that case we always
+	// assume blocking mode since we can't track connection attempts.
+	nodeID := request.OriginNodeID
+
+	// Check in our regular connection map to see if we are healthy. We use the
+	// System class because that is what is important from a liveness perspective.
+	// If we are unable to maintain a healthy connection on the System class we
+	// will fail other connections also.
+	connHealthErr := rpcCtx.ConnHealth(target, nodeID, SystemClass)
+
+	// We have a successful connection so report success. Any ongoing attempts no
+	// longer need to be tracked.
+	if connHealthErr == nil {
+		rpcCtx.clearPreviousAttempt(nodeID)
+		return nil
+	}
+
+	log.VEventf(ctx, 2, "unable to verify health on existing conn, trying dialback conn to %s, n%d mode %v, %v",
+		target, nodeID, request.NeedsDialback, connHealthErr)
+
+	if nodeID == 0 || request.NeedsDialback == PingRequest_BLOCKING {
+		// Since we don't have a successful reverse connection, try and dial back
+		// manually. We don't use the regular dialer pool since we don't want to wait
+		// for heartbeats on this connection.
+		// TODO(baptist): Consider using GRPCUnvalidatedDial and use the
+		// WaitForStateChange to detect when the TCP connection is established. This
+		// will keep this connection in the pool after establishment. Wait until
+		// https://github.com/grpc/grpc-go/issues/5496 is completed.
+		ctx := rpcCtx.makeDialCtx(target, 0, SystemClass)
+		conn, err := rpcCtx.grpcDialRaw(ctx, target, SystemClass, grpc.WithBlock())
+		if err != nil {
+			log.Infof(ctx, "blocking dialback connection failed to %s, n%d, %v", target, nodeID, err)
+			return err
+		}
+		log.VEventf(ctx, 2, "blocking dialback connection to n%d succeeded", nodeID)
+		// Clear any previous attempts since we are known to be able to initiate a
+		// TCP connection.
+		rpcCtx.clearPreviousAttempt(nodeID)
+		_ = conn.Close() // nolint:grpcconnclose
+		return nil
+	} else {
+		// If the previous attempt ended in an error, we can confidently report we
+		// are unable to dialback. If the attempt is still ongoing, then we want
+		// to allow it to finish. Once it has finished, we will leave this error
+		// here until the connection health becomes healthy either through
+		// checking the health manually or a blocking ping succeeding.
+		return rpcCtx.loadOrCreateConnAttempt(nodeID, func() *Connection {
+			return rpcCtx.GRPCDialNode(target, nodeID, SystemClass)
+		})
+	}
+}
+
+// clearPreviousAttempt will clear out any previous errors on connection
+// attempts. This is only done after we have verified we have a healthy
+// established connection to the sender of this ping.
+func (rpcCtx *Context) clearPreviousAttempt(nodeID roachpb.NodeID) {
+	if nodeID > 0 {
+		rpcCtx.dialbackMu.Lock()
+		defer rpcCtx.dialbackMu.Unlock()
+		rpcCtx.dialbackMu.m[nodeID] = nil
+	}
+}
+
+// loadOrCreateConnAttempt checks if we have an in-progress connection attempt
+// to a store, and if not will create a connection and store it in the map. It
+// takes a function to create a connection because the connection is only
+// created in the case where it doesn't already exist. If there is already a
+// ongoing connection attempt, it will instead check the status of that attempt.
+// If it is completed and is in error, then it will return that error, if it is
+// still ongoing, then it returns nil to signify that it might be healthy.
+func (rpcCtx *Context) loadOrCreateConnAttempt(
+	nodeID roachpb.NodeID, createConnFunc func() *Connection,
+) error {
+	rpcCtx.dialbackMu.Lock()
+	defer rpcCtx.dialbackMu.Unlock()
+
+	// Check if the previous connection is completed (successfully or not). This
+	// happens only on subsequent pings after not detecting a healthy reverse
+	// connection. The connection setup can take longer than a ping interval. We
+	// use the previous connection attempt if it exists rather than just checking
+	// health to avoid missing the result of our connection attempt. This could
+	// happen if our previous connect attempt failed between pings. Without this
+	// protection we would continually try opening new dialback connections, but
+	// never observe the result.
+	if previousAttempt := rpcCtx.dialbackMu.m[nodeID]; previousAttempt != nil {
+		select {
+		case <-previousAttempt.initialHeartbeatDone:
+			// The connection attempt was completed, return the outcome of it.
+			err, _ := previousAttempt.err.Load().(error)
+			if err == nil {
+				// If it completed without error then don't track the connection
+				// anymore. If it did have an error we need to track it until it later gets cleared.
+				rpcCtx.dialbackMu.m[nodeID] = nil
+			}
+			return err
+		default:
+			// We still don't know the outcome of the previous attempt. For now
+			// allow this attempt to continue and check in the future.
+			return nil
+		}
+	}
+
+	// There is no previous attempt in place. Create a connection and store it for
+	// the future, for now return success.
+	rpcCtx.dialbackMu.m[nodeID] = createConnFunc()
+	return nil
 }

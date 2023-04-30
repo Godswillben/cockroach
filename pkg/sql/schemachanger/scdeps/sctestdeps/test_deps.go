@@ -489,6 +489,7 @@ func (s *TestState) mayGetByName(
 func (s *TestState) GetAllObjectsInSchema(
 	ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor,
 ) nstree.Catalog {
+	s.LogSideEffectf("getting all objects in schema: %d", schema.GetID())
 	var ret nstree.MutableCatalog
 	_ = s.uncommittedInMemory.ForEachDescriptor(func(desc catalog.Descriptor) error {
 		if desc.GetParentSchemaID() == schema.GetID() {
@@ -851,7 +852,9 @@ func (s *TestState) Validate(ctx context.Context) error {
 		} else {
 			s.LogSideEffectf("upsert comment %s(objID: %d, subID: %d) -> %q",
 				key.CommentType, key.ObjectID, key.SubID, cmt)
-			s.uncommittedInMemory.UpsertComment(key, cmt)
+			if err := s.uncommittedInMemory.UpsertComment(key, cmt); err != nil {
+				return err
+			}
 		}
 	}
 	ve := s.uncommittedInMemory.Validate(

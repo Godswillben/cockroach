@@ -1,4 +1,4 @@
-// Copyright 2016 The Cockroach Authors.
+ // Copyright 2016 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -1136,11 +1136,6 @@ message ListDistSQLFlowsRequest {}
 // same physical plan. The gateway node that initiated the execution of the plan
 // isn't included.
 message DistSQLRemoteFlows {
-  enum Status {
-    RUNNING = 0;
-    QUEUED = 1;
-  }
-
   // Info contains an information about a single DistSQL remote flow.
   message Info {
     // NodeID is the node on which this remote flow is either running or queued.
@@ -1152,9 +1147,7 @@ message DistSQLRemoteFlows {
       (gogoproto.nullable) = false, (gogoproto.stdtime) = true
     ];
 
-    // Status is the current status of this remote flow.
-    // TODO(yuzefovich): remove this in 23.2.
-    Status status = 3;
+    reserved 3;
 
     // Stmt is the SQL statement for which this flow is executing.
     string stmt = 4;
@@ -1595,6 +1588,11 @@ message StatementsResponse {
     uint64 id = 3 [(gogoproto.customname) = "ID",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.StmtFingerprintID"];
     cockroach.sql.StatementStatistics stats = 2 [(gogoproto.nullable) = false];
+    // In 23.1 we expect the response to only group on fingerprint_id and app_name
+    // in the overview page. We now return the aggregated list of unique txn fingerprint ids,
+    // leaving the txn_fingerprint_id field in the key empty.
+   repeated uint64 txn_fingerprint_ids = 4 [(gogoproto.customname) = "TxnFingerprintIDs",
+     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/appstatspb.TransactionFingerprintID"];
   }
 
   repeated CollectedStatementStatistics statements = 1 [(gogoproto.nullable) = false];
@@ -1613,12 +1611,49 @@ message StatementsResponse {
   // Transactions is transaction-level statistics for the collection of
   // statements in this response.
   repeated ExtendedCollectedTransactionStatistics transactions = 5 [(gogoproto.nullable) = false];
+
+  float stmts_total_runtime_secs = 6;
+
+  float txns_total_runtime_secs = 7;
 }
 
+enum StatsSortOptions {
+  SERVICE_LAT = 0;
+  CPU_TIME = 1;
+  EXECUTION_COUNT = 2;
+  P99_STMTS_ONLY = 3;
+  CONTENTION_TIME = 4;
+  PCT_RUNTIME = 5;
+}
 message CombinedStatementsStatsRequest {
+  enum StatsType {
+    StmtStatsOnly = 0;
+    TxnStatsOnly = 1;
+  }
+
+  message FetchMode {
+    StatsType stats_type = 1;
+    StatsSortOptions sort = 2;
+  }
+
   // Unix time range for aggregated statements.
   int64 start = 1 [(gogoproto.nullable) = true];
   int64 end = 2 [(gogoproto.nullable) = true];
+
+  // Note that if fetch_mode is set to transactions only, we will also
+  // include the statement statistics for the stmts in the transactions
+  // response. This is more of a hack-y method to get the complete stats
+  // for txns, because in the client we need to fill in some txn stats info
+  // from its stmt stats, such as the query string.
+  //
+  // We prefer this hackier method right now to reduce surface area for backporting
+  // these changes, but in the future we will introduce more endpoints to properly
+  // organize these differing requests.
+  // TODO (xinhaoz) - Split this API into stmts and txns properly instead of using
+  //  this param.
+  FetchMode fetch_mode = 5 [(gogoproto.nullable) = true];
+
+  int64 limit = 6;
 }
 
 // StatementDetailsRequest requests the details of a Statement, based on its keys.
@@ -1930,6 +1965,13 @@ message ListExecutionInsightsResponse {
   ];
 }
 
+
+message CriticalNodesRequest {}
+message CriticalNodesResponse {
+  repeated roachpb.NodeDescriptor critical_nodes = 1 [(gogoproto.nullable) = false];
+  roachpb.SpanConfigConformanceReport report = 2 [(gogoproto.nullable) = false];
+}
+
 service Status {
   // Certificates retrieves a copy of the TLS certificates.
   rpc Certificates(CertificatesRequest) returns (CertificatesResponse) {
@@ -2172,6 +2214,19 @@ service Status {
     };
   }
 
+  // CriticalNodes retrieves nodes that are considered critical. A critical node
+  // is one whose unexpected termination could result in data loss. A node is
+  // considered critical if any of its replicas are unavailable or
+  // under-replicated. The response includes a list of node descriptors that are
+  // considered critical, and the corresponding SpanConfigConformanceReport that
+  // includes details of non-conforming ranges contributing to the criticality.
+  rpc CriticalNodes(CriticalNodesRequest) returns (CriticalNodesResponse) {
+    option (google.api.http) = {
+      post: "/_status/critical_nodes"
+      body: "*"
+    };
+  }
+
   // Stacks retrieves the stack traces of all goroutines on a given node.
   rpc Stacks(StacksRequest) returns (JSONResponse) {
     option (google.api.http) = {
@@ -2280,6 +2335,7 @@ service Status {
       get: "/_status/combinedstmts"
     };
   }
+
   rpc StatementDetails(StatementDetailsRequest) returns (StatementDetailsResponse) {
     option (google.api.http) = {
       get: "/_status/stmtdetails/{fingerprint_id}"

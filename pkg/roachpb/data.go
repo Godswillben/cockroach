@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -935,6 +936,7 @@ func (TransactionStatus) SafeValue() {}
 func MakeTransaction(
 	name string,
 	baseKey Key,
+	isoLevel isolation.Level,
 	userPriority UserPriority,
 	now hlc.Timestamp,
 	maxOffsetNs int64,
@@ -950,6 +952,7 @@ func MakeTransaction(
 		TxnMeta: enginepb.TxnMeta{
 			Key:               baseKey,
 			ID:                u,
+			IsoLevel:          isoLevel,
 			WriteTimestamp:    now,
 			MinTimestamp:      now,
 			Priority:          MakePriority(userPriority),
@@ -1197,6 +1200,7 @@ func (t *Transaction) Update(o *Transaction) {
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
+	t.IsoLevel = o.IsoLevel
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
@@ -1737,7 +1741,7 @@ func (crt ChangeReplicasTrigger) Removed() []ReplicaDescriptor {
 }
 
 // LeaseSequence is a custom type for a lease sequence number.
-type LeaseSequence int64
+type LeaseSequence uint64
 
 // SafeValue implements the redact.SafeValue interface.
 func (s LeaseSequence) SafeValue() {}
@@ -2466,4 +2470,14 @@ func (r *RowCount) Add(other RowCount) {
 	r.DataSize += other.DataSize
 	r.Rows += other.Rows
 	r.IndexEntries += other.IndexEntries
+}
+
+func (tid *TenantID) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var id uint64
+	if err := unmarshal(&id); err == nil {
+		tid.InternalValue = id
+		return nil
+	} else {
+		return unmarshal(tid)
+	}
 }

@@ -852,14 +852,19 @@ func (tt *Table) addIndexWithVersion(
 		tt.addUniqueConstraint(def.Name, def.Columns, def.Predicate, false /* withoutIndex */)
 	}
 
+	// The test catalog does not support the hash-sharded index syntactic sugar.
+	if def.Sharded != nil {
+		panic("hash-sharded indexes are not supported by the test catalog")
+	}
+
 	idx := &Index{
-		IdxName:    tt.makeIndexName(def.Name, def.Columns, typ),
-		Unique:     typ != nonUniqueIndex,
-		Inverted:   def.Inverted,
-		IdxZone:    cat.EmptyZone(),
-		table:      tt,
-		version:    version,
-		NotVisible: def.NotVisible,
+		IdxName:      tt.makeIndexName(def.Name, def.Columns, typ),
+		Unique:       typ != nonUniqueIndex,
+		Inverted:     def.Inverted,
+		IdxZone:      cat.EmptyZone(),
+		table:        tt,
+		version:      version,
+		Invisibility: def.Invisibility,
 	}
 
 	// Look for name suffixes indicating this is a mutation index.

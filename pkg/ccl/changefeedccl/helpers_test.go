@@ -27,7 +27,6 @@ import (
 
 	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	// Imported to allow locality-related table mutations
@@ -393,10 +392,10 @@ func startTestFullServer(
 		Knobs: knobs,
 		// This test suite is already probabilistically running with
 		// tenants. No need for the test tenant.
-		DisableDefaultTestTenant: true,
-		UseDatabase:              `d`,
-		ExternalIODir:            options.externalIODir,
-		Settings:                 options.settings,
+		DefaultTestTenant: base.TestTenantDisabled,
+		UseDatabase:       `d`,
+		ExternalIODir:     options.externalIODir,
+		Settings:          options.settings,
 	}
 
 	if options.argsFn != nil {
@@ -854,6 +853,12 @@ func randomSinkTypeWithOptions(options feedTestOptions) string {
 	for _, weight := range sinkWeights {
 		weightTotal += weight
 	}
+	if weightTotal == 0 {
+		// This exists for testing purposes, where one may want to run all tests on
+		// the same sink and set sinkWeights to be 1 only for that sink, but some
+		// tests explicitly disallow that sink and therefore have no valid sinks.
+		return "skip"
+	}
 	p := rand.Float32() * float32(weightTotal)
 	var sum float32 = 0
 	for sink, weight := range sinkWeights {
@@ -862,7 +867,7 @@ func randomSinkTypeWithOptions(options feedTestOptions) string {
 			return sink
 		}
 	}
-	return "kafka" // unreachable
+	return "skip" // unreachable
 }
 
 // addCloudStorageOptions adds the options necessary to enable a server to run a
@@ -870,20 +875,6 @@ func randomSinkTypeWithOptions(options feedTestOptions) string {
 func addCloudStorageOptions(t *testing.T, options *feedTestOptions) (cleanup func()) {
 	dir, dirCleanupFn := testutils.TempDir(t)
 	options.externalIODir = dir
-	oldKnobsFn := options.knobsFn
-	options.knobsFn = func(knobs *base.TestingKnobs) {
-		if oldKnobsFn != nil {
-			oldKnobsFn(knobs)
-		}
-		blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(options.externalIODir)
-		if serverKnobs, ok := knobs.Server.(*server.TestingKnobs); ok {
-			serverKnobs.BlobClientFactory = blobClientFactory
-		} else {
-			knobs.Server = &server.TestingKnobs{
-				BlobClientFactory: blobClientFactory,
-			}
-		}
-	}
 	return dirCleanupFn
 }
 
@@ -982,6 +973,9 @@ func cdcTestNamedWithSystem(
 	cleanupCloudStorage := addCloudStorageOptions(t, &options)
 
 	sinkType := randomSinkTypeWithOptions(options)
+	if sinkType == "skip" {
+		return
+	}
 	testLabel := sinkType
 	if name != "" {
 		testLabel = fmt.Sprintf("%s/%s", sinkType, name)
@@ -1012,8 +1006,7 @@ func maybeUseExternalConnection(
 ) cdctest.TestFeedFactory {
 	// percentExternal is the chance of randomly running a test using an `external://` uri.
 	// Set to 1 to always do this.
-	// TODO (zinger): Set this to 0.5 before merging.
-	const percentExternal = 1
+	const percentExternal = 0.5
 	if sinkType == `sinkless` || sinkType == `enterprise` || strings.Contains(flakyWhenExternalConnection, sinkType) ||
 		options.forceNoExternalConnectionURI || rand.Float32() > percentExternal {
 		return factory
@@ -1048,7 +1041,7 @@ var cmLogRe = regexp.MustCompile(`event_log\.go`)
 func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []string {
 	var matchingEntries []string
 	testutils.SucceedsSoon(t, func() error {
-		log.Flush()
+		log.FlushFileSinks()
 		entries, err := log.FetchEntriesFromFiles(startTime,
 			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
 		if err != nil {

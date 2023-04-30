@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -109,37 +111,46 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 // getNodeColumnOrdinal takes a column that is known to be produced by the execPlan
 // and returns the ordinal index of that column in the result columns of the
 // node.
-func (ep *execPlan) getNodeColumnOrdinal(col opt.ColumnID) exec.NodeColumnOrdinal {
+func (ep *execPlan) getNodeColumnOrdinal(col opt.ColumnID) (exec.NodeColumnOrdinal, error) {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
-		panic(errors.AssertionFailedf("column %d not in input", redact.Safe(col)))
+		return 0, errors.AssertionFailedf("column %d not in input", redact.Safe(col))
 	}
-	return exec.NodeColumnOrdinal(ord)
+	return exec.NodeColumnOrdinal(ord), nil
 }
 
-func (ep *execPlan) getNodeColumnOrdinalSet(cols opt.ColSet) exec.NodeColumnOrdinalSet {
+func (ep *execPlan) getNodeColumnOrdinalSet(cols opt.ColSet) (exec.NodeColumnOrdinalSet, error) {
 	var res exec.NodeColumnOrdinalSet
-	cols.ForEach(func(colID opt.ColumnID) {
-		res.Add(int(ep.getNodeColumnOrdinal(colID)))
-	})
-	return res
+	for colID, ok := cols.Next(0); ok; colID, ok = cols.Next(colID + 1) {
+		colOrd, err := ep.getNodeColumnOrdinal(colID)
+		if err != nil {
+			return exec.NodeColumnOrdinalSet{}, err
+		}
+		res.Add(int(colOrd))
+	}
+	return res, nil
 }
 
 // reqOrdering converts the provided ordering of a relational expression to an
 // OutputOrdering (according to the outputCols map).
-func (ep *execPlan) reqOrdering(expr memo.RelExpr) exec.OutputOrdering {
-	return exec.OutputOrdering(ep.sqlOrdering(expr.ProvidedPhysical().Ordering))
+func (ep *execPlan) reqOrdering(expr memo.RelExpr) (exec.OutputOrdering, error) {
+	ordering, err := ep.sqlOrdering(expr.ProvidedPhysical().Ordering)
+	return exec.OutputOrdering(ordering), err
 }
 
 // sqlOrdering converts an Ordering to a ColumnOrdering (according to the
 // outputCols map).
-func (ep *execPlan) sqlOrdering(ordering opt.Ordering) colinfo.ColumnOrdering {
+func (ep *execPlan) sqlOrdering(ordering opt.Ordering) (colinfo.ColumnOrdering, error) {
 	if ordering.Empty() {
-		return nil
+		return nil, nil
 	}
 	colOrder := make(colinfo.ColumnOrdering, len(ordering))
 	for i := range ordering {
-		colOrder[i].ColIdx = int(ep.getNodeColumnOrdinal(ordering[i].ID()))
+		ord, err := ep.getNodeColumnOrdinal(ordering[i].ID())
+		if err != nil {
+			return nil, err
+		}
+		colOrder[i].ColIdx = int(ord)
 		if ordering[i].Descending() {
 			colOrder[i].Direction = encoding.Descending
 		} else {
@@ -147,7 +158,7 @@ func (ep *execPlan) sqlOrdering(ordering opt.Ordering) colinfo.ColumnOrdering {
 		}
 	}
 
-	return colOrder
+	return colOrder, nil
 }
 
 func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
@@ -678,6 +689,11 @@ func (b *Builder) scanParams(
 			if !(maxResults == 1 && scan.Constraint.Spans.Count() == 1) {
 				parallelize = true
 			}
+		} else if b.evalCtx != nil {
+			// If 'unbounded_parallel_scans' is true, even though we cannot
+			// guarantee a sufficiently small upper bound on the number of rows
+			// scanned, we still will parallelize this scan.
+			parallelize = b.evalCtx.SessionData().UnboundedParallelScans
 		}
 	}
 
@@ -734,7 +750,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		return execPlan{},
 			errors.AssertionFailedf("expected inverted index scan to have an inverted constraint")
 	}
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
@@ -810,11 +826,15 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 	res := execPlan{outputCols: outputCols}
+	reqOrdering, err := res.reqOrdering(scan)
+	if err != nil {
+		return execPlan{}, err
+	}
 	root, err := b.factory.ConstructScan(
 		tab,
 		tab.Index(scan.Index),
 		params,
-		res.reqOrdering(scan),
+		reqOrdering,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -884,11 +904,15 @@ func (b *Builder) buildPlaceholderScan(scan *memo.PlaceholderScanExpr) (execPlan
 		return execPlan{}, err
 	}
 	res := execPlan{outputCols: outputCols}
+	reqOrdering, err := res.reqOrdering(scan)
+	if err != nil {
+		return execPlan{}, err
+	}
 	root, err := b.factory.ConstructScan(
 		tab,
 		tab.Index(scan.Index),
 		params,
-		res.reqOrdering(scan),
+		reqOrdering,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -909,7 +933,10 @@ func (b *Builder) buildSelect(sel *memo.SelectExpr) (execPlan, error) {
 	}
 	// A filtering node does not modify the schema.
 	res := execPlan{outputCols: input.outputCols}
-	reqOrder := res.reqOrdering(sel)
+	reqOrder, err := res.reqOrdering(sel)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructFilter(input.root, filter, reqOrder)
 	if err != nil {
 		return execPlan{}, err
@@ -924,7 +951,10 @@ func (b *Builder) buildInvertedFilter(invFilter *memo.InvertedFilterExpr) (execP
 	}
 	// A filtering node does not modify the schema.
 	res := execPlan{outputCols: input.outputCols}
-	invertedCol := input.getNodeColumnOrdinal(invFilter.InvertedColumn)
+	invertedCol, err := input.getNodeColumnOrdinal(invFilter.InvertedColumn)
+	if err != nil {
+		return execPlan{}, err
+	}
 	var typedPreFilterExpr tree.TypedExpr
 	var typ *types.T
 	if invFilter.PreFiltererState != nil && invFilter.PreFiltererState.Expr != nil {
@@ -966,13 +996,21 @@ func (b *Builder) applySimpleProject(
 	// We have only pass-through columns.
 	colList := make([]exec.NodeColumnOrdinal, 0, cols.Len())
 	var res execPlan
-	cols.ForEach(func(i opt.ColumnID) {
+	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
 		res.outputCols.Set(int(i), len(colList))
-		colList = append(colList, input.getNodeColumnOrdinal(i))
-	})
+		ord, err := input.getNodeColumnOrdinal(i)
+		if err != nil {
+			return execPlan{}, err
+		}
+		colList = append(colList, ord)
+	}
 	var err error
+	sqlOrdering, err := res.sqlOrdering(providedOrd)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructSimpleProject(
-		input.root, colList, exec.OutputOrdering(res.sqlOrdering(providedOrd)),
+		input.root, colList, exec.OutputOrdering(sqlOrdering),
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -1010,17 +1048,23 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 			Typ:  item.Typ,
 		})
 	}
-	prj.Passthrough.ForEach(func(colID opt.ColumnID) {
+	for colID, ok := prj.Passthrough.Next(0); ok; colID, ok = prj.Passthrough.Next(colID + 1) {
 		res.outputCols.Set(int(colID), len(exprs))
-		indexedVar := b.indexedVar(&ctx, md, colID)
+		indexedVar, err := b.indexedVar(&ctx, md, colID)
+		if err != nil {
+			return execPlan{}, err
+		}
 		exprs = append(exprs, indexedVar)
 		meta := md.ColumnMeta(colID)
 		cols = append(cols, colinfo.ResultColumn{
 			Name: meta.Alias,
 			Typ:  meta.Type,
 		})
-	})
-	reqOrdering := res.reqOrdering(prj)
+	}
+	reqOrdering, err := res.reqOrdering(prj)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructRender(input.root, cols, exprs, reqOrdering)
 	if err != nil {
 		return execPlan{}, err
@@ -1034,7 +1078,10 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 	default:
 		return execPlan{}, fmt.Errorf("couldn't execute correlated subquery with op %s", join.Op())
 	}
-	joinType := joinOpToJoinType(join.Op())
+	joinType, err := joinOpToJoinType(join.Op())
+	if err != nil {
+		return execPlan{}, err
+	}
 	leftExpr := join.Child(0).(memo.RelExpr)
 	leftProps := leftExpr.Relational()
 	rightExpr := join.Child(1).(memo.RelExpr)
@@ -1156,7 +1203,7 @@ func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
 				// expression.
 				fmtFlags := memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes |
 					memo.ExprFmtHideNotVisibleIndexInfo
-				explainOpt := o.FormatExpr(newRightSide, fmtFlags)
+				explainOpt := o.FormatExpr(newRightSide, fmtFlags, false /* redactableValues */)
 				err = errors.WithDetailf(err, "newRightSide:\n%s", explainOpt)
 			}
 			return nil, err
@@ -1252,7 +1299,10 @@ func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
 		)
 	}
 
-	joinType := joinOpToJoinType(join.Op())
+	joinType, err := joinOpToJoinType(join.Op())
+	if err != nil {
+		return execPlan{}, err
+	}
 	leftExpr := join.Child(0).(memo.RelExpr)
 	rightExpr := join.Child(1).(memo.RelExpr)
 	filters := join.Child(2).(*memo.FiltersExpr)
@@ -1305,8 +1355,14 @@ func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
 	leftEqOrdinals := eqColsBuf[:len(leftEq):len(leftEq)]
 	rightEqOrdinals := eqColsBuf[len(leftEq):]
 	for i := range leftEq {
-		leftEqOrdinals[i] = left.getNodeColumnOrdinal(leftEq[i])
-		rightEqOrdinals[i] = right.getNodeColumnOrdinal(rightEq[i])
+		leftEqOrdinals[i], err = left.getNodeColumnOrdinal(leftEq[i])
+		if err != nil {
+			return execPlan{}, err
+		}
+		rightEqOrdinals[i], err = right.getNodeColumnOrdinal(rightEq[i])
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	leftEqColsAreKey := leftExpr.Relational().FuncDeps.ColsAreStrictKey(leftEq.ToSet())
@@ -1337,7 +1393,10 @@ func (b *Builder) buildMergeJoin(join *memo.MergeJoinExpr) (execPlan, error) {
 		telemetry.Inc(opt.JoinTypeToUseCounter(join.JoinType))
 	}
 
-	joinType := joinOpToJoinType(join.JoinType)
+	joinType, err := joinOpToJoinType(join.JoinType)
+	if err != nil {
+		return execPlan{}, err
+	}
 	leftExpr, rightExpr := join.Left, join.Right
 	leftEq, rightEq := join.LeftEq, join.RightEq
 
@@ -1366,10 +1425,19 @@ func (b *Builder) buildMergeJoin(join *memo.MergeJoinExpr) (execPlan, error) {
 	if err != nil {
 		return execPlan{}, err
 	}
-	leftOrd := left.sqlOrdering(leftEq)
-	rightOrd := right.sqlOrdering(rightEq)
+	leftOrd, err := left.sqlOrdering(leftEq)
+	if err != nil {
+		return execPlan{}, err
+	}
+	rightOrd, err := right.sqlOrdering(rightEq)
+	if err != nil {
+		return execPlan{}, err
+	}
 	ep := execPlan{outputCols: outputCols}
-	reqOrd := ep.reqOrdering(join)
+	reqOrd, err := ep.reqOrdering(join)
+	if err != nil {
+		return execPlan{}, err
+	}
 	leftEqColsAreKey := leftExpr.Relational().FuncDeps.ColsAreStrictKey(leftEq.ColSet())
 	rightEqColsAreKey := rightExpr.Relational().FuncDeps.ColsAreStrictKey(rightEq.ColSet())
 	b.recordJoinType(joinType)
@@ -1433,28 +1501,28 @@ func joinOutputMap(left, right opt.ColMap) opt.ColMap {
 	return res
 }
 
-func joinOpToJoinType(op opt.Operator) descpb.JoinType {
+func joinOpToJoinType(op opt.Operator) (descpb.JoinType, error) {
 	switch op {
 	case opt.InnerJoinOp, opt.InnerJoinApplyOp:
-		return descpb.InnerJoin
+		return descpb.InnerJoin, nil
 
 	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
-		return descpb.LeftOuterJoin
+		return descpb.LeftOuterJoin, nil
 
 	case opt.RightJoinOp:
-		return descpb.RightOuterJoin
+		return descpb.RightOuterJoin, nil
 
 	case opt.FullJoinOp:
-		return descpb.FullOuterJoin
+		return descpb.FullOuterJoin, nil
 
 	case opt.SemiJoinOp, opt.SemiJoinApplyOp:
-		return descpb.LeftSemiJoin
+		return descpb.LeftSemiJoin, nil
 
 	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
-		return descpb.LeftAntiJoin
+		return descpb.LeftAntiJoin, nil
 
 	default:
-		panic(errors.AssertionFailedf("not a join op %s", redact.Safe(op)))
+		return 0, errors.AssertionFailedf("not a join op %s", redact.Safe(op))
 	}
 }
 
@@ -1469,7 +1537,11 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 	groupingColIdx := make([]exec.NodeColumnOrdinal, 0, groupingCols.Len())
 	for i, ok := groupingCols.Next(0); ok; i, ok = groupingCols.Next(i + 1) {
 		ep.outputCols.Set(int(i), len(groupingColIdx))
-		groupingColIdx = append(groupingColIdx, input.getNodeColumnOrdinal(i))
+		ord, err := input.getNodeColumnOrdinal(i)
+		if err != nil {
+			return execPlan{}, err
+		}
+		groupingColIdx = append(groupingColIdx, ord)
 	}
 
 	aggregations := *groupBy.Child(1).(*memo.AggregationsExpr)
@@ -1484,7 +1556,10 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 			if !ok {
 				return execPlan{}, errors.AssertionFailedf("only VariableOp args supported")
 			}
-			filterOrd = input.getNodeColumnOrdinal(filter.Col)
+			filterOrd, err = input.getNodeColumnOrdinal(filter.Col)
+			if err != nil {
+				return execPlan{}, err
+			}
 			agg = aggFilter.Input
 		}
 
@@ -1506,7 +1581,11 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 				if len(constArgs) != 0 {
 					return execPlan{}, errors.Errorf("constant args must come after variable args")
 				}
-				argCols = append(argCols, input.getNodeColumnOrdinal(variable.Col))
+				ord, err := input.getNodeColumnOrdinal(variable.Col)
+				if err != nil {
+					return execPlan{}, err
+				}
+				argCols = append(argCols, ord)
 			} else {
 				if len(argCols) == 0 {
 					return execPlan{}, errors.Errorf("a constant arg requires at least one variable arg")
@@ -1530,10 +1609,18 @@ func (b *Builder) buildGroupBy(groupBy memo.RelExpr) (execPlan, error) {
 		ep.root, err = b.factory.ConstructScalarGroupBy(input.root, aggInfos)
 	} else {
 		groupBy := groupBy.(*memo.GroupByExpr)
-		groupingColOrder := input.sqlOrdering(ordering.StreamingGroupingColOrdering(
+		var groupingColOrder colinfo.ColumnOrdering
+		groupingColOrder, err = input.sqlOrdering(ordering.StreamingGroupingColOrdering(
 			&groupBy.GroupingPrivate, &groupBy.RequiredPhysical().Ordering,
 		))
-		reqOrdering := ep.reqOrdering(groupBy)
+		if err != nil {
+			return execPlan{}, err
+		}
+		var reqOrdering exec.OutputOrdering
+		reqOrdering, err = ep.reqOrdering(groupBy)
+		if err != nil {
+			return execPlan{}, err
+		}
 		orderType := exec.GroupingOrderType(groupBy.GroupingOrderType(&groupBy.RequiredPhysical().Ordering))
 		ep.root, err = b.factory.ConstructGroupBy(
 			input.root, groupingColIdx, groupingColOrder, aggInfos, reqOrdering, orderType,
@@ -1558,17 +1645,27 @@ func (b *Builder) buildDistinct(distinct memo.RelExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 
-	distinctCols := input.getNodeColumnOrdinalSet(private.GroupingCols)
+	distinctCols, err := input.getNodeColumnOrdinalSet(private.GroupingCols)
+	if err != nil {
+		return execPlan{}, err
+	}
 	var orderedCols exec.NodeColumnOrdinalSet
 	ordering := ordering.StreamingGroupingColOrdering(
 		private, &distinct.RequiredPhysical().Ordering,
 	)
 	for i := range ordering {
-		orderedCols.Add(int(input.getNodeColumnOrdinal(ordering[i].ID())))
+		ord, err := input.getNodeColumnOrdinal(ordering[i].ID())
+		if err != nil {
+			return execPlan{}, err
+		}
+		orderedCols.Add(int(ord))
 	}
 	ep := execPlan{outputCols: input.outputCols}
 
-	reqOrdering := ep.reqOrdering(distinct)
+	reqOrdering, err := ep.reqOrdering(distinct)
+	if err != nil {
+		return execPlan{}, err
+	}
 	ep.root, err = b.factory.ConstructDistinct(
 		input.root, distinctCols, orderedCols, reqOrdering,
 		private.NullsAreDistinct, private.ErrorOnDup)
@@ -1626,14 +1723,18 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 	for colID, ok := neededCols.Next(0); ok; colID, ok = neededCols.Next(colID + 1) {
 		ordinal, ordOk := input.outputCols.Get(int(colID))
 		if !ordOk {
-			panic(errors.AssertionFailedf("needed column not produced by group-by input"))
+			return execPlan{},
+				errors.AssertionFailedf("needed column not produced by group-by input")
 		}
 		newOutputCols.Set(int(colID), len(cols))
 		cols = append(cols, exec.NodeColumnOrdinal(ordinal))
 	}
 
 	input.outputCols = newOutputCols
-	reqOrdering := input.reqOrdering(groupByInput)
+	reqOrdering, err := input.reqOrdering(groupByInput)
+	if err != nil {
+		return execPlan{}, err
+	}
 	input.root, err = b.factory.ConstructSimpleProject(input.root, cols, reqOrdering)
 	if err != nil {
 		return execPlan{}, err
@@ -1699,7 +1800,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	case opt.ExceptAllOp:
 		typ, all = tree.ExceptOp, true
 	default:
-		panic(errors.AssertionFailedf("invalid operator %s", redact.Safe(set.Op())))
+		return execPlan{}, errors.AssertionFailedf("invalid operator %s", redact.Safe(set.Op()))
 	}
 
 	switch typ {
@@ -1732,10 +1833,16 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	for i, col := range private.OutCols {
 		ep.outputCols.Set(int(col), i)
 	}
-	streamingOrdering := ep.sqlOrdering(
+	streamingOrdering, err := ep.sqlOrdering(
 		ordering.StreamingSetOpOrdering(set, &set.RequiredPhysical().Ordering),
 	)
-	reqOrdering := ep.reqOrdering(set)
+	if err != nil {
+		return execPlan{}, err
+	}
+	reqOrdering, err := ep.reqOrdering(set)
+	if err != nil {
+		return execPlan{}, err
+	}
 
 	if typ == tree.UnionOp && all {
 		ep.root, err = b.factory.ConstructUnionAll(left.root, right.root, reqOrdering, hardLimit, enforceHomeRegion)
@@ -1778,10 +1885,14 @@ func (b *Builder) buildTopK(e *memo.TopKExpr) (execPlan, error) {
 		}
 		alreadyOrderedPrefix = i + 1
 	}
+	sqlOrdering, err := input.sqlOrdering(ordering)
+	if err != nil {
+		return execPlan{}, err
+	}
 	node, err := b.factory.ConstructTopK(
 		input.root,
 		e.K,
-		exec.OutputOrdering(input.sqlOrdering(ordering)),
+		exec.OutputOrdering(sqlOrdering),
 		alreadyOrderedPrefix)
 	if err != nil {
 		return execPlan{}, err
@@ -1832,9 +1943,13 @@ func (b *Builder) buildSort(sort *memo.SortExpr) (execPlan, error) {
 		alreadyOrderedPrefix = i + 1
 	}
 
+	sqlOrdering, err := input.sqlOrdering(ordering)
+	if err != nil {
+		return execPlan{}, err
+	}
 	node, err := b.factory.ConstructSort(
 		input.root,
-		exec.OutputOrdering(input.sqlOrdering(ordering)),
+		exec.OutputOrdering(sqlOrdering),
 		alreadyOrderedPrefix,
 	)
 	if err != nil {
@@ -1855,12 +1970,14 @@ func (b *Builder) enforceScanWithHomeRegion(skipID cat.StableID) error {
 	for _, scan := range b.builtScans {
 		if scan.Distribution.Any() {
 			return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-				"Query has no home region. Try accessing only tables defined in multi-region databases.")
+				"Query has no home region. Try accessing only tables defined in multi-region databases. %s",
+				sqlerrors.EnforceHomeRegionFurtherInfo)
 		}
 		if len(scan.Distribution.Regions) > 1 {
 			if scan.Table == opt.TableID(0) {
 				return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-					"Query has no home region. Try adding a LIMIT clause.")
+					"Query has no home region. Try adding a LIMIT clause. %s",
+					sqlerrors.EnforceHomeRegionFurtherInfo)
 			}
 			moreThanOneRegionScans = append(moreThanOneRegionScans, scan)
 		} else {
@@ -1883,7 +2000,8 @@ func (b *Builder) enforceScanWithHomeRegion(skipID cat.StableID) error {
 	}
 	if len(regionSet) > 2 {
 		return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-			"Query has no home region. Try adding a LIMIT clause.")
+			"Query has no home region. Try adding a LIMIT clause. %s",
+			sqlerrors.EnforceHomeRegionFurtherInfo)
 	}
 	for i, scan := range b.builtScans {
 		inputTableMeta := scan.Memo().Metadata().TableMeta(scan.Table)
@@ -1906,15 +2024,18 @@ func (b *Builder) enforceScanWithHomeRegion(skipID cat.StableID) error {
 		if queryHasHomeRegion {
 			if homeRegion != queryHomeRegion {
 				return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-					`Query has no home region. The home region ('%s') of operation on table '%s' does not match the home region ('%s') of operation on table '%s'.`,
+					`Query has no home region. The home region ('%s') of operation on table '%s' does not match the home region ('%s') of operation on table '%s'. %s`,
 					queryHomeRegion,
 					inputTableName,
 					homeRegion,
-					firstTable)
+					firstTable,
+					sqlerrors.EnforceHomeRegionFurtherInfo)
 			} else if gatewayRegion != homeRegion {
 				return pgerror.Newf(pgcode.QueryNotRunningInHomeRegion,
-					`Query is not running in its home region. Try running the query from region '%s'.`,
+					`%s. Try running the query from region '%s'. %s`,
+					execinfra.QueryNotRunningInHomeRegionMessagePrefix,
 					homeRegion,
+					sqlerrors.EnforceHomeRegionFurtherInfo,
 				)
 			}
 		} else {
@@ -1978,8 +2099,8 @@ func (b *Builder) buildDistribute(distribute *memo.DistributeExpr) (input execPl
 		var errCode pgcode.Code
 		if ok {
 			errCode = pgcode.QueryNotRunningInHomeRegion
-			errorStringBuilder.WriteString("Query is not running in its home region.")
-			errorStringBuilder.WriteString(fmt.Sprintf(` Try running the query from region '%s'.`, homeRegion))
+			errorStringBuilder.WriteString(execinfra.QueryNotRunningInHomeRegionMessagePrefix)
+			errorStringBuilder.WriteString(fmt.Sprintf(`. Try running the query from region '%s'. %s`, homeRegion, sqlerrors.EnforceHomeRegionFurtherInfo))
 		} else if distribute.Input.Op() != opt.LookupJoinOp {
 			// More detailed error message handling for lookup join occurs in the
 			// execbuilder.
@@ -1988,7 +2109,8 @@ func (b *Builder) buildDistribute(distribute *memo.DistributeExpr) (input execPl
 			} else {
 				errCode = pgcode.QueryHasNoHomeRegion
 				errorStringBuilder.WriteString("Query has no home region.")
-				errorStringBuilder.WriteString(` Try adding a LIMIT clause.`)
+				errorStringBuilder.WriteString(` Try adding a LIMIT clause. `)
+				errorStringBuilder.WriteString(sqlerrors.EnforceHomeRegionFurtherInfo)
 			}
 		}
 		if err == nil {
@@ -2036,10 +2158,13 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 	// TODO(radu): the distsql implementation of index join assumes that the input
 	// starts with the PK columns in order (#40749).
 	pri := tab.Index(cat.PrimaryIndex)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), pri.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), pri.ID())})
 	keyCols := make([]exec.NodeColumnOrdinal, pri.KeyColumnCount())
 	for i := range keyCols {
-		keyCols[i] = input.getNodeColumnOrdinal(join.Table.ColumnID(pri.Column(i).Ordinal()))
+		keyCols[i], err = input.getNodeColumnOrdinal(join.Table.ColumnID(pri.Column(i).Ordinal()))
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	cols := join.Cols
@@ -2053,8 +2178,12 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 
 	res := execPlan{outputCols: output}
 	b.recordJoinAlgorithm(exec.IndexJoin)
+	reqOrdering, err := res.reqOrdering(join)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructIndexJoin(
-		input.root, tab, keyCols, needed, res.reqOrdering(join), locking, join.RequiredPhysical().LimitHintInt64(),
+		input.root, tab, keyCols, needed, reqOrdering, locking, join.RequiredPhysical().LimitHintInt64(),
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -2104,14 +2233,15 @@ func (b *Builder) filterSuggestionError(
 				plural = "s"
 			}
 			tableName := tableMeta.Alias.Table()
-			args := make([]interface{}, 0, 8)
+			args := make([]interface{}, 0, 9)
 			args = append(args, tableName)
 			args = append(args, crdbRegionColName)
 			args = append(args, plural)
 			args = append(args, b.indexColumnNames(tableMeta, index, 1))
-			if table2 == nil {
+			if table2 == nil || table2Meta.Alias.Table() == tableName {
+				args = append(args, sqlerrors.EnforceHomeRegionFurtherInfo)
 				err = pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-					"Query has no home region. Try adding a filter on %s.%s and/or on key column%s (%s).", args...)
+					"Query has no home region. Try adding a filter on %s.%s and/or on key column%s (%s). %s", args...)
 			} else if crdbRegionColName2, ok := table2.HomeRegionColName(); ok {
 				index = table2.Index(indexOrdinal2)
 				plural = ""
@@ -2123,8 +2253,9 @@ func (b *Builder) filterSuggestionError(
 				args = append(args, crdbRegionColName2)
 				args = append(args, plural)
 				args = append(args, b.indexColumnNames(table2Meta, index, 1))
+				args = append(args, sqlerrors.EnforceHomeRegionFurtherInfo)
 				err = pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-					"Query has no home region. Try adding a filter on %s.%s and/or on key column%s (%s). Try adding a filter on %s.%s and/or on key column%s (%s).", args...)
+					"Query has no home region. Try adding a filter on %s.%s and/or on key column%s (%s). Try adding a filter on %s.%s and/or on key column%s (%s). %s", args...)
 			}
 		}
 	}
@@ -2132,6 +2263,12 @@ func (b *Builder) filterSuggestionError(
 }
 
 func (b *Builder) handleRemoteLookupJoinError(join *memo.LookupJoinExpr) (err error) {
+	if join.ChildOfLocalityOptimizedSearch {
+		// If this join is a child of a locality-optimized search operation, it
+		// should not be statically errored out. It could dynamically error out if
+		// the query can't be answered by executing the first branch of the LOS.
+		return nil
+	}
 	lookupTableMeta := join.Memo().Metadata().TableMeta(join.Table)
 	lookupTable := lookupTableMeta.Table
 
@@ -2144,7 +2281,20 @@ func (b *Builder) handleRemoteLookupJoinError(join *memo.LookupJoinExpr) (err er
 	inputTableName := ""
 	// ScanExprs from global tables will have filled in a provided distribution
 	// of the gateway region by now.
-	queryHomeRegion, queryHasHomeRegion := input.(memo.RelExpr).ProvidedPhysical().Distribution.GetSingleRegion()
+	var queryHomeRegion string
+	var queryHasHomeRegion bool
+	if rel, ok := input.(memo.RelExpr); ok {
+		queryHomeRegion, queryHasHomeRegion = rel.ProvidedPhysical().Distribution.GetSingleRegion()
+	} else if _, ok = input.(*memo.ScalarListExpr); ok {
+		// A list of scalar constants doesn't access remote regions.
+		// If these aren't constants, such as scalar subqueries, checks for a home
+		// region are done elsewhere.
+		queryHasHomeRegion = true
+		queryHomeRegion = gatewayRegion
+	} else {
+		return errors.AssertionFailedf("unexpected expression kind while checking home region of input to lookup join: %v", input)
+	}
+
 	var inputTableMeta *opt.TableMeta
 	var inputTable cat.Table
 	var inputIndexOrdinal cat.IndexOrdinal
@@ -2199,23 +2349,27 @@ func (b *Builder) handleRemoteLookupJoinError(join *memo.LookupJoinExpr) (err er
 				if homeRegion != queryHomeRegion {
 					if inputTableName == "" {
 						return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-							`Query has no home region. The home region ('%s') of lookup table '%s' does not match the home region ('%s') of the other relation in the join.'`,
+							`Query has no home region. The home region ('%s') of lookup table '%s' does not match the home region ('%s') of the other relation in the join. %s'`,
 							homeRegion,
 							lookupTable.Name(),
 							queryHomeRegion,
+							sqlerrors.EnforceHomeRegionFurtherInfo,
 						)
 					}
 					return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-						`Query has no home region. The home region ('%s') of table '%s' does not match the home region ('%s') of lookup table '%s'.`,
+						`Query has no home region. The home region ('%s') of table '%s' does not match the home region ('%s') of lookup table '%s'. %s`,
 						queryHomeRegion,
 						inputTableName,
 						homeRegion,
 						string(lookupTable.Name()),
+						sqlerrors.EnforceHomeRegionFurtherInfo,
 					)
 				} else if gatewayRegion != homeRegion {
 					return pgerror.Newf(pgcode.QueryNotRunningInHomeRegion,
-						`Query is not running in its home region. Try running the query from region '%s'.`,
+						`%s. Try running the query from region '%s'. %s`,
+						execinfra.QueryNotRunningInHomeRegionMessagePrefix,
 						homeRegion,
+						sqlerrors.EnforceHomeRegionFurtherInfo,
 					)
 				}
 			} else {
@@ -2272,7 +2426,10 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	}
 	keyCols := make([]exec.NodeColumnOrdinal, len(join.KeyCols))
 	for i, c := range join.KeyCols {
-		keyCols[i] = input.getNodeColumnOrdinal(c)
+		keyCols[i], err = input.getNodeColumnOrdinal(c)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	inputCols := join.Input.Relational().OutputCols
@@ -2332,7 +2489,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	locking := join.Locking
 	if b.forceForUpdateLocking {
@@ -2340,9 +2497,16 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 	}
 	b.ContainsNonDefaultKeyLocking = b.ContainsNonDefaultKeyLocking || locking.IsLocking()
 
-	joinType := joinOpToJoinType(join.JoinType)
+	joinType, err := joinOpToJoinType(join.JoinType)
+	if err != nil {
+		return execPlan{}, err
+	}
 	b.recordJoinType(joinType)
 	b.recordJoinAlgorithm(exec.LookupJoin)
+	reqOrdering, err := res.reqOrdering(join)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinType,
 		input.root,
@@ -2356,7 +2520,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		onExpr,
 		join.IsFirstJoinInPairedJoiner,
 		join.IsSecondJoinInPairedJoiner,
-		res.reqOrdering(join),
+		reqOrdering,
 		locking,
 		join.RequiredPhysical().LimitHintInt64(),
 		join.RemoteOnlyLookups,
@@ -2430,23 +2594,27 @@ func (b *Builder) handleRemoteInvertedJoinError(join *memo.InvertedJoinExpr) (er
 				if homeRegion != queryHomeRegion {
 					if inputTableName == "" {
 						return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-							`Query has no home region. The home region ('%s') of lookup table '%s' does not match the home region ('%s') of the other relation in the join.'`,
+							`Query has no home region. The home region ('%s') of lookup table '%s' does not match the home region ('%s') of the other relation in the join. %s`,
 							homeRegion,
 							lookupTable.Name(),
 							queryHomeRegion,
+							sqlerrors.EnforceHomeRegionFurtherInfo,
 						)
 					}
 					return pgerror.Newf(pgcode.QueryHasNoHomeRegion,
-						`Query has no home region. The home region ('%s') of table '%s' does not match the home region ('%s') of lookup table '%s'.`,
+						`Query has no home region. The home region ('%s') of table '%s' does not match the home region ('%s') of lookup table '%s'. %s`,
 						queryHomeRegion,
 						inputTableName,
 						homeRegion,
 						string(lookupTable.Name()),
+						sqlerrors.EnforceHomeRegionFurtherInfo,
 					)
 				} else if gatewayRegion != homeRegion {
 					return pgerror.Newf(pgcode.QueryNotRunningInHomeRegion,
-						`Query is not running in its home region. Try running the query from region '%s'.`,
+						`%s. Try running the query from region '%s'. %s`,
+						execinfra.QueryNotRunningInHomeRegionMessagePrefix,
 						homeRegion,
+						sqlerrors.EnforceHomeRegionFurtherInfo,
 					)
 				}
 			} else {
@@ -2496,11 +2664,14 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 	md := b.mem.Metadata()
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	prefixEqCols := make([]exec.NodeColumnOrdinal, len(join.PrefixKeyCols))
 	for i, c := range join.PrefixKeyCols {
-		prefixEqCols[i] = input.getNodeColumnOrdinal(c)
+		prefixEqCols[i], err = input.getNodeColumnOrdinal(c)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
 	inputCols := join.Input.Relational().OutputCols
@@ -2568,9 +2739,16 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 	}
 	b.ContainsNonDefaultKeyLocking = b.ContainsNonDefaultKeyLocking || locking.IsLocking()
 
-	joinType := joinOpToJoinType(join.JoinType)
+	joinType, err := joinOpToJoinType(join.JoinType)
+	if err != nil {
+		return execPlan{}, err
+	}
 	b.recordJoinType(joinType)
 	b.recordJoinAlgorithm(exec.InvertedJoin)
+	reqOrdering, err := res.reqOrdering(join)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructInvertedJoin(
 		joinType,
 		invertedExpr,
@@ -2581,7 +2759,7 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 		lookupOrdinals,
 		onExpr,
 		join.IsFirstJoinInPairedJoiner,
-		res.reqOrdering(join),
+		reqOrdering,
 		locking,
 	)
 	if err != nil {
@@ -2599,9 +2777,9 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 	rightTable := md.Table(join.RightTable)
 	leftIndex := leftTable.Index(join.LeftIndex)
 	rightIndex := rightTable.Index(join.RightIndex)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed,
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed,
 		[]string{fmt.Sprintf("%d@%d", leftTable.ID(), leftIndex.ID())})
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed,
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed,
 		[]string{fmt.Sprintf("%d@%d", rightTable.ID(), rightIndex.ID())})
 
 	leftEqCols := make([]exec.TableColumnOrdinal, len(join.LeftEqCols))
@@ -2678,6 +2856,10 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 	}
 
 	b.recordJoinAlgorithm(exec.ZigZagJoin)
+	reqOrdering, err := res.reqOrdering(join)
+	if err != nil {
+		return execPlan{}, err
+	}
 	res.root, err = b.factory.ConstructZigzagJoin(
 		leftTable,
 		leftIndex,
@@ -2692,7 +2874,7 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 		rightEqCols,
 		rightLocking,
 		onExpr,
-		res.reqOrdering(join),
+		reqOrdering,
 	)
 	if err != nil {
 		return execPlan{}, err
@@ -2970,7 +3152,7 @@ func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowF
 	}
 	if boundExpr, ok := b.extractFromOffset(w.Function); ok {
 		if !b.isOffsetMode(w.Frame.StartBoundType) {
-			panic(errors.AssertionFailedf("expected offset to only be present in offset mode"))
+			return nil, errors.AssertionFailedf("expected offset to only be present in offset mode")
 		}
 		offset, err := b.buildScalar(&scalarCtx, boundExpr)
 		if err != nil {
@@ -2984,7 +3166,7 @@ func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowF
 
 	if boundExpr, ok := b.extractToOffset(w.Function); ok {
 		if !b.isOffsetMode(newDef.Bounds.EndBound.BoundType) {
-			panic(errors.AssertionFailedf("expected offset to only be present in offset mode"))
+			return nil, errors.AssertionFailedf("expected offset to only be present in offset mode")
 		}
 		offset, err := b.buildScalar(&scalarCtx, boundExpr)
 		if err != nil {
@@ -3032,8 +3214,12 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		if c.Descending() {
 			direction = tree.Descending
 		}
+		indexedVar, err := b.indexedVar(&ctx, b.mem.Metadata(), c.ID())
+		if err != nil {
+			return execPlan{}, err
+		}
 		orderingExprs[i] = &tree.Order{
-			Expr:      b.indexedVar(&ctx, b.mem.Metadata(), c.ID()),
+			Expr:      indexedVar,
 			Direction: direction,
 		}
 	}
@@ -3042,12 +3228,16 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 	partitionExprs := make(tree.Exprs, w.Partition.Len())
 
 	i := 0
-	w.Partition.ForEach(func(col opt.ColumnID) {
+	for col, ok := w.Partition.Next(0); ok; col, ok = w.Partition.Next(col + 1) {
 		ordinal, _ := input.outputCols.Get(int(col))
 		partitionIdxs[i] = exec.NodeColumnOrdinal(ordinal)
-		partitionExprs[i] = b.indexedVar(&ctx, b.mem.Metadata(), col)
+		indexedVar, err := b.indexedVar(&ctx, b.mem.Metadata(), col)
+		if err != nil {
+			return execPlan{}, err
+		}
+		partitionExprs[i] = indexedVar
 		i++
-	})
+	}
 
 	argIdxs := make([][]exec.NodeColumnOrdinal, len(w.Windows))
 	filterIdxs := make([]int, len(w.Windows))
@@ -3067,7 +3257,11 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		argIdxs[i] = make([]exec.NodeColumnOrdinal, fn.ChildCount())
 		for j, n := 0, fn.ChildCount(); j < n; j++ {
 			col := fn.Child(j).(*memo.VariableExpr).Col
-			args[j] = b.indexedVar(&ctx, b.mem.Metadata(), col)
+			indexedVar, err := b.indexedVar(&ctx, b.mem.Metadata(), col)
+			if err != nil {
+				return execPlan{}, err
+			}
+			args[j] = indexedVar
 			idx, _ := input.outputCols.Get(int(col))
 			argIdxs[i][j] = exec.NodeColumnOrdinal(idx)
 		}
@@ -3082,7 +3276,8 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		if ok {
 			f, ok := filter.(*memo.VariableExpr)
 			if !ok {
-				panic(errors.AssertionFailedf("expected FILTER expression to be a VariableExpr"))
+				return execPlan{},
+					errors.AssertionFailedf("expected FILTER expression to be a VariableExpr")
 			}
 			filterIdxs[i], _ = input.outputCols.Get(int(f.Col))
 
@@ -3099,8 +3294,12 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 			OrderBy:    orderingExprs,
 			Frame:      frame,
 		}
+		wrappedFn, err := b.wrapFunction(name)
+		if err != nil {
+			return execPlan{}, err
+		}
 		exprs[i] = tree.NewTypedFuncExpr(
-			b.wrapFunction(name),
+			wrappedFn,
 			0,
 			args,
 			builtFilter,
@@ -3138,6 +3337,10 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		outputIdxs[i] = windowStart + i
 	}
 
+	sqlOrdering, err := input.sqlOrdering(ord)
+	if err != nil {
+		return execPlan{}, err
+	}
 	node, err := b.factory.ConstructWindow(input.root, exec.WindowInfo{
 		Cols:       resultCols,
 		Exprs:      exprs,
@@ -3145,7 +3348,7 @@ func (b *Builder) buildWindow(w *memo.WindowExpr) (execPlan, error) {
 		ArgIdxs:    argIdxs,
 		FilterIdxs: filterIdxs,
 		Partition:  partitionIdxs,
-		Ordering:   input.sqlOrdering(ord),
+		Ordering:   sqlOrdering,
 	})
 	if err != nil {
 		return execPlan{}, err
@@ -3214,7 +3417,7 @@ func (b *Builder) buildOpaque(opaque *memo.OpaqueRelPrivate) (execPlan, error) {
 // the columns (in the same order), returns needProj=false.
 func (b *Builder) needProjection(
 	input execPlan, colList opt.ColList,
-) (_ []exec.NodeColumnOrdinal, needProj bool) {
+) (_ []exec.NodeColumnOrdinal, needProj bool, err error) {
 	if input.numOutputCols() == len(colList) {
 		identity := true
 		for i, col := range colList {
@@ -3224,16 +3427,20 @@ func (b *Builder) needProjection(
 			}
 		}
 		if identity {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	cols := make([]exec.NodeColumnOrdinal, 0, len(colList))
 	for _, col := range colList {
 		if col != 0 {
-			cols = append(cols, input.getNodeColumnOrdinal(col))
+			ord, err := input.getNodeColumnOrdinal(col)
+			if err != nil {
+				return nil, false, err
+			}
+			cols = append(cols, ord)
 		}
 	}
-	return cols, true
+	return cols, true, nil
 }
 
 // ensureColumns applies a projection as necessary to make the output match the
@@ -3241,7 +3448,10 @@ func (b *Builder) needProjection(
 func (b *Builder) ensureColumns(
 	input execPlan, inputExpr memo.RelExpr, colList opt.ColList, provided opt.Ordering,
 ) (execPlan, error) {
-	cols, needProj := b.needProjection(input, colList)
+	cols, needProj, err := b.needProjection(input, colList)
+	if err != nil {
+		return execPlan{}, err
+	}
 	if !needProj {
 		return input, nil
 	}
@@ -3253,8 +3463,11 @@ func (b *Builder) ensureColumns(
 	for i, col := range colList {
 		res.outputCols.Set(int(col), i)
 	}
-	reqOrdering := exec.OutputOrdering(res.sqlOrdering(provided))
-	var err error
+	sqlOrdering, err := res.sqlOrdering(provided)
+	if err != nil {
+		return execPlan{}, err
+	}
+	reqOrdering := exec.OutputOrdering(sqlOrdering)
 	res.root, err = b.factory.ConstructSimpleProject(input.root, cols, reqOrdering)
 	return res, err
 }
@@ -3266,7 +3479,11 @@ func (b *Builder) applyPresentation(input execPlan, pres physical.Presentation) 
 	colNames := make([]string, len(pres))
 	var res execPlan
 	for i := range pres {
-		cols[i] = input.getNodeColumnOrdinal(pres[i].ID)
+		ord, err := input.getNodeColumnOrdinal(pres[i].ID)
+		if err != nil {
+			return execPlan{}, err
+		}
+		cols[i] = ord
 		res.outputCols.Set(int(pres[i].ID), i)
 		colNames[i] = pres[i].Alias
 	}
@@ -3277,7 +3494,7 @@ func (b *Builder) applyPresentation(input execPlan, pres physical.Presentation) 
 
 // getEnvData consolidates the information that must be presented in
 // EXPLAIN (opt, env).
-func (b *Builder) getEnvData() exec.ExplainEnvData {
+func (b *Builder) getEnvData() (exec.ExplainEnvData, error) {
 	envOpts := exec.ExplainEnvData{ShowEnv: true}
 	var err error
 	envOpts.Tables, envOpts.Sequences, envOpts.Views, err = b.mem.Metadata().AllDataSourceNames(
@@ -3286,11 +3503,7 @@ func (b *Builder) getEnvData() exec.ExplainEnvData {
 			return b.catalog.FullyQualifiedName(context.TODO(), ds)
 		},
 	)
-	if err != nil {
-		panic(err)
-	}
-
-	return envOpts
+	return envOpts, err
 }
 
 // statementTag returns a string that can be used in an error message regarding

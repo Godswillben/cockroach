@@ -238,6 +238,9 @@ func supportedNatively(core *execinfrapb.ProcessorCoreUnion) error {
 		// distinguish from other unsupported cores.
 		return errLocalPlanNodeWrap
 
+	case core.Insert != nil:
+		return nil
+
 	default:
 		return errCoreUnsupportedNatively
 	}
@@ -435,6 +438,8 @@ func (r opResult) createDiskBackedSort(
 			outputUnlimitedAllocator := colmem.NewAllocator(ctx, accounts[2], factory)
 			diskAccount := args.MonitorRegistry.CreateDiskAccount(ctx, flowCtx, opName, processorID)
 			es := colexecdisk.NewExternalSorter(
+				flowCtx,
+				processorID,
 				sortUnlimitedAllocator,
 				mergeUnlimitedAllocator,
 				outputUnlimitedAllocator,
@@ -550,8 +555,7 @@ func (r opResult) createAndWrapRowSource(
 			// here because when wrapping the processor, the materializer will
 			// be its output, and it will be set up in wrapRowSources.
 			proc, err := args.ProcessorConstructor(
-				ctx, flowCtx, processorID, core, post, inputs,
-				[]execinfra.RowReceiver{nil} /* outputs */, args.LocalProcessors,
+				ctx, flowCtx, processorID, core, post, inputs, args.LocalProcessors,
 			)
 			if err != nil {
 				return nil, err
@@ -818,11 +822,20 @@ func NewColOperator(
 				return r, err
 			}
 			if core.Values.NumRows == 0 || len(core.Values.Columns) == 0 {
-				// To simplify valuesOp we handle some special cases with
-				// fixedNumTuplesNoInputOp.
-				result.Root = colexecutils.NewFixedNumTuplesNoInputOp(
-					getStreamingAllocator(ctx, args), int(core.Values.NumRows), nil, /* opToInitialize */
-				)
+				// Handle coldata.Batch vector source.
+				if b, ok := args.LocalVectorSources[args.Spec.ProcessorID]; ok {
+					batch, ok := b.(coldata.Batch)
+					if !ok {
+						colexecerror.InternalError(errors.AssertionFailedf("LocalVectorSource wasn't a coldata.Batch"))
+					}
+					result.Root = colexecutils.NewRawColDataBatchOp(batch)
+				} else {
+					// To simplify valuesOp we handle some special cases with
+					// fixedNumTuplesNoInputOp.
+					result.Root = colexecutils.NewFixedNumTuplesNoInputOp(
+						getStreamingAllocator(ctx, args), int(core.Values.NumRows), nil, /* opToInitialize */
+					)
+				}
 			} else {
 				result.Root = colexec.NewValuesOp(
 					getStreamingAllocator(ctx, args), core.Values, execinfra.GetWorkMemLimit(flowCtx),
@@ -911,7 +924,7 @@ func NewColOperator(
 				if canUseDirectScan() {
 					scanOp, resultTypes, err = colfetcher.NewColBatchDirectScan(
 						ctx, colmem.NewAllocator(ctx, accounts[0], factory), accounts[1],
-						flowCtx, core.TableReader, post, args.TypeResolver,
+						flowCtx, spec.ProcessorID, core.TableReader, post, args.TypeResolver,
 					)
 					if err != nil {
 						return r, err
@@ -921,7 +934,7 @@ func NewColOperator(
 			if scanOp == nil {
 				scanOp, resultTypes, err = colfetcher.NewColBatchScan(
 					ctx, colmem.NewAllocator(ctx, accounts[0], factory), accounts[1],
-					flowCtx, core.TableReader, post, estimatedRowCount, args.TypeResolver,
+					flowCtx, spec.ProcessorID, core.TableReader, post, estimatedRowCount, args.TypeResolver,
 				)
 				if err != nil {
 					return r, err
@@ -954,7 +967,7 @@ func NewColOperator(
 			indexJoinOp, err := colfetcher.NewColIndexJoin(
 				ctx, getStreamingAllocator(ctx, args),
 				colmem.NewAllocator(ctx, accounts[0], factory),
-				accounts[1], accounts[2], flowCtx,
+				accounts[1], accounts[2], flowCtx, spec.ProcessorID,
 				inputs[0].Root, core.JoinReader, post, inputTypes,
 				streamerDiskMonitor, args.TypeResolver,
 			)
@@ -1727,6 +1740,15 @@ func NewColOperator(
 				result.ColumnTypes = appendOneType(result.ColumnTypes, returnType)
 				input = result.Root
 			}
+
+		case core.Insert != nil:
+			if err := checkNumIn(inputs, 1); err != nil {
+				return r, err
+			}
+			outputIdx := len(spec.Input[0].ColumnTypes)
+			result.Root = colexec.NewInsertOp(ctx, flowCtx, core.Insert, inputs[0].Root, spec.ResultTypes, outputIdx,
+				getStreamingAllocator(ctx, args), args.ExprHelper.SemaCtx)
+			result.ColumnTypes = spec.ResultTypes
 
 		default:
 			return r, errors.AssertionFailedf("unsupported processor core %q", core)

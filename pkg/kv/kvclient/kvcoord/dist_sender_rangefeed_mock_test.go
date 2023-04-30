@@ -128,13 +128,15 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 					// returning a range descriptor and a client that immediately
 					// cancels the context and closes the range feed stream.
 					if spec.expectRetry {
-						rangeDB.EXPECT().FirstRange().Return(&desc, nil)
+						rangeDB.EXPECT().FirstRange().MinTimes(1).Return(&desc, nil)
 						client := kvpbmock.NewMockInternalClient(ctrl)
 
 						if useMuxRangeFeed {
 							stream := kvpbmock.NewMockInternal_MuxRangeFeedClient(ctrl)
 							stream.EXPECT().Send(gomock.Any()).Return(nil)
-							stream.EXPECT().Recv().Do(cancel).Return(nil, io.EOF)
+							stream.EXPECT().Recv().Do(func() {
+								cancel()
+							}).Return(nil, context.Canceled)
 							client.EXPECT().MuxRangeFeed(gomock.Any()).Return(stream, nil)
 						} else {
 							stream := kvpbmock.NewMockInternal_RangeFeedClient(ctrl)
@@ -145,7 +147,7 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 						transport.EXPECT().IsExhausted().Return(false)
 						transport.EXPECT().NextReplica().Return(desc.InternalReplicas[0])
 						transport.EXPECT().NextInternalClient(gomock.Any()).Return(client, nil)
-						transport.EXPECT().Release()
+						transport.EXPECT().Release().AnyTimes()
 					}
 
 					ds := NewDistSender(DistSenderConfig{
@@ -172,8 +174,7 @@ func TestDistSenderRangeFeedRetryOnTransportErrors(t *testing.T) {
 					if useMuxRangeFeed {
 						opts = append(opts, WithMuxRangeFeed())
 					}
-					err := ds.RangeFeed(ctx, []roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}}, hlc.Timestamp{},
-						false, nil, opts...)
+					err := ds.RangeFeed(ctx, []roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}}, hlc.Timestamp{}, nil, opts...)
 					require.Error(t, err)
 				})
 		}

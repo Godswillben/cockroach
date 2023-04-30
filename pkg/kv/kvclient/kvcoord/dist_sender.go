@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -165,6 +167,12 @@ This counts the number of ranges with an active rangefeed that are performing ca
 		Measurement: "Ranges",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaDistSenderRangefeedRestartRanges = metric.Metadata{
+		Name:        "distsender.rangefeed.restart_ranges",
+		Help:        `Number of ranges that were restarted due to transient errors`,
+		Measurement: "Ranges",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaDistSenderRangefeedRestartStuck = metric.Metadata{
 		Name: "distsender.rangefeed.restart_stuck",
 		Help: `Number of times a rangefeed was restarted due to not receiving ` +
@@ -204,6 +212,14 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 	"kv.range_descriptor_cache.size",
 	"maximum number of entries in the range descriptor cache",
 	1e6,
+	func(v int64) error {
+		// Set a minimum value to avoid a cache that is too small to be useful.
+		const minVal = 64
+		if v < minVal {
+			return errors.Errorf("cannot be set to a value less than %d", minVal)
+		}
+		return nil
+	},
 )
 
 // senderConcurrencyLimit controls the maximum number of asynchronous send
@@ -239,6 +255,7 @@ type DistSenderMetrics struct {
 	RangefeedRanges         *metric.Gauge
 	RangefeedCatchupRanges  *metric.Gauge
 	RangefeedErrorCatchup   *metric.Counter
+	RangefeedRestartRanges  *metric.Counter
 	RangefeedRestartStuck   *metric.Counter
 	MethodCounts            [kvpb.NumMethods]*metric.Counter
 	ErrCounts               [kvpb.NumErrors]*metric.Counter
@@ -260,6 +277,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		RangefeedRanges:         metric.NewGauge(metaDistSenderRangefeedTotalRanges),
 		RangefeedCatchupRanges:  metric.NewGauge(metaDistSenderRangefeedCatchupRanges),
 		RangefeedErrorCatchup:   metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
+		RangefeedRestartRanges:  metric.NewCounter(metaDistSenderRangefeedRestartRanges),
 		RangefeedRestartStuck:   metric.NewCounter(metaDistSenderRangefeedRestartStuck),
 	}
 	for i := range m.MethodCounts {
@@ -731,6 +749,15 @@ func (ds *DistSender) initAndVerifyBatch(ctx context.Context, ba *kvpb.BatchRequ
 		return kvpb.NewErrorf("unknown wait policy %s", ba.WaitPolicy)
 	}
 
+	//  If the context has any pprof labels, attach them to the BatchRequest.
+	//  These labels will be applied to the root context processing the request
+	//  server-side, if the node processing the request is collecting a CPU
+	//  profile with labels.
+	pprof.ForLabels(ctx, func(key, value string) bool {
+		ba.ProfileLabels = append(ba.ProfileLabels, key, value)
+		return true
+	})
+
 	return nil
 }
 
@@ -794,6 +821,8 @@ func unsetCanForwardReadTimestampFlag(ba *kvpb.BatchRequest) {
 func (ds *DistSender) Send(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
+	startup.AssertStartupRetry(ctx)
+
 	ds.incrementBatchCounters(ba)
 
 	if pErr := ds.initAndVerifyBatch(ctx, ba); pErr != nil {
@@ -1074,6 +1103,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 		qiReply.reply = qiBa.CreateReply()
 		for _, ru := range qiReply.reply.Responses {
 			ru.GetQueryIntent().FoundIntent = true
+			ru.GetQueryIntent().FoundUnpushedIntent = true
 		}
 	}
 
@@ -1082,7 +1112,7 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	copy(resps, br.Responses)
 	resps[swapIdx], resps[lastIdx] = resps[lastIdx], resps[swapIdx]
 	br.Responses = resps
-	if err := br.Combine(qiReply.reply, qiReply.positions); err != nil {
+	if err := br.Combine(ctx, qiReply.reply, qiReply.positions, ba); err != nil {
 		return nil, kvpb.NewError(err)
 	}
 	return br, nil
@@ -1340,7 +1370,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 			// Combine the new response with the existing one (including updating
 			// the headers) if we haven't yet seen an error.
 			if pErr == nil {
-				if err := br.Combine(resp.reply, resp.positions); err != nil {
+				if err := br.Combine(ctx, resp.reply, resp.positions, ba); err != nil {
 					pErr = kvpb.NewError(err)
 				}
 			} else {
@@ -1357,7 +1387,8 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 	}()
 
 	canParallelize := ba.Header.MaxSpanRequestKeys == 0 && ba.Header.TargetBytes == 0 &&
-		!ba.Header.ReturnOnRangeBoundary
+		!ba.Header.ReturnOnRangeBoundary &&
+		!ba.Header.ReturnElasticCPUResumeSpans
 	if ba.IsSingleCheckConsistencyRequest() {
 		// Don't parallelize full checksum requests as they have to touch the
 		// entirety of each replica of each range they touch.
@@ -1447,7 +1478,7 @@ func (ds *DistSender) divideAndSendBatchToRanges(
 				ba.UpdateTxn(resp.reply.Txn)
 			}
 
-			mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary
+			mightStopEarly := ba.MaxSpanRequestKeys > 0 || ba.TargetBytes > 0 || ba.ReturnOnRangeBoundary || ba.ReturnElasticCPUResumeSpans
 			// Check whether we've received enough responses to exit query loop.
 			if mightStopEarly {
 				var replyKeys int64

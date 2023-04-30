@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
@@ -104,11 +103,12 @@ func newEventConsumer(
 	}
 
 	pacerRequestUnit := changefeedbase.EventConsumerPacerRequestSize.Get(&cfg.Settings.SV)
-	enablePacer := changefeedbase.EventConsumerElasticCPUControlEnabled.Get(&cfg.Settings.SV)
+	enablePacer := changefeedbase.PerEventElasticCPUControlEnabled.Get(&cfg.Settings.SV)
 
 	makeConsumer := func(s EventSink, frontier frontier) (eventConsumer, error) {
 		var err error
-		encoder, err := getEncoder(encodingOpts, feed.Targets)
+		encoder, err := getEncoder(encodingOpts, feed.Targets, spec.Select.Expr != "",
+			makeExternalConnectionProvider(ctx, cfg.DB), sliMetrics)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +182,10 @@ func newEventConsumer(
 		workerChSize: changefeedbase.EventConsumerWorkerQueueSize.Get(&cfg.Settings.SV),
 		spanFrontier: spanFrontier,
 	}
-	ss := &safeSink{wrapped: sink, beforeFlush: c.Flush}
+	ss := sink
+	if !sinkSupportsConcurrentEmits(sink) {
+		ss = &safeSink{wrapped: sink}
+	}
 	c.makeConsumer = func() (eventConsumer, error) {
 		return makeConsumer(ss, c)
 	}
@@ -270,7 +273,7 @@ func newEvaluator(
 		return nil, err
 	}
 
-	var sd sessiondatapb.SessionData
+	sd := sql.NewInternalSessionData(ctx, cfg.Settings, "changefeed-evaluator")
 	if spec.Feed.SessionData == nil {
 		// This changefeed was created prior to
 		// clusterversion.V23_1_ChangefeedExpressionProductionReady; thus we must
@@ -290,7 +293,7 @@ func newEvaluator(
 			sc = newExpr
 		}
 	} else {
-		sd = *spec.Feed.SessionData
+		sd.SessionData = *spec.Feed.SessionData
 	}
 
 	return cdceval.NewEvaluator(sc, cfg, spec.User(), sd, spec.Feed.StatementTime, withDiff), nil
@@ -366,22 +369,18 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 	}
 
 	if c.evaluator != nil {
-		projection, err := c.evaluator.Eval(ctx, updatedRow, prevRow)
+		updatedRow, err = c.evaluator.Eval(ctx, updatedRow, prevRow)
 		if err != nil {
 			return err
 		}
 
-		if !projection.IsInitialized() {
+		if !updatedRow.IsInitialized() {
 			// Filter did not match.
 			c.metrics.FilteredMessages.Inc(1)
 			a := ev.DetachAlloc()
 			a.Release(ctx)
 			return nil
 		}
-
-		// Clear out prevRow.  Projection can already emit previous row; thus
-		// it would be superfluous to also encode prevRow.
-		updatedRow, prevRow = projection, cdcevent.Row{}
 	}
 
 	return c.encodeAndEmit(ctx, updatedRow, prevRow, schemaTimestamp, ev.DetachAlloc())

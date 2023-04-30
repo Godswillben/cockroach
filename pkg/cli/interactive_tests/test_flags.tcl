@@ -134,10 +134,33 @@ eexpect "setting --url from COCKROACH_URL"
 eexpect "invalid argument"
 eexpect "unrecognized URL scheme"
 eexpect ":/# "
+send "unset COCKROACH_URL\r"
+eexpect ":/# "
 end_test
 
+start_test "Check that common URL mistakes are detected and the user is informed"
+send "$argv sql --no-line-editor --url='postgres://invalid:0/?-cinvalid'\r"
+eexpect "warning: found raw URL parameter \"-cinvalid"
+eexpect "are you sure"
+eexpect ":/# "
+
+send "$argv sql --no-line-editor --url='postgres://invalid:0/?options=-cluster=foo'\r"
+eexpect "warning: found \"-cluster=\" in URL \"options\" field"
+eexpect "are you sure"
+eexpect ":/# "
+end_test
 
 stop_server $argv
+
+start_test "Check that set GOMEMLIMIT env var without specifying --max-go-memory works"
+send "export GOMEMLIMIT=1GiB;\r"
+eexpect ":/# "
+send "$argv start-single-node --insecure --store=path=logs/mystore\r"
+eexpect "node starting"
+interrupt
+eexpect ":/# "
+stop_server $argv
+end_test
 
 send "exit 0\r"
 eexpect eof

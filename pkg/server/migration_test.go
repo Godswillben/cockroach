@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -254,11 +255,13 @@ func TestUpgradeHappensAfterMigrations(t *testing.T) {
 		clusterversion.TestingBinaryMinSupportedVersion,
 		false, /* initializeVersion */
 	)
+	automaticUpgrade := make(chan struct{})
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Settings: st,
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
-				BinaryVersionOverride: clusterversion.TestingBinaryMinSupportedVersion,
+				DisableAutomaticVersionUpgrade: automaticUpgrade,
+				BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
 			},
 			UpgradeManager: &upgradebase.TestingKnobs{
 				AfterRunPermanentUpgrades: func() {
@@ -272,10 +275,15 @@ func TestUpgradeHappensAfterMigrations(t *testing.T) {
 			},
 		},
 	})
-	sqlutils.MakeSQLRunner(db).
-		CheckQueryResultsRetry(t, `
+	close(automaticUpgrade)
+	sr := sqlutils.MakeSQLRunner(db)
+
+	// Allow more than the default 45 seconds for the upgrades to run. Migrations
+	// can take some time, especially under stress.
+	sr.SucceedsSoonDuration = 3 * time.Minute
+	sr.CheckQueryResultsRetry(t, `
 SELECT version = crdb_internal.node_executable_version()
   FROM [SHOW CLUSTER SETTING version]`,
-			[][]string{{"true"}})
+		[][]string{{"true"}})
 	s.Stopper().Stop(context.Background())
 }

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -55,16 +56,17 @@ type TestClusterConfig struct {
 	SkipShort bool
 	// If not empty, bootstrapVersion controls what version the cluster will be
 	// bootstrapped at.
-	BootstrapVersion roachpb.Version
-	// If not empty, binaryVersion is used to set what the Server will consider
-	// to be the binary version.
-	BinaryVersion  roachpb.Version
+	BootstrapVersion clusterversion.Key
+	// DisableUpgrade prevents the cluster from automatically upgrading to the
+	// latest version.
 	DisableUpgrade bool
-	// If true, a sql tenant server will be started and pointed at a node in the
-	// cluster. Connections on behalf of the logic test will go to that tenant.
-	UseTenant bool
-	// Disable the default test tenant.
-	DisableDefaultTestTenant bool
+
+	// If a test tenant is explicitly enabled, a sql tenant server will be started
+	// and pointed at a node in the cluster. Connections on behalf of the logic
+	// test will go to that tenant. Otherwise, the default test tenant logic will
+	// be followed
+	DefaultTestTenant base.DefaultTestTenantOptions
+
 	// IsCCLConfig should be true for any config that can only be run with a CCL
 	// binary.
 	IsCCLConfig bool
@@ -86,18 +88,9 @@ type TestClusterConfig struct {
 	// UseCockroachGoTestserver determines if the logictest uses the
 	// cockroach-go/testserver package to run the logic test.
 	// This allows us to do testing on different binary versions or to
-	// restart/upgrade nodes.
+	// restart/upgrade nodes. This always bootstraps with the predecessor version
+	// of the current commit, and upgrades to the current commit.
 	UseCockroachGoTestserver bool
-
-	// CockroachGoBootstrapVersion defines the version the cockroach-go/testserver
-	// is bootstrapped on for the logictest. It is required if
-	// UseCockroachGoTestserver is true.
-	CockroachGoBootstrapVersion string
-
-	// CockroachGoUpgradeVersion defines the version that the
-	// cockroach-go/testserver is upgraded to during the logictest. If one is not
-	// specified, it uses the local cockroach binary.
-	CockroachGoUpgradeVersion string
 }
 
 const threeNodeTenantConfigName = "3node-tenant"
@@ -272,7 +265,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		OverrideDistSQLMode: "off",
 		// local is the configuration where we run all tests which have bad
 		// interactions with the default test tenant.
-		DisableDefaultTestTenant:    true,
+		DefaultTestTenant:           base.TestTenantDisabled,
 		DeclarativeCorpusCollection: true,
 	},
 	{
@@ -286,14 +279,6 @@ var LogicTestConfigs = []TestClusterConfig{
 		NumNodes:            1,
 		OverrideDistSQLMode: "off",
 		OverrideVectorize:   "off",
-	},
-	{
-		Name:                "local-v1.1-at-v1.0-noupgrade",
-		NumNodes:            1,
-		OverrideDistSQLMode: "off",
-		BootstrapVersion:    roachpb.Version{Major: 1},
-		BinaryVersion:       roachpb.Version{Major: 1, Minor: 1},
-		DisableUpgrade:      true,
 	},
 	{
 		Name:                "fakedist",
@@ -324,7 +309,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		// this mode which try to modify zone configurations and we're more
 		// restrictive in the way we allow zone configs to be modified by
 		// secondary tenants. See #75569 for more info.
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 	},
 	{
 		Name:                "5node-disk",
@@ -341,7 +326,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		// dev testlogic ccl --files 3node-tenant --subtest $SUBTEST
 		Name:                        threeNodeTenantConfigName,
 		NumNodes:                    3,
-		UseTenant:                   true,
+		DefaultTestTenant:           base.TestTenantEnabled,
 		IsCCLConfig:                 true,
 		OverrideDistSQLMode:         "on",
 		DeclarativeCorpusCollection: true,
@@ -355,7 +340,7 @@ var LogicTestConfigs = []TestClusterConfig{
 		// dev testlogic ccl --files 3node-tenant-multiregion --subtests $SUBTESTS
 		Name:                        "3node-tenant-multiregion",
 		NumNodes:                    3,
-		UseTenant:                   true,
+		DefaultTestTenant:           base.TestTenantEnabled,
 		IsCCLConfig:                 true,
 		OverrideDistSQLMode:         "on",
 		DeclarativeCorpusCollection: true,
@@ -432,14 +417,14 @@ var LogicTestConfigs = []TestClusterConfig{
 		// Need to disable the default test tenant here until we have the
 		// locality optimized search working in multi-tenant configurations.
 		// Tracked with #80678.
-		DisableDefaultTestTenant:    true,
+		DefaultTestTenant:           base.TestTenantDisabled,
 		DeclarativeCorpusCollection: true,
 	},
 	{
 		Name:                        "multiregion-9node-3region-3azs-tenant",
 		NumNodes:                    9,
 		Localities:                  multiregion9node3region3azsLocalities,
-		UseTenant:                   true,
+		DefaultTestTenant:           base.TestTenantEnabled,
 		DeclarativeCorpusCollection: true,
 	},
 	{
@@ -463,23 +448,14 @@ var LogicTestConfigs = []TestClusterConfig{
 		Name:                        "local-mixed-22.2-23.1",
 		NumNodes:                    1,
 		OverrideDistSQLMode:         "off",
-		BootstrapVersion:            clusterversion.ByKey(clusterversion.V22_2),
-		BinaryVersion:               clusterversion.ByKey(clusterversion.V23_1),
+		BootstrapVersion:            clusterversion.V22_2,
 		DisableUpgrade:              true,
 		DeclarativeCorpusCollection: true,
 	},
 	{
-		Name:                        "cockroach-go-testserver-22.2-master",
-		UseCockroachGoTestserver:    true,
-		NumNodes:                    3,
-		CockroachGoBootstrapVersion: "v22.2.1",
-	},
-	{
-		Name:                        "cockroach-go-testserver-22.1-22.2",
-		UseCockroachGoTestserver:    true,
-		NumNodes:                    3,
-		CockroachGoBootstrapVersion: "v22.1.6",
-		CockroachGoUpgradeVersion:   "v22.2.1",
+		Name:                     "cockroach-go-testserver-upgrade-to-master",
+		UseCockroachGoTestserver: true,
+		NumNodes:                 3,
 	},
 }
 
@@ -548,6 +524,7 @@ var (
 		"fakedist",
 		"fakedist-vec-off",
 		"fakedist-disk",
+		"local-mixed-22.2-23.1",
 	}
 	// FiveNodeDefaultConfigName is a special alias for all 5 node configs.
 	FiveNodeDefaultConfigName = "5node-default-configs"

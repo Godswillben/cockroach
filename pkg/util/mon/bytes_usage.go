@@ -12,7 +12,6 @@ package mon
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"math"
 	"math/bits"
@@ -246,7 +245,13 @@ type BytesMonitor struct {
 	// when an owner monitor has a larger capacity than wanted but should still
 	// keep track of allocations made through this monitor. Note that child
 	// monitors are affected by this limit.
+	//
+	// limit is computed from configLimit, the parent monitor and the
+	// reserved budget during Start().
 	limit int64
+
+	// configLimit is the limit configured when the monitor is created.
+	configLimit int64
 
 	// poolAllocationSize specifies the allocation unit for requests to the
 	// pool.
@@ -413,6 +418,7 @@ func NewMonitorWithLimit(
 	m := &BytesMonitor{
 		name:                 name,
 		resource:             res,
+		configLimit:          limit,
 		limit:                limit,
 		noteworthyUsageBytes: noteworthy,
 		poolAllocationSize:   increment,
@@ -436,8 +442,6 @@ func NewMonitorWithLimit(
 func NewMonitorInheritWithLimit(
 	name redact.RedactableString, limit int64, m *BytesMonitor,
 ) *BytesMonitor {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	return NewMonitorWithLimit(
 		name,
 		m.resource,
@@ -468,10 +472,10 @@ func (mm *BytesMonitor) StartNoReserved(ctx context.Context, pool *BytesMonitor)
 // - reserved is the pre-reserved budget (see above).
 func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved *BoundAccount) {
 	if mm.mu.curAllocated != 0 {
-		panic(fmt.Sprintf("%s: started with %d bytes left over", mm.name, mm.mu.curAllocated))
+		panic(errors.AssertionFailedf("%s: started with %d bytes left over", mm.name, mm.mu.curAllocated))
 	}
 	if mm.mu.curBudget.mon != nil {
-		panic(fmt.Sprintf("%s: already started with pool %s", mm.name, mm.mu.curBudget.mon.name))
+		panic(errors.AssertionFailedf("%s: already started with pool %s", mm.name, mm.mu.curBudget.mon.name))
 	}
 	mm.mu.curAllocated = 0
 	mm.mu.maxAllocated = 0
@@ -488,6 +492,8 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 			humanizeutil.IBytes(mm.reserved.used),
 			poolname)
 	}
+
+	var effectiveLimit int64
 	if pool != nil {
 		// If we have a "parent" monitor, then register mm as its child by
 		// making it the head of the doubly-linked list.
@@ -499,7 +505,24 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 		pool.mu.head = mm
 		pool.mu.numChildren++
 		pool.mu.Unlock()
+		effectiveLimit = pool.limit
 	}
+
+	if reserved != nil {
+		// In addition to the limit of the parent monitor, we can also
+		// allocate from our reserved budget.
+		// We do need to take care of overflows though.
+		if effectiveLimit < math.MaxInt64-reserved.used {
+			effectiveLimit += reserved.used
+		} else {
+			effectiveLimit = math.MaxInt64
+		}
+	}
+
+	if effectiveLimit > mm.configLimit {
+		effectiveLimit = mm.configLimit
+	}
+	mm.limit = effectiveLimit
 }
 
 // NewUnlimitedMonitor creates a new monitor and starts the monitor in
@@ -515,7 +538,6 @@ func NewUnlimitedMonitor(
 ) *BytesMonitor {
 	if log.V(2) {
 		log.InfofDepth(ctx, 1, "%s: starting unlimited monitor", name)
-
 	}
 	m := &BytesMonitor{
 		name:                 name,
@@ -696,7 +718,7 @@ func (b *BoundAccount) Monitor() *BytesMonitor {
 	return b.mon
 }
 
-func (b *BoundAccount) allocated() int64 {
+func (b *BoundAccount) Allocated() int64 {
 	if b == nil {
 		return 0
 	}
@@ -802,7 +824,7 @@ func (b *BoundAccount) Close(ctx context.Context) {
 		// monitor -- "bytes out of the aether". This needs not be closed.
 		return
 	}
-	if a := b.allocated(); a > 0 {
+	if a := b.Allocated(); a > 0 {
 		b.mon.releaseBytes(ctx, a)
 	}
 }
@@ -1018,7 +1040,7 @@ func (mm *BytesMonitor) roundSize(sz int64) int64 {
 func (mm *BytesMonitor) releaseBudget(ctx context.Context) {
 	// NB: mm.mu need not be locked here, as this is only called from StopMonitor().
 	if log.V(2) {
-		log.Infof(ctx, "%s: releasing %d bytes to the pool", mm.name, mm.mu.curBudget.allocated())
+		log.Infof(ctx, "%s: releasing %d bytes to the pool", mm.name, mm.mu.curBudget.Allocated())
 	}
 	mm.mu.curBudget.Clear(ctx)
 }

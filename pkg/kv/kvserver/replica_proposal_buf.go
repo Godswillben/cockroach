@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -76,7 +75,7 @@ type propBuf struct {
 
 	// assignedLAI represents the highest LAI that was assigned to a proposal.
 	// This is set at the same time as assignedClosedTimestamp.
-	assignedLAI uint64
+	assignedLAI kvpb.LeaseAppliedIndex
 	// assignedClosedTimestamp is the largest "closed timestamp" - i.e. the
 	// largest timestamp that was communicated to other replicas as closed,
 	// representing a promise that this leaseholder will not evaluate writes with
@@ -98,7 +97,7 @@ type propBuf struct {
 	testing struct {
 		// leaseIndexFilter can be used by tests to override the max lease index
 		// assigned to a proposal by returning a non-zero lease index.
-		leaseIndexFilter func(*ProposalData) (indexOverride uint64)
+		leaseIndexFilter func(*ProposalData) kvpb.LeaseAppliedIndex
 		// insertFilter allows tests to inject errors at Insert() time.
 		insertFilter func(*ProposalData) error
 		// submitProposalFilter can be used by tests to observe and optionally
@@ -140,8 +139,8 @@ type proposer interface {
 	// The following require the proposer to hold (at least) a shared lock.
 	getReplicaID() roachpb.ReplicaID
 	destroyed() destroyStatus
-	firstIndex() uint64
-	leaseAppliedIndex() uint64
+	firstIndex() kvpb.RaftIndex
+	leaseAppliedIndex() kvpb.LeaseAppliedIndex
 	enqueueUpdateCheck()
 	closedTimestampTarget() hlc.Timestamp
 	leaderStatus(ctx context.Context, raftGroup proposerRaft) rangeLeaderInfo
@@ -745,7 +744,7 @@ func (b *propBuf) leaderStatusRLocked(ctx context.Context, raftGroup proposerRaf
 // in the local replica's raft entry cache).
 func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	ctx context.Context, p *ProposalData, closedTSTarget hlc.Timestamp,
-) (uint64, hlc.Timestamp, error) {
+) (kvpb.LeaseAppliedIndex, hlc.Timestamp, error) {
 
 	// Assign a LeaseAppliedIndex (see checkForcedErr). These provide replay
 	// protection.
@@ -763,7 +762,7 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	// are only ever proposed by leaseholders, and they use the LAI to prevent
 	// replays (though they could in principle also be handled like lease
 	// requests).
-	var lai uint64
+	var lai kvpb.LeaseAppliedIndex
 	if !p.Request.IsSingleRequestLeaseRequest() {
 		b.assignedLAI++
 		lai = b.assignedLAI
@@ -861,7 +860,7 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 // marshallLAIAndClosedTimestampToProposalLocked modifies p.encodedCommand,
 // adding the LAI and closed timestamp.
 func (b *propBuf) marshallLAIAndClosedTimestampToProposalLocked(
-	ctx context.Context, p *ProposalData, lai uint64, closedTimestamp hlc.Timestamp,
+	ctx context.Context, p *ProposalData, lai kvpb.LeaseAppliedIndex, closedTimestamp hlc.Timestamp,
 ) error {
 	buf := &b.scratchFooter
 	buf.MaxLeaseIndex = lai
@@ -889,7 +888,7 @@ func (b *propBuf) marshallLAIAndClosedTimestampToProposalLocked(
 	return err
 }
 
-func (b *propBuf) forwardAssignedLAILocked(v uint64) {
+func (b *propBuf) forwardAssignedLAILocked(v kvpb.LeaseAppliedIndex) {
 	if b.assignedLAI < v {
 		b.assignedLAI = v
 	}
@@ -940,7 +939,7 @@ func (b *propBuf) FlushLockedWithoutProposing(ctx context.Context) {
 // Similarly, appliedLAI is the highest LAI of an applied command; the propBuf
 // will propose commands with higher LAIs.
 func (b *propBuf) OnLeaseChangeLocked(
-	leaseOwned bool, appliedClosedTS hlc.Timestamp, appliedLAI uint64,
+	leaseOwned bool, appliedClosedTS hlc.Timestamp, appliedLAI kvpb.LeaseAppliedIndex,
 ) {
 	if leaseOwned {
 		b.forwardClosedTimestampLocked(appliedClosedTS)
@@ -1152,11 +1151,11 @@ func (rp *replicaProposer) destroyed() destroyStatus {
 	return rp.mu.destroyStatus
 }
 
-func (rp *replicaProposer) firstIndex() uint64 {
+func (rp *replicaProposer) firstIndex() kvpb.RaftIndex {
 	return (*Replica)(rp).raftFirstIndexRLocked()
 }
 
-func (rp *replicaProposer) leaseAppliedIndex() uint64 {
+func (rp *replicaProposer) leaseAppliedIndex() kvpb.LeaseAppliedIndex {
 	return rp.mu.state.LeaseAppliedIndex
 }
 
@@ -1189,15 +1188,13 @@ func (rp *replicaProposer) registerProposalLocked(p *ProposalData) {
 	if p.createdAtTicks == 0 {
 		p.createdAtTicks = rp.mu.ticks
 	}
-	// TODO(tbg): this assertion fires. Figure out why. See:
-	// https://github.com/cockroachdb/cockroach/issues/97605
-	const enableAssertion = false
-	if enableAssertion && buildutil.CrdbTestBuild && (p.ec.repl == nil || p.ec.g == nil) {
-		log.Fatalf(rp.store.AnnotateCtx(context.Background()), "finished proposal inserted into map: %+v", p)
-	}
 	if prev := rp.mu.proposals[p.idKey]; prev != nil && prev != p {
 		log.Fatalf(rp.store.AnnotateCtx(context.Background()), "two proposals under same ID:\n%+v,\n%+v", prev, p)
 	}
+	// NB: we can see finished proposals inserted here. We don't like it but
+	// it's currently possible.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/97605
 	rp.mu.proposals[p.idKey] = p
 }
 
@@ -1255,7 +1252,7 @@ func (rp *replicaProposer) shouldCampaignOnRedirect(raftGroup proposerRaft) bool
 		raftGroup.BasicStatus(),
 		livenessMap,
 		r.descRLocked(),
-		r.requiresExpiringLeaseRLocked(),
+		r.shouldUseExpirationLeaseRLocked(),
 		r.store.Clock().Now(),
 	)
 }

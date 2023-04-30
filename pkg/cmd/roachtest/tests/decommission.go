@@ -316,7 +316,9 @@ func runDecommission(
 			run(fmt.Sprintf(`ALTER RANGE default CONFIGURE ZONE = 'constraints: {"-node%d"}'`, node))
 
 			targetNodeList := option.NodeListOption{nodeID}
-			if _, err := h.decommission(ctx, targetNodeList, pinnedNode, "--wait=all"); err != nil {
+			// TODO(sarkesian): Ensure updated span configs have been applied, so that
+			// checks can be reenabled.
+			if _, err := h.decommission(ctx, targetNodeList, pinnedNode, "--wait=all", "--checks=skip"); err != nil {
 				return err
 			}
 
@@ -405,7 +407,7 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 
 		exp := [][]string{
 			decommissionHeader,
-			{strconv.Itoa(targetNode), "true", `\d+`, "true", "decommissioning", "false"},
+			{strconv.Itoa(targetNode), "true", `\d+`, "true", "decommissioning", "false", "ready", "0"},
 		}
 		if err := cli.MatchCSV(o, exp); err != nil {
 			t.Fatal(err)
@@ -471,18 +473,34 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 	{
 		// Attempt to decommission all the nodes.
 		{
+			// Validate that the decommission pre-checks prevent this.
+			runNode := h.getRandNode()
+			t.L().Printf("checking ability to decommission all nodes from n%d\n", runNode)
+			o, _ := h.decommission(ctx, c.All(), runNode,
+				"--wait=none", "--format=csv")
+
+			exp := [][]string{decommissionHeader}
+			for i := 1; i <= c.Spec().NodeCount; i++ {
+				rowRegex := []string{strconv.Itoa(i), "true", `\d+`, "true", "decommissioning", "false", "allocation errors", `\d+`}
+				exp = append(exp, rowRegex)
+			}
+			if err := cli.MatchCSV(o, exp); err != nil {
+				t.Fatalf("decommission failed: %v", err)
+			}
+		}
+		{
 			// NB: the retry loop here is mostly silly, but since some of the fields below
 			// are async, we may for example find an 'active' node instead of 'decommissioning'.
 			if err := retry.WithMaxAttempts(ctx, retryOpts, 50, func() error {
 				runNode := h.getRandNode()
 				t.L().Printf("attempting to decommission all nodes from n%d\n", runNode)
 				o, err := h.decommission(ctx, c.All(), runNode,
-					"--wait=none", "--format=csv")
+					"--wait=none", "--checks=skip", "--format=csv")
 				if err != nil {
 					t.Fatalf("decommission failed: %v", err)
 				}
 
-				exp := [][]string{decommissionHeader}
+				exp := [][]string{decommissionHeaderWithoutChecks}
 				for i := 1; i <= c.Spec().NodeCount; i++ {
 					rowRegex := []string{strconv.Itoa(i), "true", `\d+`, "true", "decommissioning", "false"}
 					exp = append(exp, rowRegex)
@@ -605,8 +623,8 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 
 			exp := [][]string{
 				decommissionHeader,
-				{strconv.Itoa(targetNodeA), "true|false", "0", "true", "decommissioned", "false"},
-				{strconv.Itoa(targetNodeB), "true|false", "0", "true", "decommissioned", "false"},
+				{strconv.Itoa(targetNodeA), "true|false", "0", "true", "decommissioned", "false", "ready|allocation errors", `\d+`},
+				{strconv.Itoa(targetNodeB), "true|false", "0", "true", "decommissioned", "false", "ready|allocation errors", `\d+`},
 				decommissionFooter,
 			}
 			return cli.MatchCSV(cli.RemoveMatchingLines(o, warningFilter), exp)
@@ -692,8 +710,9 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 				decommissionHeader,
 				// NB: the "false" is liveness. We waited above for these nodes to
 				// vanish from `node ls`, so definitely not live at this point.
-				{strconv.Itoa(targetNodeA), "false", "0", "true", "decommissioned", "false"},
-				{strconv.Itoa(targetNodeB), "false", "0", "true", "decommissioned", "false"},
+				// TODO(sarkesian): Validate that MatchCSV is working as expected.
+				{strconv.Itoa(targetNodeA), "false", "0", "true", "decommissioned", "false", "already decommissioned", "0"},
+				{strconv.Itoa(targetNodeB), "false", "0", "true", "decommissioned", "false", "already decommissioned", "0"},
 				decommissionFooter,
 			}
 			if err := cli.MatchCSV(cli.RemoveMatchingLines(o, warningFilter), exp); err != nil {
@@ -761,7 +780,7 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 		runNode := h.getRandNode()
 		t.L().Printf("decommissioning n%d (from n%d) in absentia\n", targetNode, runNode)
 		if _, err := h.decommission(ctx, c.Node(targetNode), runNode,
-			"--wait=all", "--format=csv"); err != nil {
+			"--wait=all", "--checks=skip", "--format=csv"); err != nil {
 			t.Fatalf("decommission failed: %v", err)
 		}
 
@@ -777,14 +796,16 @@ func runDecommissionRandomized(ctx context.Context, t test.Test, c cluster.Clust
 		// all been GC'ed. Note that we specify "all" because even though
 		// the target node is now running, it may not be live by the time
 		// the command runs.
+		t.L().Printf("decommissioning n%d a second time using --wait=all\n", targetNode)
+		// TODO(sarkesian): Remove error on checking already decommissioned nodes.
 		o, err := h.decommission(ctx, c.Node(targetNode), runNode,
-			"--wait=all", "--format=csv")
+			"--wait=all", "--checks=skip", "--format=csv")
 		if err != nil {
 			t.Fatalf("decommission failed: %v", err)
 		}
 
 		exp := [][]string{
-			decommissionHeader,
+			decommissionHeaderWithoutChecks,
 			{strconv.Itoa(targetNode), "true|false", "0", "true", "decommissioned", "false"},
 			decommissionFooter,
 		}
@@ -1001,13 +1022,13 @@ func runDecommissionDrains(ctx context.Context, t test.Test, c cluster.Cluster) 
 		// The expected output of decommission while the node is about to be drained/is draining.
 		expReplicasTransferred = [][]string{
 			decommissionHeader,
-			{strconv.Itoa(decommNodeID), "true|false", "0", "true", "decommissioning", "false"},
+			{strconv.Itoa(decommNodeID), "true|false", "0", "true", "decommissioning", "false", "ready", "0"},
 			decommissionFooter,
 		}
 		// The expected output of decommission once the node is finally marked as "decommissioned."
 		expDecommissioned = [][]string{
 			decommissionHeader,
-			{strconv.Itoa(decommNodeID), "true|false", "0", "true", "decommissioned", "false"},
+			{strconv.Itoa(decommNodeID), "true|false", "0", "true", "decommissioned", "false", "ready", "0"},
 			decommissionFooter,
 		}
 	)
@@ -1094,7 +1115,7 @@ func runDecommissionSlow(ctx context.Context, t test.Test, c cluster.Cluster) {
 				t.Status(fmt.Sprintf("decommissioning node %d", id))
 				return c.RunE(ctx,
 					c.Node(id),
-					fmt.Sprintf("./cockroach node decommission %d --insecure", id),
+					fmt.Sprintf("./cockroach node decommission %d --insecure --checks=skip", id),
 				)
 			}
 			return decom(id)
@@ -1120,6 +1141,11 @@ func runDecommissionSlow(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 // Header from the output of `cockroach node decommission`.
 var decommissionHeader = []string{
+	"id", "is_live", "replicas", "is_decommissioning", "membership", "is_draining", "readiness", "blocking_ranges",
+}
+
+// Header from the output of `cockroach node decommission --checks=skip`.
+var decommissionHeaderWithoutChecks = []string{
 	"id", "is_live", "replicas", "is_decommissioning", "membership", "is_draining",
 }
 

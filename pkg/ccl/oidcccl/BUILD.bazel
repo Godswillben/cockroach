@@ -5,6 +5,7 @@ go_library(
     name = "oidcccl",
     srcs = [
         "authentication_oidc.go",
+        "claim_match.go",
         "settings.go",
         "state.go",
     ],
@@ -39,6 +40,7 @@ go_test(
     ],
     args = ["-test.timeout=55s"],
     embed = [":oidcccl"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
         "//pkg/ccl",

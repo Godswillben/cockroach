@@ -258,8 +258,10 @@ const (
 	FunctionLangUnknown FunctionLanguage = "unknown"
 	// FunctionLangSQL represents SQL language.
 	FunctionLangSQL FunctionLanguage = "SQL"
-	// FunctionLangPlPgSQL represents the PL/pgSQL procedural language.
-	FunctionLangPlPgSQL FunctionLanguage = "plpgsql"
+	// FunctionLangPLpgSQL represents the PL/pgSQL procedural language.
+	FunctionLangPLpgSQL FunctionLanguage = "plpgsql"
+	// FunctionLangC represents the C language.
+	FunctionLangC FunctionLanguage = "C"
 )
 
 // Format implements the NodeFormatter interface.
@@ -276,7 +278,9 @@ func AsFunctionLanguage(lang string) (FunctionLanguage, error) {
 	case "sql":
 		return FunctionLangSQL, nil
 	case "plpgsql":
-		return FunctionLangPlPgSQL, nil
+		return FunctionLangPLpgSQL, nil
+	case "c":
+		return FunctionLangC, nil
 	}
 	return FunctionLanguage(lang), nil
 }
@@ -287,13 +291,21 @@ type FunctionBodyStr string
 // Format implements the NodeFormatter interface.
 func (node FunctionBodyStr) Format(ctx *FmtCtx) {
 	ctx.WriteString("AS ")
-	ctx.WriteString("$$")
+	if ctx.flags.HasFlags(FmtTagDollarQuotes) {
+		ctx.WriteString("$funcbody$")
+	} else {
+		ctx.WriteString("$$")
+	}
 	if ctx.flags.HasFlags(FmtAnonymize) || ctx.flags.HasFlags(FmtHideConstants) {
 		ctx.WriteString("_")
 	} else {
 		ctx.WriteString(string(node))
 	}
-	ctx.WriteString("$$")
+	if ctx.flags.HasFlags(FmtTagDollarQuotes) {
+		ctx.WriteString("$funcbody$")
+	} else {
+		ctx.WriteString("$$")
+	}
 }
 
 // FuncParams represents a list of FuncParam.
@@ -516,7 +528,7 @@ type UDFDisallowanceVisitor struct {
 
 // VisitPre implements the Visitor interface.
 func (v *UDFDisallowanceVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
-	if funcExpr, ok := expr.(*FuncExpr); ok && funcExpr.ResolvedOverload().IsUDF {
+	if funcExpr, ok := expr.(*FuncExpr); ok && funcExpr.ResolvedOverload().HasSQLBody() {
 		v.FoundUDF = true
 		return false, expr
 	}

@@ -42,7 +42,7 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │       │   ├── • Table:{DescID: 108}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 108}
@@ -64,8 +64,20 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │       │   ├── • ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 108}
-│       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 108}
+│       │   │   │     rule: "descriptor dropped before dependent element removal"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 1}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ReferencedTypeIDs: [106 107], ColumnFamilyID: 0, ColumnID: 2}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967295}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   └── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967294}
+│       │   │         rule: "column type removed before column family"
 │       │   │
 │       │   ├── • Column:{DescID: 108, ColumnID: 1}
 │       │   │   │ PUBLIC → WRITE_ONLY
@@ -224,10 +236,6 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │           │     DescID: 108
 │           │     ElementType: scpb.TablePartitioning
 │           │
-│           ├── • NotImplementedForPublicObjects
-│           │     DescID: 108
-│           │     ElementType: scpb.ColumnFamily
-│           │
 │           ├── • MakePublicColumnWriteOnly
 │           │     ColumnID: 1
 │           │     TableID: 108
@@ -314,11 +322,14 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │           │     ColumnID: 2
 │           │     TableID: 108
 │           │
-│           └── • UpdateTableBackReferencesInTypes
-│                 BackReferencedTableID: 108
-│                 TypeIDs:
-│                 - 106
-│                 - 107
+│           ├── • UpdateTableBackReferencesInTypes
+│           │     BackReferencedTableID: 108
+│           │     TypeIDs:
+│           │     - 106
+│           │     - 107
+│           │
+│           └── • AssertColumnFamilyIsRemoved
+│                 TableID: 108
 │
 ├── • PreCommitPhase
 │   │
@@ -341,7 +352,7 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │   │   │   ├── • Table:{DescID: 108}
 │   │   │   │     DROPPED → PUBLIC
 │   │   │   │
-│   │   │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│   │   │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │   │   │   │     ABSENT → PUBLIC
 │   │   │   │
 │   │   │   ├── • TablePartitioning:{DescID: 108}
@@ -443,7 +454,7 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │       │   ├── • Table:{DescID: 108}
 │       │   │     PUBLIC → DROPPED
 │       │   │
-│       │   ├── • ObjectParent:{DescID: 108, ReferencedDescID: 105}
+│       │   ├── • SchemaChild:{DescID: 108, ReferencedDescID: 105}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
 │       │   │   └── • SameStagePrecedence dependency from DROPPED Table:{DescID: 108}
@@ -465,8 +476,20 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │       │   ├── • ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
 │       │   │   │ PUBLIC → ABSENT
 │       │   │   │
-│       │   │   └── • Precedence dependency from DROPPED Table:{DescID: 108}
-│       │   │         rule: "descriptor dropped before dependent element removal"
+│       │   │   ├── • Precedence dependency from DROPPED Table:{DescID: 108}
+│       │   │   │     rule: "descriptor dropped before dependent element removal"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 1}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ReferencedTypeIDs: [106 107], ColumnFamilyID: 0, ColumnID: 2}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   ├── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967295}
+│       │   │   │     rule: "column type removed before column family"
+│       │   │   │
+│       │   │   └── • Precedence dependency from ABSENT ColumnType:{DescID: 108, ColumnFamilyID: 0, ColumnID: 4294967294}
+│       │   │         rule: "column type removed before column family"
 │       │   │
 │       │   ├── • Column:{DescID: 108, ColumnID: 1}
 │       │   │   │ PUBLIC → ABSENT
@@ -712,10 +735,6 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │           │     DescID: 108
 │           │     ElementType: scpb.TablePartitioning
 │           │
-│           ├── • NotImplementedForPublicObjects
-│           │     DescID: 108
-│           │     ElementType: scpb.ColumnFamily
-│           │
 │           ├── • MakePublicColumnWriteOnly
 │           │     ColumnID: 1
 │           │     TableID: 108
@@ -824,6 +843,9 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
 │           │     ColumnID: 4294967294
 │           │     TableID: 108
 │           │
+│           ├── • AssertColumnFamilyIsRemoved
+│           │     TableID: 108
+│           │
 │           ├── • MakeWriteOnlyColumnDeleteOnly
 │           │     ColumnID: 1
 │           │     TableID: 108
@@ -918,7 +940,7 @@ EXPLAIN (ddl, verbose) DROP TABLE multi_region_test_db.public.table_regional_by_
         │   │   ├── • PreviousStagePrecedence dependency from DROPPED Table:{DescID: 108}
         │   │   │     rule: "descriptor dropped in transaction before removal"
         │   │   │
-        │   │   ├── • Precedence dependency from ABSENT ObjectParent:{DescID: 108, ReferencedDescID: 105}
+        │   │   ├── • Precedence dependency from ABSENT SchemaChild:{DescID: 108, ReferencedDescID: 105}
         │   │   │     rule: "non-data dependents removed before descriptor"
         │   │   │
         │   │   ├── • Precedence dependency from ABSENT TablePartitioning:{DescID: 108}

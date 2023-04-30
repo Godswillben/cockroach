@@ -159,6 +159,20 @@ percentage of physical memory (e.g. .25). If left unspecified, defaults to 25% o
 physical memory.`,
 	}
 
+	GoMemLimit = FlagInfo{
+		Name: "max-go-memory",
+		Description: `
+Soft memory limit set on the Go runtime (which is also configurable via the
+GOMEMLIMIT environment variable, but --max-go-memory has higher precedence if
+both are set). Notably, the pebble cache (as configured by --cache) is not under
+control of the Go runtime and should not be considered when determining this
+soft memory limit. Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB
+and 1GiB) or a percentage of physical memory (e.g. .25). If left unspecified,
+defaults to 2.25x of --max-sql-memory (subject to max-go-memory + 1.15x --cache
+not exceeding 90% of available RAM). Set to 0 to disable the soft memory limit
+(not recommended).`,
+	}
+
 	TSDBMem = FlagInfo{
 		Name: "max-tsdb-memory",
 		Description: `
@@ -1251,6 +1265,26 @@ in the history of the cluster.`,
 as target of the decommissioning or recommissioning command.`,
 	}
 
+	NodeDecommissionChecks = FlagInfo{
+		Name: "checks",
+		Description: `
+Specifies how to evaluate readiness checks prior to node decommission.
+Takes any of the following values:
+<PRE>
+
+  - enabled  evaluate readiness prior to starting node decommission.
+  - strict   use strict readiness evaluation mode prior to node decommission.
+  - skip     skip readiness checks and immediately request node decommission.
+             Use when rerunning node decommission.
+</PRE>`,
+	}
+
+	NodeDecommissionDryRun = FlagInfo{
+		Name: "dry-run",
+		Description: `Only evaluate decommission readiness and check decommission
+status, without actually decommissioning the node.`,
+	}
+
 	NodeDrainSelf = FlagInfo{
 		Name: "self",
 		Description: `Use the node ID of the node connected to via --host
@@ -1413,6 +1447,12 @@ If set to false, overrides the default demo behavior of enabling rangefeeds.`,
 		Description: `
 Disable the creation of a default dataset in the demo shell.
 This makes 'cockroach demo' faster to start.`,
+	}
+
+	ConfigProfile = FlagInfo{
+		Name:        "config-profile",
+		EnvVar:      "COCKROACH_CONFIG_PROFILE",
+		Description: `Select a configuration profile to apply.`,
 	}
 
 	GeoLibsDir = FlagInfo{
@@ -1876,6 +1916,16 @@ y - assume yes to all prompts
 n - assume no/abort to all prompts
 p - prompt interactively for a confirmation
 </PRE>
+`,
+	}
+
+	RecoverIgnoreInternalVersion = FlagInfo{
+		Name: "ignore-internal-version",
+		Description: `
+When set, staging and local store plan application commands will ignore internal
+cluster version. This option must only be used to bypass version check if
+cluster is stuck in the middle of upgrade and locally stored versions differ
+from node to node and previous application or staging attempt failed.
 `,
 	}
 

@@ -13,21 +13,11 @@
  */
 
 import _ from "lodash";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 import { propsToQueryString } from "src/util/query";
-
-export type DatabaseDetailsRequestMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsRequest;
-export type DatabaseDetailsResponseMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsResponse;
-
-export type TableDetailsRequestMessage =
-  protos.cockroach.server.serverpb.TableDetailsRequest;
-export type TableDetailsResponseMessage =
-  protos.cockroach.server.serverpb.TableDetailsResponse;
 
 export type LocationsRequestMessage =
   protos.cockroach.server.serverpb.LocationsRequest;
@@ -180,8 +170,6 @@ export type MetricMetadataRequestMessage =
 export type MetricMetadataResponseMessage =
   protos.cockroach.server.serverpb.MetricMetadataResponse;
 
-export type StatementsRequestMessage =
-  protos.cockroach.server.serverpb.StatementsRequest;
 export type StatementDetailsRequestMessage =
   protos.cockroach.server.serverpb.StatementDetailsRequest;
 
@@ -349,45 +337,6 @@ export type APIRequestFn<TReq, TResponse> = (
 
 const serverpb = protos.cockroach.server.serverpb;
 const tspb = protos.cockroach.ts.tspb;
-
-// getDatabaseDetails gets details for a specific database
-export function getDatabaseDetails(
-  req: DatabaseDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<DatabaseDetailsResponseMessage> {
-  const queryString = req.include_stats ? "?include_stats=true" : "";
-
-  const promiseErr = IsValidateUriName(req.database);
-  if (promiseErr) {
-    return promiseErr;
-  }
-  return timeoutFetch(
-    serverpb.DatabaseDetailsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(req.database)}${queryString}`,
-    null,
-    timeout,
-  );
-}
-
-// getTableDetails gets details for a specific table
-export function getTableDetails(
-  req: TableDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<TableDetailsResponseMessage> {
-  const promiseErr = IsValidateUriName(req.database, req.table);
-  if (promiseErr) {
-    return promiseErr;
-  }
-
-  return timeoutFetch(
-    serverpb.TableDetailsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(
-      req.database,
-    )}/tables/${EncodeUriName(req.table)}`,
-    null,
-    timeout,
-  );
-}
 
 // getUIData gets UI data
 export function getUIData(
@@ -763,24 +712,6 @@ export function getStores(
   return timeoutFetch(
     serverpb.StoresResponse,
     `${STATUS_PREFIX}/stores/${req.node_id}`,
-    null,
-    timeout,
-  );
-}
-
-// getCombinedStatements returns statements the cluster has recently executed, and some stats about them.
-export function getCombinedStatements(
-  req: StatementsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<StatementsResponseMessage> {
-  const queryStr = propsToQueryString({
-    combined: req.combined,
-    start: req.start.toInt(),
-    end: req.end.toInt(),
-  });
-  return timeoutFetch(
-    serverpb.StatementsResponse,
-    `${STATUS_PREFIX}/statements?${queryStr}`,
     null,
     timeout,
   );

@@ -888,16 +888,32 @@ available replica will error.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
-<tr><td><a name="phraseto_tsquery"></a><code>phraseto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified or default configuration. The &lt;-&gt; operator is inserted between each token in the input.</p>
+<tr><td><a name="phraseto_tsquery"></a><code>phraseto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified configuration. The &lt;-&gt; operator is inserted between each token in the input.</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="plainto_tsquery"></a><code>plainto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified or default configuration. The &amp; operator is inserted between each token in the input.</p>
+<tr><td><a name="phraseto_tsquery"></a><code>phraseto_tsquery(text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the default configuration. The &lt;-&gt; operator is inserted between each token in the input.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="plainto_tsquery"></a><code>plainto_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the specified configuration. The &amp; operator is inserted between each token in the input.</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="to_tsquery"></a><code>to_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts the input text into a tsquery by normalizing each word in the input according to the specified or default configuration. The input must already be formatted like a tsquery, in other words, subsequent tokens must be connected by a tsquery operator (&amp;, |, &lt;-&gt;, !).</p>
+<tr><td><a name="plainto_tsquery"></a><code>plainto_tsquery(text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts text to a tsquery, normalizing words according to the default configuration. The &amp; operator is inserted between each token in the input.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_tsquery"></a><code>to_tsquery(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts the input text into a tsquery by normalizing each word in the input according to the specified configuration. The input must already be formatted like a tsquery, in other words, subsequent tokens must be connected by a tsquery operator (&amp;, |, &lt;-&gt;, !).</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="to_tsvector"></a><code>to_tsvector(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsvector</code></td><td><span class="funcdesc"><p>Converts text to a tsvector, normalizing words according to the specified or default configuration. Position information is included in the result.</p>
+<tr><td><a name="to_tsquery"></a><code>to_tsquery(text: <a href="string.html">string</a>) &rarr; tsquery</code></td><td><span class="funcdesc"><p>Converts the input text into a tsquery by normalizing each word in the input according to the default configuration. The input must already be formatted like a tsquery, in other words, subsequent tokens must be connected by a tsquery operator (&amp;, |, &lt;-&gt;, !).</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_tsvector"></a><code>to_tsvector(config: <a href="string.html">string</a>, text: <a href="string.html">string</a>) &rarr; tsvector</code></td><td><span class="funcdesc"><p>Converts text to a tsvector, normalizing words according to the specified configuration. Position information is included in the result.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="to_tsvector"></a><code>to_tsvector(text: <a href="string.html">string</a>) &rarr; tsvector</code></td><td><span class="funcdesc"><p>Converts text to a tsvector, normalizing words according to the default configuration. Position information is included in the result.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="ts_parse"></a><code>ts_parse(parser_name: <a href="string.html">string</a>, document: <a href="string.html">string</a>) &rarr; tuple{int AS tokid, string AS token}</code></td><td><span class="funcdesc"><p>ts_parse parses the given document and returns a series of records, one for each token produced by parsing. Each record includes a tokid showing the assigned token type and a token which is the text of the token.</p>
-</span></td><td>Stable</td></tr></tbody>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="ts_rank"></a><code>ts_rank(vector: tsvector, query: tsquery) &rarr; float4</code></td><td><span class="funcdesc"><p>Ranks vectors based on the frequency of their matching lexemes.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="ts_rank"></a><code>ts_rank(vector: tsvector, query: tsquery, normalization: <a href="int.html">int</a>) &rarr; float4</code></td><td><span class="funcdesc"><p>Ranks vectors based on the frequency of their matching lexemes.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="ts_rank"></a><code>ts_rank(weights: <a href="float.html">float</a>[], vector: tsvector, query: tsquery) &rarr; float4</code></td><td><span class="funcdesc"><p>Ranks vectors based on the frequency of their matching lexemes.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="ts_rank"></a><code>ts_rank(weights: <a href="float.html">float</a>[], vector: tsvector, query: tsquery, normalization: <a href="int.html">int</a>) &rarr; float4</code></td><td><span class="funcdesc"><p>Ranks vectors based on the frequency of their matching lexemes.</p>
+</span></td><td>Immutable</td></tr></tbody>
 </table>
 
 ### Fuzzy String Matching functions
@@ -2660,29 +2676,6 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td><td>Immutable</td></tr></tbody>
 </table>
 
-### Stream Ingestion functions
-
-<table>
-<thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
-<tbody>
-<tr><td><a name="crdb_internal.complete_replication_stream"></a><code>crdb_internal.complete_replication_stream(stream_id: <a href="int.html">int</a>, successful_ingestion: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used on the producer side to complete and clean up a replication stream.‘successful_ingestion’ indicates whether the stream ingestion finished successfully.</p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.complete_stream_ingestion_job"></a><code>crdb_internal.complete_stream_ingestion_job(job_id: <a href="int.html">int</a>, cutover_ts: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function can be used to signal a running stream ingestion job to complete. The job will eventually stop ingesting, revert to the specified timestamp and leave the cluster in a consistent state. The specified timestamp can only be specified up to the microsecond. This function does not wait for the job to reach a terminal state, but instead returns the job id as soon as it has signaled the job to complete. This builtin can be used in conjunction with <code>SHOW JOBS WHEN COMPLETE</code> to ensure that the job has left the cluster in a consistent state.</p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.replication_stream_progress"></a><code>crdb_internal.replication_stream_progress(stream_id: <a href="int.html">int</a>, frontier_ts: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to heartbeat its replication progress to a replication stream in the source cluster. The returns a StreamReplicationStatus message that indicates stream status (<code>ACTIVE</code>, <code>PAUSED</code>, <code>INACTIVE</code>, or <code>STATUS_UNKNOWN_RETRY</code>).</p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.replication_stream_spec"></a><code>crdb_internal.replication_stream_spec(stream_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the consumer side to get a replication stream specification for the specified stream. The consumer will later call ‘stream_partition’ to a partition with the spec to start streaming.</p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.start_replication_stream"></a><code>crdb_internal.start_replication_stream(tenant_name: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>This function can be used on the producer side to start a replication stream for the specified tenant. The returned stream ID uniquely identifies created stream. The caller must periodically invoke crdb_internal.heartbeat_stream() function to notify that the replication is still ongoing.</p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.stream_ingestion_stats_json"></a><code>crdb_internal.stream_ingestion_stats_json(job_id: <a href="int.html">int</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>DEPRECATED, consider using <code>SHOW TENANT name WITH REPLICATION STATUS</code></p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.stream_ingestion_stats_pb"></a><code>crdb_internal.stream_ingestion_stats_pb(job_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>DEPRECATED, consider using <code>SHOW TENANT name WITH REPLICATION STATUS</code></p>
-</span></td><td>Volatile</td></tr>
-<tr><td><a name="crdb_internal.stream_partition"></a><code>crdb_internal.stream_partition(stream_id: <a href="int.html">int</a>, partition_spec: <a href="bytes.html">bytes</a>) &rarr; tuple{bytes AS stream_event}</code></td><td><span class="funcdesc"><p>Stream partition data</p>
-</span></td><td>Volatile</td></tr></tbody>
-</table>
-
 ### String and byte functions
 
 <table>
@@ -3111,6 +3104,8 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.fingerprint"></a><code>crdb_internal.fingerprint(span: <a href="bytes.html">bytes</a>[], start_time: <a href="timestamp.html">timestamptz</a>, all_revisions: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.fingerprint"></a><code>crdb_internal.fingerprint(span: <a href="bytes.html">bytes</a>[], stripped: <a href="bool.html">bool</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.force_assertion_error"></a><code>crdb_internal.force_assertion_error(msg: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.force_error"></a><code>crdb_internal.force_error(errorCode: <a href="string.html">string</a>, msg: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
@@ -3186,14 +3181,14 @@ Note: the name pattern must contain ASCII letters already for capital letters to
 <tr><td><a name="crdb_internal.is_constraint_active"></a><code>crdb_internal.is_constraint_active(table_name: <a href="string.html">string</a>, constraint_name: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to determine if a given constraint is currently.
 active for the current transaction.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.job_execution_details"></a><code>crdb_internal.job_execution_details(job_id: <a href="int.html">int</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Output a JSONB version of the specified job’s execution details. The execution details are collectedand persisted during the lifetime of the job and provide more observability into the job’s execution</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.lease_holder"></a><code>crdb_internal.lease_holder(key: <a href="bytes.html">bytes</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function is used to fetch the leaseholder corresponding to a request key</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.list_sql_keys_in_range"></a><code>crdb_internal.list_sql_keys_in_range(range_id: <a href="int.html">int</a>) &rarr; tuple{string AS key, string AS value, string AS ts}</code></td><td><span class="funcdesc"><p>Returns all SQL K/V pairs within the requested range.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.locality_value"></a><code>crdb_internal.locality_value(key: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the value of the specified locality key.</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="crdb_internal.no_constant_folding"></a><code>crdb_internal.no_constant_folding(input: anyelement) &rarr; anyelement</code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
-</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.node_executable_version"></a><code>crdb_internal.node_executable_version() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the version of CockroachDB this node is running.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.node_id"></a><code>crdb_internal.node_id() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the node ID.</p>

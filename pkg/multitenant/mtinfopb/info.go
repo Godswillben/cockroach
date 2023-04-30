@@ -81,7 +81,7 @@ func (s TenantDataState) String() string {
 	case DataStateReady:
 		return "ready"
 	case DataStateDrop:
-		return "drop"
+		return "dropping"
 	default:
 		return fmt.Sprintf("unimplemented-%d", int(s))
 	}
@@ -89,14 +89,14 @@ func (s TenantDataState) String() string {
 
 // TenantDataStateValues facilitates the string -> TenantDataState conversion.
 var TenantDataStateValues = map[string]TenantDataState{
-	"add":   DataStateAdd,
-	"ready": DataStateReady,
-	"drop":  DataStateDrop,
+	"add":      DataStateAdd,
+	"ready":    DataStateReady,
+	"dropping": DataStateDrop,
 }
 
 // TenantInfo captures both a ProtoInfo and the SQLInfo columns that
 // go alongside it, sufficient to represent an entire row in
-// system.tenans.
+// system.tenants.
 type TenantInfo struct {
 	ProtoInfo
 	SQLInfo

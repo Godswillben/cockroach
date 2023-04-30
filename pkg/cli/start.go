@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -537,6 +538,53 @@ func runStartInternal(
 	// Now perform additional configuration tweaks specific to the start
 	// command.
 
+	// Set the soft memory limit on the Go runtime.
+	if err = func() error {
+		if startCtx.goMemLimitValue.IsSet() {
+			if goMemLimit < 0 {
+				return errors.New("--max-go-memory must be non-negative")
+			} else if goMemLimit > 0 && goMemLimit < defaultGoMemLimitMinValue {
+				log.Ops.Shoutf(
+					ctx, severity.WARNING, "--max-go-memory (%s) is smaller "+
+						"than the recommended minimum (%s), consider increasing it",
+					humanizeutil.IBytes(goMemLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+				)
+			}
+		} else {
+			if envVarLimitString, envVarSet := envutil.ExternalEnvString("GOMEMLIMIT", 1); envVarSet {
+				// When --max-go-memory is not specified, but the env var is
+				// set, we don't change it, so we just log a warning if the
+				// value is too small.
+				envVarLimit, err := humanizeutil.ParseBytes(envVarLimitString)
+				if err != nil {
+					return errors.Wrapf(err, "couldn't parse GOMEMLIMIT value %s", envVarLimitString)
+				}
+				if envVarLimit < defaultGoMemLimitMinValue {
+					log.Ops.Shoutf(
+						ctx, severity.WARNING, "GOMEMLIMIT (%s) is smaller "+
+							"than the recommended minimum (%s), consider increasing it",
+						humanizeutil.IBytes(envVarLimit), humanizeutil.IBytes(defaultGoMemLimitMinValue),
+					)
+				}
+				return nil
+			}
+			// If --max-go-memory wasn't specified, we set it to a reasonable
+			// default value.
+			goMemLimit = getDefaultGoMemLimit(ctx)
+		}
+		if goMemLimit == 0 {
+			// Value of 0 indicates that the soft memory limit should be
+			// disabled.
+			goMemLimit = math.MaxInt64
+		} else {
+			log.Ops.Infof(ctx, "soft memory limit of Go runtime is set to %s", humanizeutil.IBytes(goMemLimit))
+		}
+		debug.SetMemoryLimit(goMemLimit)
+		return nil
+	}(); err != nil {
+		return err
+	}
+
 	// Initialize the node's configuration from startup parameters.
 	// This also reads the part of the configuration that comes from
 	// environment variables.
@@ -610,6 +658,83 @@ If problems persist, please see %s.`
 		srvStatus)
 }
 
+const (
+	// defaultGoMemLimitSQLMultiple determines the multiple of SQL memory pool
+	// size that we use in the calculation of the default value of the
+	// goMemLimit.
+	//
+	// Since not every memory allocation is registered with the memory
+	// accounting system of CRDB, we need to give it some room to prevent Go GC
+	// from being too aggressive to stay under the GOMEMLIMIT. The default
+	// multiple of 2.25x over the memory pool size should give enough room for
+	// those unaccounted for allocations.
+	defaultGoMemLimitSQLMultiple = 2.25
+
+	// Lower bound on the default value for goMemLimit. Lower bound has higher
+	// precedence that the upper bound when two bounds conflict with each other.
+
+	// defaultGoMemLimitMinValue determines the lower bound on the default value
+	// of the goMemLimit.
+	defaultGoMemLimitMinValue = 256 << 20 /* 256MiB */
+
+	// Upper bound on the default value for goMemLimit is computed as follows:
+	//
+	//   upper bound = 0.9 * SystemMemory - 1.15 * PebbleCache
+	//
+	// The rationale for this formula is as follows:
+	// - we don't want for the estimated max memory usage to exceed 90% of the
+	// available RAM to prevent the OOMs
+	// - Go runtime doesn't control the pebble cache, so we need to subtract it
+	// - anecdotally, the pebble cache can have some slop over its target size
+	// (perhaps, due to memory fragmentation), so we adjust the footprint of the
+	// cache by 15%.
+
+	// defaultGoMemLimitMaxTotalSystemMemUsage determines the maximum percentage
+	// of the system memory that goMemLimit and the pebble cache can use
+	// together.
+	defaultGoMemLimitMaxTotalSystemMemUsage = 0.9
+	// defaultGoMemLimitCacheSlopMultiple determines a "slop" multiple that we
+	// use on top of the pebble cache size when computing the upper bound.
+	defaultGoMemLimitCacheSlopMultiple = 1.15
+)
+
+// getDefaultGoMemLimit returns a reasonable default value for the soft memory
+// limit of the Go runtime based on SQL memory pool and the cache sizes (which
+// must be already set in serverCfg). It also warns the user in some cases when
+// suboptimal flags or hardware is detected.
+func getDefaultGoMemLimit(ctx context.Context) int64 {
+	sysMem, err := status.GetTotalMemory(ctx)
+	if err != nil {
+		return 0
+	}
+	maxGoMemLimit := int64(defaultGoMemLimitMaxTotalSystemMemUsage*float64(sysMem) -
+		defaultGoMemLimitCacheSlopMultiple*float64(serverCfg.CacheSize))
+	if maxGoMemLimit < defaultGoMemLimitMinValue {
+		// Most likely, --cache is set to at least 75% of available RAM which
+		// has already triggered a warning in maybeWarnMemorySizes(), so we
+		// don't shout here.
+		maxGoMemLimit = defaultGoMemLimitMinValue
+	}
+	limit := int64(defaultGoMemLimitSQLMultiple * float64(serverCfg.MemoryPoolSize))
+	if limit < defaultGoMemLimitMinValue {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "--max-sql-memory (%s) is set too low, "+
+				"consider increasing it", humanizeutil.IBytes(serverCfg.MemoryPoolSize),
+		)
+		limit = defaultGoMemLimitMinValue
+	}
+	if limit > maxGoMemLimit {
+		log.Ops.Shoutf(
+			ctx, severity.WARNING, "recommended default value of "+
+				"--max-go-memory (%s) was truncated to %s, consider reducing "+
+				"--max-sql-memory and / or --cache",
+			humanizeutil.IBytes(limit), humanizeutil.IBytes(maxGoMemLimit),
+		)
+		limit = maxGoMemLimit
+	}
+	return limit
+}
+
 // createAndStartServerAsync starts an async goroutine which instantiates
 // the server and starts it.
 // We run it in a separate goroutine because the instantiation&start
@@ -646,7 +771,7 @@ func createAndStartServerAsync(
 
 	go func() {
 		// Ensure that the log files see the startup messages immediately.
-		defer log.Flush()
+		defer log.FlushFileSinks()
 		// If anything goes dramatically wrong, use Go's panic/recover
 		// mechanism to intercept the panic and log the panic details to
 		// the error reporting server.
@@ -1001,40 +1126,13 @@ func startShutdownAsync(
 		drainCtx := logtags.AddTag(s.AnnotateCtx(context.Background()), "server drain process", nil)
 
 		if shouldDrain {
-			// Perform a graceful drain. We keep retrying forever, in
-			// case there are many range leases or some unavailability
-			// preventing progress. If the operator wants to expedite
-			// the shutdown, they will need to make it ungraceful
-			// via a 2nd signal.
-			var (
-				remaining     = uint64(math.MaxUint64)
-				prevRemaining = uint64(math.MaxUint64)
-				verbose       = false
-			)
-
-			for ; ; prevRemaining = remaining {
-				var err error
-				remaining, _, err = s.Drain(drainCtx, verbose)
-				if err != nil {
-					log.Ops.Errorf(drainCtx, "graceful drain failed: %v", err)
-					break
-				}
-				if remaining == 0 {
-					// No more work to do.
-					break
-				}
-
-				// If range lease transfer stalls or the number of
-				// remaining leases somehow increases, verbosity is set
-				// to help with troubleshooting.
-				if remaining >= prevRemaining {
-					verbose = true
-				}
-
-				// Avoid a busy wait with high CPU usage if the server replies
-				// with an incomplete drain too quickly.
-				time.Sleep(200 * time.Millisecond)
-			}
+			// Perform a graceful drain. This function keeps retrying and
+			// the call might never complete (e.g. due to some
+			// unavailability preventing progress). This is intentional. If
+			// the operator wants to expedite the shutdown, they will need
+			// to make it ungraceful by sending a second signal to the
+			// process, which will tickle the shortcut in waitForShutdown().
+			server.CallDrainServerSide(drainCtx, s.Drain)
 		}
 
 		stopper.Stop(drainCtx)
@@ -1232,6 +1330,8 @@ func maybeWarnMemorySizes(ctx context.Context) {
 	// Check that the total suggested "max" memory is well below the available memory.
 	if maxMemory, err := status.GetTotalMemory(ctx); err == nil {
 		requestedMem := serverCfg.CacheSize + serverCfg.MemoryPoolSize + serverCfg.TimeSeriesServerConfig.QueryMemoryMax
+		// TODO(yuzefovich): we might want to adjust this warning higher now
+		// that GOMEMLIMIT is used.
 		maxRecommendedMem := int64(.75 * float64(maxMemory))
 		if requestedMem > maxRecommendedMem {
 			log.Ops.Shoutf(ctx, severity.WARNING,
@@ -1424,7 +1524,7 @@ func reportReadinessExternally(ctx context.Context, cmd *cobra.Command, waitForI
 	// Ensure the configuration logging is written to disk in case a
 	// process is waiting for the sdnotify readiness to read important
 	// information from there.
-	log.Flush()
+	log.FlushFileSinks()
 
 	// Signal readiness. This unblocks the process when running with
 	// --background or under systemd.

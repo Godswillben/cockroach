@@ -6,7 +6,6 @@ skip issue-num=89861
 # is only sampled if and only if no logical plan has been sampled for the given
 # tuple in the last 5 minutes. (This is controlled via
 # sql.metrics.statement_details.plan_collection.period cluster setting).
-
 exec-sql
 SET application_name = 'app1'
 ----

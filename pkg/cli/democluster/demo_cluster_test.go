@@ -67,7 +67,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 2 << 10,
 			cacheSize:         1 << 10,
 			expected: base.TestServerArgs{
-				DisableDefaultTestTenant:  true,
+				DefaultTestTenant:         base.TestTenantDisabled,
 				PartOfCluster:             true,
 				JoinAddr:                  "127.0.0.1",
 				DisableTLSForHTTP:         true,
@@ -92,7 +92,7 @@ func TestTestServerArgsForTransientCluster(t *testing.T) {
 			sqlPoolMemorySize: 4 << 10,
 			cacheSize:         4 << 10,
 			expected: base.TestServerArgs{
-				DisableDefaultTestTenant:  true,
+				DefaultTestTenant:         base.TestTenantDisabled,
 				PartOfCluster:             true,
 				JoinAddr:                  "127.0.0.1",
 				Addr:                      "127.0.0.1:1336",
@@ -148,6 +148,8 @@ func TestTransientClusterSimulateLatencies(t *testing.T) {
 	// This is slow under race as it starts a 9-node cluster which
 	// has a very high simulated latency between each node.
 	skip.UnderRace(t)
+
+	skip.WithIssue(t, 99768, "flaky test")
 
 	demoCtx := newDemoCtx()
 	// Set up an empty 9-node cluster with simulated latencies.

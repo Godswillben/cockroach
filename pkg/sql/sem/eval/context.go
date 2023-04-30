@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirecancel"
@@ -45,6 +46,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
+
+var ErrNilTxnInClusterContext = errors.New("nil txn in cluster context")
 
 // Context defines the context in which to evaluate an expression, allowing
 // the retrieval of state such as the node ID or statement start time.
@@ -92,8 +95,13 @@ type Context struct {
 	// are no tiers, then the node's location is not known. Example:
 	//
 	//   [region=us,dc=east]
-	//
+	// The region entry in this variable is the gateway region.
 	Locality roachpb.Locality
+
+	// OriginalLocality is the initial Locality at the time the connection was
+	// established. Since Locality may be overridden in some paths, this provides
+	// a means of restoring the original Locality.
+	OriginalLocality roachpb.Locality
 
 	Tracer *tracing.Tracer
 
@@ -250,6 +258,23 @@ type Context struct {
 
 	// ParseHelper makes date parsing more efficient.
 	ParseHelper pgdate.ParseHelper
+
+	// RemoteRegions contains the slice of remote regions in a multiregion
+	// database which owns a table accessed by the current SQL request.
+	// This slice is only populated during the optbuild stage.
+	RemoteRegions catpb.RegionNames
+
+	// JobsProfiler is the interface for builtins to extract job specific
+	// execution details that may have been aggregated during a job's lifetime.
+	JobsProfiler JobsProfiler
+}
+
+// JobsProfiler is the interface used to fetch job specific execution details
+// that may have been aggregated during a job's lifetime.
+type JobsProfiler interface {
+	// GenerateExecutionDetailsJSON generates a JSON blob of the job specific
+	// execution details.
+	GenerateExecutionDetailsJSON(ctx context.Context, evalCtx *Context, jobID jobspb.JobID) ([]byte, error)
 }
 
 // DescIDGenerator generates unique descriptor IDs.
@@ -290,7 +315,7 @@ type ConsistencyCheckRunner interface {
 // crdb_internal.probe_ranges.
 type RangeProber interface {
 	RunProbe(
-		ctx context.Context, key roachpb.Key, isWrite bool,
+		ctx context.Context, desc *roachpb.RangeDescriptor, isWrite bool,
 	) error
 }
 
@@ -373,6 +398,20 @@ type fakePlannerWithMonitor struct {
 // Mon is part of the Planner interface.
 func (p *fakePlannerWithMonitor) Mon() *mon.BytesMonitor {
 	return p.monitor
+}
+
+// IsANSIDML is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) IsANSIDML() bool {
+	return false
+}
+
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) EnforceHomeRegion() bool {
+	return false
+}
+
+// MaybeReallocateAnnotations is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
 }
 
 type fakeStreamManagerFactory struct {
@@ -474,12 +513,15 @@ func (ec *Context) GetStmtTimestamp() time.Time {
 
 // GetClusterTimestamp retrieves the current cluster timestamp as per
 // the evaluation context. The timestamp is guaranteed to be nonzero.
-func (ec *Context) GetClusterTimestamp() *tree.DDecimal {
+func (ec *Context) GetClusterTimestamp() (*tree.DDecimal, error) {
+	if ec.Txn == nil {
+		return nil, ErrNilTxnInClusterContext
+	}
 	ts := ec.Txn.CommitTimestamp()
 	if ts.IsEmpty() {
-		panic(errors.AssertionFailedf("zero cluster timestamp in txn"))
+		return nil, errors.AssertionFailedf("zero cluster timestamp in txn")
 	}
-	return TimestampToDecimalDatum(ts)
+	return TimestampToDecimalDatum(ts), nil
 }
 
 // HasPlaceholders returns true if this EvalContext's placeholders have been

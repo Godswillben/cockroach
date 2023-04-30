@@ -35,10 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -61,7 +62,7 @@ const (
 	multiNode                   = 3
 	backupRestoreDefaultRanges  = 10
 	backupRestoreRowPayloadSize = 100
-	localFoo                    = "nodelocal://0/foo"
+	localFoo                    = "nodelocal://1/foo"
 )
 
 // smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
@@ -84,7 +85,7 @@ func backupRestoreTestSetupWithParams(
 	if len(params.ServerArgsPerNode) > 0 {
 		for i := range params.ServerArgsPerNode {
 			param := params.ServerArgsPerNode[i]
-			param.ExternalIODir = dir
+			param.ExternalIODir = dir + param.ExternalIODir
 			param.UseDatabase = "data"
 			params.ServerArgsPerNode[i] = param
 		}
@@ -96,14 +97,12 @@ func backupRestoreTestSetupWithParams(
 		}
 		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
 	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
 
 	params.ServerArgs.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
 		SkipJobBootstrap:        true,
+		SkipZoneConfigBootstrap: true,
+	}
+	params.ServerArgs.Knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
 		SkipZoneConfigBootstrap: true,
 	}
 	tc = testcluster.StartTestCluster(t, clusterSize, params)
@@ -149,18 +148,11 @@ func backupRestoreTestSetupWithParams(
 func backupRestoreTestSetup(
 	t testing.TB, clusterSize int, numAccounts int, init func(*testcluster.TestCluster),
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	// TODO (msbutler): DisableDefaultTestTenant should be disabled by the caller of this function
+	// TODO (msbutler): The DefaultTestTenant should be disabled by the caller of this function
 	return backupRestoreTestSetupWithParams(t, clusterSize, numAccounts, init,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DisableDefaultTestTenant: true,
-				Knobs: base.TestingKnobs{
-					TenantCapabilitiesTestingKnobs: &tenantcapabilities.TestingKnobs{
-						// TODO(arul): This can be removed once
-						// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-						AuthorizerSkipAdminSplitCapabilityChecks: true,
-					},
-				},
+				DefaultTestTenant: base.TestTenantDisabled,
 			}})
 }
 
@@ -172,12 +164,7 @@ func backupRestoreTestSetupEmpty(
 	params base.TestClusterArgs,
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, cleanup func()) {
 	// TODO (msbutler): this should be disabled by callers of this function
-	params.ServerArgs.DisableDefaultTestTenant = true
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
+	params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
 	return backupRestoreTestSetupEmptyWithParams(t, clusterSize, tempDir, init, params)
 }
 
@@ -205,11 +192,6 @@ func backupRestoreTestSetupEmptyWithParams(
 		}
 		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
 	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
-	}
 
 	tc = testcluster.StartTestCluster(t, clusterSize, params)
 	init(tc)
@@ -234,11 +216,6 @@ func createEmptyCluster(
 	params.ServerArgs.ExternalIODir = dir
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		SmallEngineBlocks: smallEngineBlocks,
-	}
-	params.ServerArgs.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{
-		// TODO(arul): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/96736  is fixed.
-		AuthorizerSkipAdminSplitCapabilityChecks: true,
 	}
 	tc := testcluster.StartTestCluster(t, clusterSize, params)
 
@@ -657,18 +634,14 @@ func upsertUntilBackpressure(
 	t *testing.T, rRand *rand.Rand, conn *gosql.DB, database, table string,
 ) {
 	t.Helper()
-	testutils.SucceedsSoon(t, func() error {
+	for i := 1; i < 50; i++ {
 		_, err := conn.Exec(fmt.Sprintf("UPSERT INTO %s.%s VALUES (1, $1)", database, table),
-			randutil.RandBytes(rRand, 1<<15))
-		if err == nil {
-			return errors.New("expected `backpressure` error")
+			randutil.RandBytes(rRand, 5<<20))
+		if testutils.IsError(err, "backpressure") {
+			return
 		}
-
-		if !testutils.IsError(err, "backpressure") {
-			return errors.NewAssertionErrorWithWrappedErrf(err, "expected `backpressure` error")
-		}
-		return nil
-	})
+	}
+	assert.Fail(t, "expected `backpressure` error")
 }
 
 // requireRecoveryEvent fetches all available log entries on disk after
@@ -683,7 +656,7 @@ func requireRecoveryEvent(
 	expected eventpb.RecoveryEvent,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		log.Flush()
+		log.FlushFileSinks()
 		entries, err := log.FetchEntriesFromFiles(
 			startTime,
 			math.MaxInt64,

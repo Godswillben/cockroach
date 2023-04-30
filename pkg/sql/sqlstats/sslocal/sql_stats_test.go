@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -46,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -1466,31 +1468,26 @@ func TestSQLStatsLatencyInfo(t *testing.T) {
 		name        string
 		statement   string
 		fingerprint string
-		latencyMax  float64
 	}{
 		{
 			name:        "select on table",
 			statement:   "SELECT * FROM t1",
 			fingerprint: "SELECT * FROM t1",
-			latencyMax:  1,
 		},
 		{
-			name:        "select sleep",
+			name:        "select sleep(0.06)",
 			statement:   "SELECT pg_sleep(0.06)",
 			fingerprint: "SELECT pg_sleep(_)",
-			latencyMax:  0.2,
 		},
 		{
-			name:        "select sleep",
+			name:        "select sleep(0.1)",
 			statement:   "SELECT pg_sleep(0.1)",
 			fingerprint: "SELECT pg_sleep(_)",
-			latencyMax:  0.2,
 		},
 		{
-			name:        "select sleep",
+			name:        "select sleep(0.07)",
 			statement:   "SELECT pg_sleep(0.07)",
 			fingerprint: "SELECT pg_sleep(_)",
-			latencyMax:  0.2,
 		},
 	}
 
@@ -1499,9 +1496,13 @@ func TestSQLStatsLatencyInfo(t *testing.T) {
 	var p50 float64
 	var p90 float64
 	var p99 float64
+	stopwatch := timeutil.NewStopWatch()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+
+			stopwatch.Start()
 			testConn.Exec(t, tc.statement)
+			stopwatch.Stop()
 
 			rows := testConn.QueryRow(t, "SELECT statistics -> 'statistics' -> 'latencyInfo' ->> 'min',"+
 				"statistics -> 'statistics' -> 'latencyInfo' ->> 'max',"+
@@ -1512,13 +1513,55 @@ func TestSQLStatsLatencyInfo(t *testing.T) {
 				"AND metadata ->> 'query'=$2", appName, "SELECT * FROM t1")
 			rows.Scan(&min, &max, &p50, &p90, &p99)
 
-			require.Positive(t, min)
-			require.Positive(t, max)
-			require.GreaterOrEqual(t, max, min)
-			require.LessOrEqual(t, max, tc.latencyMax)
-			require.GreaterOrEqual(t, p99, p90)
-			require.GreaterOrEqual(t, p90, p50)
-			require.LessOrEqual(t, p99, max)
+			require.Positivef(t, min, "expected min latency %f greater than 0", min)
+			require.Positivef(t, max, "expected max latency %f greater than 0", max)
+			require.GreaterOrEqualf(t, max, min, "expected max latency %f greater than min latency %f", max, min)
+			require.LessOrEqualf(t, max, stopwatch.Elapsed().Seconds(), "expected max latency %f less or equal %f",
+				max, stopwatch.Elapsed().Seconds())
+			require.GreaterOrEqualf(t, p99, p90, "expected p99 latency %f greater or equal p90 latency %f", p99, p90)
+			require.GreaterOrEqualf(t, p90, p50, "expected p90 latency %f greater or equal p50 latency %f", p90, p50)
+			require.LessOrEqualf(t, p99, max, "expected p99 latency %f less or equal max latency %f", p99, max)
+		})
+	}
+}
+
+func TestSQLStatsRegions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name     string
+		locality roachpb.Locality
+		expected string
+	}{{
+		name:     "locality not set",
+		locality: roachpb.Locality{},
+		expected: `[]`,
+	}, {
+		name:     "locality set",
+		locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "us-east1"}}},
+		expected: `["us-east1"]`,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			params, _ := tests.CreateTestServerParams()
+			params.Locality = tc.locality
+			s, conn, _ := serverutils.StartServer(t, params)
+			defer s.Stopper().Stop(ctx)
+
+			db := sqlutils.MakeSQLRunner(conn)
+			db.Exec(t, "SET application_name = $1", t.Name())
+			db.Exec(t, "SELECT 1")
+
+			row := db.QueryRow(t, `
+				SELECT statistics->'statistics'->>'regions'
+				  FROM crdb_internal.statement_statistics
+				 WHERE app_name = $1`, t.Name())
+			var actual string
+			row.Scan(&actual)
+			require.Equal(t, tc.expected, actual)
 		})
 	}
 }

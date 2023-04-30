@@ -12,7 +12,7 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { JobsPageProps } from "./jobsPage";
-import moment from "moment";
+import moment from "moment-timezone";
 
 import JobsResponse = cockroach.server.serverpb.JobsResponse;
 import Job = cockroach.server.serverpb.IJobResponse;
@@ -328,16 +328,18 @@ const getJobsPageProps = (
   isLoading = false,
 ): JobsPageProps => ({
   ...staticJobProps,
-  jobs: JobsResponse.create({
-    jobs: jobs,
-    earliest_retained_time: earliestRetainedTime,
-  }),
-  jobsError: error,
-  reqInFlight: isLoading,
-  isDataValid: !isLoading,
+  jobsResponse: {
+    data: new JobsResponse({
+      jobs: jobs,
+      earliest_retained_time: earliestRetainedTime,
+    }),
+    error,
+    inFlight: isLoading,
+    valid: !isLoading,
+    lastUpdated: moment.utc(),
+  },
   columns: null,
   onColumnsChange: () => {},
-  lastUpdated: moment(),
 });
 
 export const withData: JobsPageProps = getJobsPageProps(allJobsFixture);

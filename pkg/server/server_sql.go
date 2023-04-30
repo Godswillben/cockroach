@@ -21,8 +21,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -44,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -51,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -91,6 +91,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
@@ -119,6 +120,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -150,7 +153,6 @@ type SQLServer struct {
 	internalExecutor *sql.InternalExecutor
 	internalDB       descs.DB
 	leaseMgr         *lease.Manager
-	blobService      *blobs.Service
 	tracingService   *service.Service
 	tenantConnect    kvtenant.Connector
 	// sessionRegistry can be queried for info on running SQL sessions. It is
@@ -186,6 +188,11 @@ type SQLServer struct {
 	// This is set to true when the server has started accepting client conns.
 	isReady syncutil.AtomicBool
 
+	// gracefulDrainComplete indicates when a graceful drain has
+	// completed successfully. We use this to document cases where a
+	// graceful drain did _not_ occur.
+	gracefulDrainComplete syncutil.AtomicBool
+
 	// internalDBMemMonitor is the memory monitor corresponding to the
 	// InternalDB singleton. It only gets closed when
 	// Server is closed. Every Executor created via the factory
@@ -195,6 +202,9 @@ type SQLServer struct {
 	// upgradeManager deals with cluster version upgrades on bootstrap and on
 	// `set cluster setting version = <v>`.
 	upgradeManager *upgrademanager.Manager
+
+	// Tenant migration server for use in tenant tests.
+	migrationServer *TenantMigrationServer
 }
 
 // sqlServerOptionalKVArgs are the arguments supplied to newSQLServer which are
@@ -237,7 +247,9 @@ type sqlServerOptionalKVArgs struct {
 // sqlServerOptionalTenantArgs are the arguments supplied to newSQLServer which
 // are only available if the SQL server runs as part of a standalone SQL node.
 type sqlServerOptionalTenantArgs struct {
-	tenantConnect    kvtenant.Connector
+	tenantConnect      kvtenant.Connector
+	spanLimiterFactory spanLimiterFactory
+
 	promRuleExporter *metric.PrometheusRuleExporter
 }
 
@@ -381,6 +393,8 @@ type sqlServerArgs struct {
 
 	// tenantTimeSeriesServer is used to make TSDB queries by the DB Console.
 	tenantTimeSeriesServer *ts.TenantServer
+
+	tenantCapabilitiesReader sql.SystemTenantOnly[tenantcapabilities.Reader]
 }
 
 type monitorAndMetrics struct {
@@ -459,16 +473,35 @@ var _ slinstance.SessionEventListener = &stopperSessionEventListener{}
 func (r *refreshInstanceSessionListener) OnSessionDeleted(
 	ctx context.Context,
 ) (createAnotherSession bool) {
-	if err := r.cfg.stopper.RunAsyncTask(ctx, "refresh-instance-session", func(context.Context) {
-		nodeID, _ := r.cfg.nodeIDContainer.OptionalNodeID()
-		s, err := r.cfg.sqlLivenessProvider.Session(ctx)
-		if err != nil {
-			log.Errorf(ctx, "faild to get new liveness session ID: %v", err)
-		}
-		if _, err := r.cfg.sqlInstanceStorage.CreateNodeInstance(
-			ctx, s.ID(), s.Expiration(), r.cfg.AdvertiseAddr, r.cfg.SQLAdvertiseAddr, r.cfg.Locality, nodeID,
-		); err != nil {
-			log.Errorf(ctx, "failed to update instance with new session ID: %v", err)
+	if err := r.cfg.stopper.RunAsyncTask(ctx, "refresh-instance-session", func(ctx context.Context) {
+		for i := retry.StartWithCtx(ctx, retry.Options{MaxBackoff: time.Second * 5}); i.Next(); {
+			select {
+			case <-r.cfg.stopper.ShouldQuiesce():
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			nodeID, _ := r.cfg.nodeIDContainer.OptionalNodeID()
+			s, err := r.cfg.sqlLivenessProvider.Session(ctx)
+			if err != nil {
+				log.Warningf(ctx, "failed to get new liveness session ID: %v", err)
+				continue
+			}
+			if _, err := r.cfg.sqlInstanceStorage.CreateNodeInstance(
+				ctx,
+				s.ID(),
+				s.Expiration(),
+				r.cfg.AdvertiseAddr,
+				r.cfg.SQLAdvertiseAddr,
+				r.cfg.Locality,
+				r.cfg.Settings.Version.BinaryVersion(),
+				nodeID,
+			); err != nil {
+				log.Warningf(ctx, "failed to update instance with new session ID: %v", err)
+				continue
+			}
+			return
 		}
 	}); err != nil {
 		log.Errorf(ctx, "failed to run update of instance with new session ID: %v", err)
@@ -501,12 +534,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		}
 	}
 
-	// Create blob service for inter-node file sharing.
-	blobService, err := blobs.NewBlobService(cfg.Settings.ExternalIODir)
-	if err != nil {
-		return nil, errors.Wrap(err, "creating blob service")
+	if err := cfg.stopper.RunAsyncTask(ctx, "tracer-snapshots", func(context.Context) {
+		cfg.Tracer.PeriodicSnapshotsLoop(&cfg.Settings.SV, cfg.stopper.ShouldQuiesce())
+	}); err != nil {
+		return nil, err
 	}
-	blobspb.RegisterBlobServer(cfg.grpcServer, blobService)
 
 	// Create trace service for inter-node sharing of inflight trace spans.
 	tracingService := service.New(cfg.Tracer)
@@ -516,6 +548,19 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	// instance provider without initializing the instance, since this is not a
 	// SQL pod server.
 	_, isMixedSQLAndKVNode := cfg.nodeIDContainer.OptionalNodeID()
+
+	var settingsWatcher *settingswatcher.SettingsWatcher
+	if codec.ForSystemTenant() {
+		settingsWatcher = settingswatcher.New(
+			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.settingsStorage,
+		)
+	} else {
+		// Create the tenant settings watcher, using the tenant connector as the
+		// overrides monitor.
+		settingsWatcher = settingswatcher.NewWithOverrides(
+			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.tenantConnect, cfg.settingsStorage,
+		)
+	}
 
 	sqllivenessKnobs, _ := cfg.TestingKnobs.SQLLivenessKnobs.(*sqlliveness.TestingKnobs)
 	var sessionEventsConsumer slinstance.SessionEventListener
@@ -532,18 +577,20 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	cfg.sqlLivenessProvider = slprovider.New(
 		cfg.AmbientCtx,
-		cfg.stopper, cfg.clock, cfg.db, codec, cfg.Settings, sqllivenessKnobs, sessionEventsConsumer,
+		cfg.stopper, cfg.clock, cfg.db, codec, cfg.Settings, settingsWatcher, sqllivenessKnobs, sessionEventsConsumer,
 	)
 
 	cfg.sqlInstanceStorage = instancestorage.NewStorage(
-		cfg.db, codec, cfg.sqlLivenessProvider.CachedReader(), cfg.Settings)
-	cfg.sqlInstanceReader = instancestorage.NewReader(
-		cfg.sqlInstanceStorage,
-		cfg.sqlLivenessProvider,
-		cfg.rangeFeedFactory,
-		codec, cfg.clock, cfg.stopper)
+		cfg.db, codec, cfg.sqlLivenessProvider.CachedReader(), cfg.Settings,
+		cfg.clock, cfg.rangeFeedFactory, settingsWatcher)
 
-	// We can't use the nodeDailer as the podNodeDailer unless we
+	cfg.sqlInstanceReader = instancestorage.NewReader(
+		cfg.sqlInstanceStorage, cfg.sqlLivenessProvider.CachedReader(),
+		cfg.stopper,
+		cfg.db,
+	)
+
+	// We can't use the nodeDialer as the podNodeDialer unless we
 	// are serving the system tenant despite the fact that we've
 	// arranged for pod IDs and instance IDs to match since the
 	// secondary tenant gRPC servers currently live on a different
@@ -579,16 +626,15 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 			cfg.AmbientCtx,
 			cfg.stopper,
 			cfg.clock,
-			cfg.internalDB,
 			cfg.rpcContext.LogicalClusterID,
 			cfg.nodeIDContainer,
 			cfg.sqlLivenessProvider,
 			cfg.Settings,
 			cfg.HistogramWindowInterval(),
-			func(opName string, user username.SQLUsername) (interface{}, func()) {
+			func(ctx context.Context, opName string, user username.SQLUsername) (interface{}, func()) {
 				// This is a hack to get around a Go package dependency cycle. See comment
 				// in sql/jobs/registry.go on planHookMaker.
-				return sql.MakeJobExecContext(opName, user, &sql.MemoryMetrics{}, execCfg)
+				return sql.MakeJobExecContext(ctx, opName, user, &sql.MemoryMetrics{}, execCfg)
 			},
 			jobAdoptionStopFile,
 			td,
@@ -609,6 +655,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.internalDB,
 		cfg.clock,
 		cfg.Settings,
+		settingsWatcher,
 		codec,
 		lmKnobs,
 		cfg.stopper,
@@ -695,13 +742,18 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		splitter             spanconfig.Splitter
 		limiter              spanconfig.Limiter
 	}{}
+
+	spanConfigKnobs, _ := cfg.TestingKnobs.SpanConfig.(*spanconfig.TestingKnobs)
 	if codec.ForSystemTenant() {
-		spanConfig.limiter = spanconfiglimiter.NoopLimiter{}
 		spanConfig.splitter = spanconfigsplitter.NoopSplitter{}
 	} else {
-		spanConfigKnobs, _ := cfg.TestingKnobs.SpanConfig.(*spanconfig.TestingKnobs)
 		spanConfig.splitter = spanconfigsplitter.New(codec, spanConfigKnobs)
-		spanConfig.limiter = spanconfiglimiter.New(
+	}
+
+	if cfg.spanLimiterFactory == nil {
+		spanConfig.limiter = spanconfiglimiter.NoopLimiter{}
+	} else {
+		spanConfig.limiter = cfg.spanLimiterFactory(
 			cfg.circularInternalExecutor,
 			cfg.Settings,
 			spanConfigKnobs,
@@ -766,7 +818,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		RowMetrics:         &rowMetrics,
 		InternalRowMetrics: &internalRowMetrics,
 
-		SQLLivenessReader: cfg.sqlLivenessProvider,
+		SQLLivenessReader: cfg.sqlLivenessProvider.CachedReader(),
 		JobRegistry:       jobRegistry,
 		Gossip:            cfg.gossip,
 		PodNodeDialer:     cfg.podNodeDialer,
@@ -889,7 +941,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.sqlStatusServer.TxnIDResolution,
 		&contentionMetrics,
 	)
-	contentionRegistry.Start(ctx, cfg.stopper)
 
 	storageEngineClient := kvserver.NewStorageEngineClient(cfg.nodeDialer)
 	*execCfg = sql.ExecutorConfig{
@@ -975,6 +1026,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		RangeStatsFetcher:          rangeStatsFetcher,
 		EventsExporter:             cfg.eventsExporter,
 		NodeDescs:                  cfg.nodeDescs,
+		TenantCapabilitiesReader:   cfg.tenantCapabilitiesReader,
+		AutoConfigProvider:         cfg.AutoConfigProvider,
 	}
 
 	if sqlSchemaChangerTestingKnobs := cfg.TestingKnobs.SQLSchemaChanger; sqlSchemaChangerTestingKnobs != nil {
@@ -1051,6 +1104,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	if externalConnKnobs := cfg.TestingKnobs.ExternalConnection; externalConnKnobs != nil {
 		execCfg.ExternalConnectionTestingKnobs = externalConnKnobs.(*externalconn.TestingKnobs)
 	}
+	if autoConfigKnobs := cfg.TestingKnobs.AutoConfig; autoConfigKnobs != nil {
+		knobs := autoConfigKnobs.(*autoconfig.TestingKnobs)
+		if knobs.Provider != nil {
+			execCfg.AutoConfigProvider = knobs.Provider
+		}
+	}
 
 	statsRefresher := stats.MakeRefresher(
 		cfg.AmbientCtx,
@@ -1080,6 +1139,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	distSQLServer.ServerConfig.SQLStatsController = pgServer.SQLServer.GetSQLStatsController()
 	distSQLServer.ServerConfig.SchemaTelemetryController = pgServer.SQLServer.GetSchemaTelemetryController()
 	distSQLServer.ServerConfig.IndexUsageStatsController = pgServer.SQLServer.GetIndexUsageStatsController()
+	distSQLServer.ServerConfig.StatsRefresher = statsRefresher
 
 	// We use one BytesMonitor for all Executor's created by the
 	// internalDB.
@@ -1109,7 +1169,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	)
 	*cfg.internalDB = *internalDB
 	execCfg.InternalDB = internalDB
-	jobRegistry.SetInternalDB(internalDB)
 	execCfg.IndexBackfiller = sql.NewIndexBackfiller(execCfg)
 	execCfg.IndexSpanSplitter = sql.NewIndexSplitAndScatter(execCfg)
 	execCfg.IndexMerger = sql.NewIndexBackfillerMergePlanner(execCfg)
@@ -1129,8 +1188,21 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		sql.ValidateForwardIndexes,
 		sql.ValidateInvertedIndexes,
 		sql.ValidateConstraint,
-		sql.NewFakeSessionData,
+		sql.NewInternalSessionData,
 	)
+
+	jobsInternalDB := sql.NewInternalDBWithSessionDataOverrides(internalDB, func(sd *sessiondata.SessionData) {
+		// All the internal SQL operations performed by the jobs subsystem
+		// must have minimal interaction with other nodes. To achieve this,
+		// we disable query distribution.
+		// See https://github.com/cockroachdb/cockroach/issues/100578 for an example
+		// bad thing that happens when not doing this.
+		sd.DistSQLMode = sessiondatapb.DistSQLOff
+
+		// Job internal operations use the node principal.
+		sd.UserProto = username.NodeUserName().EncodeProto()
+	})
+	jobRegistry.SetInternalDB(jobsInternalDB)
 
 	distSQLServer.ServerConfig.ProtectedTimestampProvider = execCfg.ProtectedTimestampProvider
 
@@ -1147,12 +1219,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 
 	var upgradeMgr *upgrademanager.Manager
 	{
-		// We only need to attach a version upgrade hook if we're the system
-		// tenant. Regular tenants are disallowed from changing cluster
-		// versions.
 		var c upgrade.Cluster
 		var systemDeps upgrade.SystemDeps
 		keyVisKnobs, _ := cfg.TestingKnobs.KeyVisualizer.(*keyvisualizer.TestingKnobs)
+		sqlStatsKnobs, _ := cfg.TestingKnobs.SQLStatsKnobs.(*sqlstats.TestingKnobs)
 		if codec.ForSystemTenant() {
 			c = upgradecluster.New(upgradecluster.ClusterConfig{
 				NodeLiveness:     nodeLiveness,
@@ -1160,21 +1230,22 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 				RangeDescScanner: rangedesc.NewScanner(cfg.db),
 				DB:               cfg.db,
 			})
-			systemDeps = upgrade.SystemDeps{
-				Cluster:     c,
-				DB:          cfg.internalDB,
-				Settings:    cfg.Settings,
-				JobRegistry: jobRegistry,
-				DistSender:  cfg.distSender,
-				Stopper:     cfg.stopper,
-				KeyVisKnobs: keyVisKnobs,
-			}
 		} else {
-			c = upgradecluster.NewTenantCluster(cfg.db)
-			systemDeps = upgrade.SystemDeps{
-				Cluster: c,
-				DB:      cfg.internalDB,
-			}
+			c = upgradecluster.NewTenantCluster(
+				upgradecluster.TenantClusterConfig{
+					Dialer:         cfg.podNodeDialer,
+					InstanceReader: cfg.sqlInstanceReader,
+					DB:             cfg.db,
+				})
+		}
+		systemDeps = upgrade.SystemDeps{
+			Cluster:       c,
+			DB:            cfg.internalDB,
+			Settings:      cfg.Settings,
+			JobRegistry:   jobRegistry,
+			Stopper:       cfg.stopper,
+			KeyVisKnobs:   keyVisKnobs,
+			SQLStatsKnobs: sqlStatsKnobs,
 		}
 
 		knobs, _ := cfg.TestingKnobs.UpgradeManager.(*upgradebase.TestingKnobs)
@@ -1293,19 +1364,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	vmoduleSetting.SetOnChange(&cfg.Settings.SV, fn)
 	fn(ctx)
 
-	var settingsWatcher *settingswatcher.SettingsWatcher
-	if codec.ForSystemTenant() {
-		settingsWatcher = settingswatcher.New(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.settingsStorage,
-		)
-	} else {
-		// Create the tenant settings watcher, using the tenant connector as the
-		// overrides monitor.
-		settingsWatcher = settingswatcher.NewWithOverrides(
-			cfg.clock, codec, cfg.Settings, cfg.rangeFeedFactory, cfg.stopper, cfg.tenantConnect, cfg.settingsStorage,
-		)
-	}
-
 	return &SQLServer{
 		ambientCtx:                     cfg.BaseConfig.AmbientCtx,
 		stopper:                        cfg.stopper,
@@ -1317,7 +1375,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		internalExecutor:               cfg.circularInternalExecutor,
 		internalDB:                     cfg.internalDB,
 		leaseMgr:                       leaseMgr,
-		blobService:                    blobService,
 		tracingService:                 tracingService,
 		tenantConnect:                  cfg.tenantConnect,
 		sessionRegistry:                cfg.sessionRegistry,
@@ -1361,17 +1418,35 @@ func (s *SQLServer) preStart(
 		}
 	}
 
+	// Initialize the settings watcher early in sql server startup. Settings
+	// values are meaningless before the watcher is initialized and most sub
+	// systems depend on system settings.
+	if err := s.settingsWatcher.Start(ctx); err != nil {
+		return errors.Wrap(err, "initializing settings")
+	}
+
 	// Load the multi-region enum by reading the system database's descriptor.
 	// This also serves as a simple check to see if a tenant exist (i.e. by
 	// checking whether the system db has been bootstrapped).
-	regionPhysicalRep, err := sql.GetLocalityRegionEnumPhysicalRepresentation(
-		ctx, s.internalDB, keys.SystemDatabaseID, s.distSQLServer.Locality,
-	)
-	if err != nil && !errors.Is(err, sql.ErrNotMultiRegionDatabase) {
+	regionPhysicalRep, err := startup.RunIdempotentWithRetryEx(ctx,
+		stopper.ShouldQuiesce(),
+		"sql get locality",
+		func(ctx context.Context) ([]byte, error) {
+			res, err := sql.GetLocalityRegionEnumPhysicalRepresentation(
+				ctx, s.internalDB, keys.SystemDatabaseID, s.distSQLServer.Locality,
+			)
+			if errors.Is(err, sql.ErrNotMultiRegionDatabase) {
+				err = nil
+			}
+			return res, err
+		})
+	if err != nil {
 		return err
 	}
 
 	s.leaseMgr.SetRegionPrefix(regionPhysicalRep)
+
+	s.execCfg.ContentionRegistry.Start(ctx, stopper)
 
 	// Start the sql liveness subsystem. We'll need it to get a session.
 	s.sqlLivenessProvider.Start(ctx, regionPhysicalRep)
@@ -1393,22 +1468,35 @@ func (s *SQLServer) preStart(
 	// ID. Otherwise, allow our SQL instance ID to be generated by
 	// SQL.
 	nodeID, hasNodeID := s.sqlIDContainer.OptionalNodeID()
-	var instance sqlinstance.InstanceInfo
-	if hasNodeID {
-		// Write/acquire our instance row.
-		instance, err = s.sqlInstanceStorage.CreateNodeInstance(
-			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.cfg.SQLAdvertiseAddr, s.distSQLServer.Locality, nodeID,
-		)
-		if err != nil {
-			return err
-		}
-	} else {
-		instance, err = s.sqlInstanceStorage.CreateInstance(
-			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.cfg.SQLAdvertiseAddr, s.distSQLServer.Locality,
-		)
-		if err != nil {
-			return err
-		}
+	instance, err := startup.RunIdempotentWithRetryEx(ctx,
+		stopper.ShouldQuiesce(),
+		"sql create node instance row",
+		func(ctx context.Context) (sqlinstance.InstanceInfo, error) {
+			if hasNodeID {
+				// Write/acquire our instance row.
+				return s.sqlInstanceStorage.CreateNodeInstance(
+					ctx,
+					session.ID(),
+					session.Expiration(),
+					s.cfg.AdvertiseAddr,
+					s.cfg.SQLAdvertiseAddr,
+					s.distSQLServer.Locality,
+					s.execCfg.Settings.Version.BinaryVersion(),
+					nodeID,
+				)
+			}
+			return s.sqlInstanceStorage.CreateInstance(
+				ctx,
+				session.ID(),
+				session.Expiration(),
+				s.cfg.AdvertiseAddr,
+				s.cfg.SQLAdvertiseAddr,
+				s.distSQLServer.Locality,
+				s.execCfg.Settings.Version.BinaryVersion(),
+			)
+		})
+	if err != nil {
+		return err
 	}
 
 	// TODO(andrei): Release the instance ID on server shutdown. It is not trivial
@@ -1471,9 +1559,13 @@ func (s *SQLServer) preStart(
 
 	var bootstrapVersion roachpb.Version
 	if s.execCfg.Codec.ForSystemTenant() {
-		if err := s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return txn.GetProto(ctx, keys.BootstrapVersionKey, &bootstrapVersion)
-		}); err != nil {
+		if err := startup.RunIdempotentWithRetry(ctx,
+			s.stopper.ShouldQuiesce(),
+			"sql get cluster version", func(ctx context.Context) error {
+				return s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+					return txn.GetProto(ctx, keys.BootstrapVersionKey, &bootstrapVersion)
+				})
+			}); err != nil {
 			return err
 		}
 	} else {
@@ -1495,11 +1587,8 @@ func (s *SQLServer) preStart(
 		bootstrapVersion = roachpb.Version{Major: 20, Minor: 1, Internal: 1}
 	}
 
-	if err := s.settingsWatcher.Start(ctx); err != nil {
-		return errors.Wrap(err, "initializing settings")
-	}
 	if err := s.systemConfigWatcher.Start(ctx, s.stopper); err != nil {
-		return errors.Wrap(err, "initializing settings")
+		return errors.Wrap(err, "initializing system config watcher")
 	}
 
 	clusterVersionMetrics := clusterversion.MakeMetricsAndRegisterOnVersionChangeCallback(&s.cfg.Settings.SV)
@@ -1531,10 +1620,14 @@ func (s *SQLServer) preStart(
 	// "system.settings" table of this tenant. This includes both system
 	// and secondary tenants.
 	var tenantActiveVersion clusterversion.ClusterVersion
-	if err := s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		tenantActiveVersion, err = s.settingsWatcher.GetClusterVersionFromStorage(ctx, txn)
-		return err
-	}); err != nil {
+	if err := startup.RunIdempotentWithRetry(ctx,
+		s.stopper.ShouldQuiesce(),
+		"sql get tenant version", func(ctx context.Context) error {
+			return s.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+				tenantActiveVersion, err = s.settingsWatcher.GetClusterVersionFromStorage(ctx, txn)
+				return err
+			})
+		}); err != nil {
 		return err
 	}
 	if s.execCfg.Settings.Version.BinaryVersion().Less(tenantActiveVersion.Version) {
@@ -1557,7 +1650,7 @@ func (s *SQLServer) preStart(
 			Settings:     s.execCfg.Settings,
 			DB:           s.execCfg.InternalDB,
 			TestingKnobs: knobs.JobsTestingKnobs,
-			PlanHookMaker: func(opName string, txn *kv.Txn, user username.SQLUsername) (interface{}, func()) {
+			PlanHookMaker: func(ctx context.Context, opName string, txn *kv.Txn, user username.SQLUsername) (interface{}, func()) {
 				// This is a hack to get around a Go package dependency cycle. See comment
 				// in sql/jobs/registry.go on planHookMaker.
 				return sql.NewInternalPlanner(
@@ -1566,7 +1659,7 @@ func (s *SQLServer) preStart(
 					user,
 					&sql.MemoryMetrics{},
 					s.execCfg,
-					sessiondatapb.SessionData{},
+					sql.NewInternalSessionData(ctx, s.execCfg.Settings, opName),
 				)
 			},
 		},
@@ -1578,6 +1671,33 @@ func (s *SQLServer) preStart(
 		s.execCfg.CaptureIndexUsageStatsKnobs,
 	)
 	s.execCfg.SyntheticPrivilegeCache.Start(ctx)
+
+	// Report a warning if the server is being shut down via the stopper
+	// before it was gracefully drained. This warning may be innocuous
+	// in tests where there is no use of the test server/cluster after
+	// shutdown; but may be a sign of a problem in production or for
+	// tests that need to restart a server.
+	stopper.AddCloser(stop.CloserFn(func() {
+		var sk *TestingKnobs
+		if knobs.Server != nil {
+			sk, _ = knobs.Server.(*TestingKnobs)
+		}
+
+		if !s.gracefulDrainComplete.Get() {
+			warnCtx := s.AnnotateCtx(context.Background())
+
+			if sk != nil && sk.RequireGracefulDrain {
+				log.Fatalf(warnCtx, "drain required but not performed")
+			}
+
+			log.Warningf(warnCtx, "server shutdown without a prior graceful drain")
+		}
+
+		if sk != nil && sk.DrainReportCh != nil {
+			sk.DrainReportCh <- struct{}{}
+		}
+	}))
+
 	return nil
 }
 

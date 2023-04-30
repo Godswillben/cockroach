@@ -181,6 +181,11 @@ message ReadImportDataSpec {
   // NEXTID: 20.
 }
 
+message IngestStoppedSpec {
+  optional int64 job_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID",
+  (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/jobs/jobspb.JobID"];
+}
+
 // StreamIngestionPartitionSpec contains information about a partition and how
 // to connect to it.
 message StreamIngestionPartitionSpec {
@@ -420,10 +425,24 @@ message GenerativeSplitAndScatterSpec {
   optional int64 num_nodes = 17[(gogoproto.nullable) = false];
   optional int64 job_id = 18 [(gogoproto.nullable) = false, (gogoproto.customname) = "JobID"];
   optional bool use_simple_import_spans = 19 [(gogoproto.nullable) = false];
+  optional bool use_frontier_checkpointing = 20 [(gogoproto.nullable) = false];
+  repeated jobs.jobspb.RestoreProgress.FrontierEntry checkpointed_spans = 21 [(gogoproto.nullable) = false];
 }
+
+
 
 message CloudStorageTestSpec {
   optional string location = 1 [(gogoproto.nullable) = false];
-  optional int64 transfer_size = 2 [(gogoproto.nullable) = false];
-  // NEXT ID: 2;
+  message Params {
+    // TransferSize determines the size of the file that is written and then
+    // read back in its entirety in each iteration of the test.
+    optional int64 transfer_size = 1 [(gogoproto.nullable) = false];
+    // MinDuration causes the test to be run repeatedly until the duration has
+    // elapsed.
+    optional int64 min_duration = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "time.Duration"];
+    // Concurrency causes multiple tests to be run in parallel.
+    optional int64 concurrency = 3 [(gogoproto.nullable) = false];
+  }
+  optional Params params = 2 [(gogoproto.nullable) = false];
+  // NEXT ID: 3;
 }

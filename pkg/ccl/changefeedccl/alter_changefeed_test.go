@@ -53,7 +53,7 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
@@ -682,14 +682,13 @@ func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 
 	doneCh := make(chan struct{})
 	defer close(doneCh)
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
-		jobspb.TypeChangefeed: func(raw jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeChangefeed,
+		func(raw jobs.Resumer) jobs.Resumer {
 			r := fakeResumer{
 				done: doneCh,
 			}
 			return &r
-		},
-	}
+		})
 
 	sqlDB.QueryRow(t, `CREATE CHANGEFEED FOR TABLE foo, bar INTO $1`, unredactedSinkURI).Scan(&changefeedID)
 

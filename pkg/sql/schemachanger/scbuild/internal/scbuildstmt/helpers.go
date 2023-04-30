@@ -51,9 +51,9 @@ func qualifiedName(b BuildCtx, id catid.DescID) string {
 func qualifiedFunctionName(b BuildCtx, id catid.DescID) string {
 	elts := b.QueryByID(id)
 	_, _, fnName := scpb.FindFunctionName(elts)
-	_, _, objParent := scpb.FindObjectParent(elts)
-	_, _, scName := scpb.FindNamespace(b.QueryByID(objParent.ParentSchemaID))
-	_, _, scParent := scpb.FindSchemaParent(b.QueryByID(objParent.ParentSchemaID))
+	_, _, objParent := scpb.FindSchemaChild(elts)
+	_, _, scName := scpb.FindNamespace(b.QueryByID(objParent.SchemaID))
+	_, _, scParent := scpb.FindSchemaParent(b.QueryByID(objParent.SchemaID))
 	_, _, dbName := scpb.FindNamespace(b.QueryByID(scParent.ParentDatabaseID))
 	return dbName.Name + "." + scName.Name + "." + fnName.Name
 }
@@ -209,8 +209,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 		switch t := e.(type) {
 		case *scpb.SchemaParent:
 			dropCascadeDescriptor(next, t.SchemaID)
-		case *scpb.ObjectParent:
-			dropCascadeDescriptor(next, t.ObjectID)
+		case *scpb.SchemaChild:
+			dropCascadeDescriptor(next, t.ChildObjectID)
 		case *scpb.View:
 			dropCascadeDescriptor(next, t.ViewID)
 		case *scpb.Sequence:
@@ -776,14 +776,16 @@ func makeSwapIndexSpec(
 	return in, temp
 }
 
-// fallBackIfZoneConfigExists determines if the table has regional by row
-// properties and throws an unimplemented error.
-func fallBackIfZoneConfigExists(b BuildCtx, n tree.NodeFormatter, id catid.DescID) {
+// fallBackIfSubZoneConfigExists determines if the table has a subzone
+// config. Normally this logic is used to limit index related operations,
+// since dropping indexes will need to remove entries of sub zones from
+// the zone config.
+func fallBackIfSubZoneConfigExists(b BuildCtx, n tree.NodeFormatter, id catid.DescID) {
 	{
 		tableElts := b.QueryByID(id)
-		if _, _, elem := scpb.FindTableZoneConfig(tableElts); elem != nil {
+		if _, _, elem := scpb.FindIndexZoneConfig(tableElts); elem != nil {
 			panic(scerrors.NotImplementedErrorf(n,
-				"regional by row partitioning is not supported"))
+				"sub zone configs are not supported"))
 		}
 	}
 }
@@ -902,4 +904,27 @@ func shouldSkipValidatingConstraint(
 		}
 	})
 	return skip, err
+}
+
+// panicIfSchemaIsLocked panics if table's schema is locked.
+// It is used to prevent schema change stmts.
+func panicIfSchemaIsLocked(tableElements ElementResultSet) {
+	_, _, schemaLocked := scpb.FindTableSchemaLocked(tableElements)
+	if schemaLocked != nil {
+		_, _, ns := scpb.FindNamespace(tableElements)
+		if ns == nil {
+			panic(errors.AssertionFailedf("programming error: Namespace element not found"))
+		}
+		panic(sqlerrors.NewSchemaChangeOnLockedTableErr(ns.Name))
+	}
+}
+
+// panicIfSystemColumn blocks alter operations on system columns.
+func panicIfSystemColumn(column *scpb.Column, columnName string) {
+	if column.IsSystemColumn {
+		// Block alter operations on system columns.
+		panic(pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"cannot alter system column %q", columnName))
+	}
 }

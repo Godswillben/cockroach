@@ -21,6 +21,7 @@ package tree
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/errors"
@@ -162,7 +163,10 @@ type ShowBackupOptions struct {
 	// the full backup dir.
 	EncryptionInfoDir Expr
 	DebugMetadataSST  bool
-	TransferSize      Expr
+
+	CheckConnectionTransferSize Expr
+	CheckConnectionDuration     Expr
+	CheckConnectionConcurrency  Expr
 }
 
 var _ NodeFormatter = &ShowBackupOptions{}
@@ -218,12 +222,25 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&o.DecryptionKMSURI)
 	}
 	if o.DebugMetadataSST {
+		maybeAddSep()
 		ctx.WriteString("debug_dump_metadata_sst")
 	}
 
-	if o.TransferSize != nil {
+	// The following are only used in connection-check SHOW.
+	if o.CheckConnectionConcurrency != nil {
+		maybeAddSep()
+		ctx.WriteString("CONCURRENTLY = ")
+		ctx.FormatNode(o.CheckConnectionConcurrency)
+	}
+	if o.CheckConnectionDuration != nil {
+		maybeAddSep()
+		ctx.WriteString("TIME = ")
+		ctx.FormatNode(o.CheckConnectionDuration)
+	}
+	if o.CheckConnectionTransferSize != nil {
+		maybeAddSep()
 		ctx.WriteString("TRANSFER = ")
-		ctx.FormatNode(o.TransferSize)
+		ctx.FormatNode(o.CheckConnectionTransferSize)
 	}
 }
 
@@ -238,7 +255,9 @@ func (o ShowBackupOptions) IsDefault() bool {
 		o.Privileges == options.Privileges &&
 		o.DebugMetadataSST == options.DebugMetadataSST &&
 		o.EncryptionInfoDir == options.EncryptionInfoDir &&
-		o.TransferSize == options.TransferSize
+		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
+		o.CheckConnectionDuration == options.CheckConnectionDuration &&
+		o.CheckConnectionConcurrency == options.CheckConnectionConcurrency
 }
 
 func combineBools(v1 bool, v2 bool, label string) (bool, error) {
@@ -313,7 +332,25 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	if err != nil {
 		return err
 	}
-	// no need to combine TransferSize – it only is used standalone by CONNECTION.
+
+	o.CheckConnectionTransferSize, err = combineExpr(o.CheckConnectionTransferSize, other.CheckConnectionTransferSize,
+		"transfer")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionDuration, err = combineExpr(o.CheckConnectionDuration, other.CheckConnectionDuration,
+		"time")
+	if err != nil {
+		return err
+	}
+
+	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
+		"concurrently")
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -458,6 +495,9 @@ type ShowJobs struct {
 	// If non-nil, only display jobs started by the specified
 	// schedules.
 	Schedules *Select
+
+	// Options contain any options that were specified in the `SHOW JOB` query.
+	Options *ShowJobOptions
 }
 
 // Format implements the NodeFormatter interface.
@@ -478,7 +518,32 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 		ctx.WriteString(" FOR SCHEDULES ")
 		ctx.FormatNode(node.Schedules)
 	}
+	if node.Options != nil {
+		ctx.WriteString(" WITH")
+		ctx.FormatNode(node.Options)
+	}
 }
+
+// ShowJobOptions describes options for the SHOW JOB execution.
+type ShowJobOptions struct {
+	// ExecutionDetails, if true, will render job specific details about the job's
+	// execution. These details will provide improved observability into the
+	// execution of the job.
+	ExecutionDetails bool
+}
+
+func (s *ShowJobOptions) Format(ctx *FmtCtx) {
+	if s.ExecutionDetails {
+		ctx.WriteString(" EXECUTION DETAILS")
+	}
+}
+
+func (s *ShowJobOptions) CombineWith(other *ShowJobOptions) error {
+	s.ExecutionDetails = other.ExecutionDetails
+	return nil
+}
+
+var _ NodeFormatter = &ShowJobOptions{}
 
 // ShowChangefeedJobs represents a SHOW CHANGEFEED JOBS statement
 type ShowChangefeedJobs struct {
@@ -733,10 +798,18 @@ const (
 	ShowCreateModeSecondaryIndexes
 )
 
+type ShowCreateFormatOption int
+
+const (
+	ShowCreateFormatOptionNone ShowCreateFormatOption = iota
+	ShowCreateFormatOptionRedactedValues
+)
+
 // ShowCreate represents a SHOW CREATE statement.
 type ShowCreate struct {
-	Mode ShowCreateMode
-	Name *UnresolvedObjectName
+	Mode   ShowCreateMode
+	Name   *UnresolvedObjectName
+	FmtOpt ShowCreateFormatOption
 }
 
 // Format implements the NodeFormatter interface.
@@ -752,6 +825,11 @@ func (node *ShowCreate) Format(ctx *FmtCtx) {
 		ctx.WriteString("SECONDARY INDEXES FROM ")
 	}
 	ctx.FormatNode(node.Name)
+
+	switch node.FmtOpt {
+	case ShowCreateFormatOptionRedactedValues:
+		ctx.WriteString(" WITH REDACT")
+	}
 }
 
 // ShowCreateAllSchemas represents a SHOW CREATE ALL SCHEMAS statement.
@@ -1059,12 +1137,16 @@ func (node *ShowTenant) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW TENANT ")
 	ctx.FormatNode(node.TenantSpec)
 
+	withs := []string{}
 	if node.WithReplication {
-		ctx.WriteString(" WITH REPLICATION STATUS")
+		withs = append(withs, "REPLICATION STATUS")
 	}
-
 	if node.WithCapabilities {
-		ctx.WriteString(" WITH CAPABILITIES")
+		withs = append(withs, "CAPABILITIES")
+	}
+	if len(withs) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.WriteString(strings.Join(withs, ", "))
 	}
 }
 

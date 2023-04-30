@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -47,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -615,7 +617,7 @@ func TestImmutableBatchArgs(t *testing.T) {
 	ds := NewDistSender(cfg)
 
 	txn := roachpb.MakeTransaction(
-		"test", nil /* baseKey */, roachpb.NormalUserPriority,
+		"test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
 		clock.Now(), clock.MaxOffset().Nanoseconds(), int32(ds.getNodeID()),
 	)
 	origTxnTs := txn.WriteTimestamp
@@ -2450,8 +2452,9 @@ func TestMultiRangeGapReverse(t *testing.T) {
 
 	txn := roachpb.MakeTransaction(
 		"foo",
-		nil, // baseKey
-		1.0, // userPriority
+		nil,                    // baseKey
+		isolation.Serializable, // isoLevel
+		1.0,                    // userPriority
 		clock.Now(),
 		0, // maxOffsetNs
 		1, // coordinatorNodeID
@@ -3260,7 +3263,7 @@ func TestParallelCommitsDetectIntentMissingCause(t *testing.T) {
 
 	key := roachpb.Key("a")
 	txn := roachpb.MakeTransaction(
-		"test", key, roachpb.NormalUserPriority,
+		"test", key, isolation.Serializable, roachpb.NormalUserPriority,
 		clock.Now(), clock.MaxOffset().Nanoseconds(), 1, /* coordinatorNodeID */
 	)
 
@@ -3494,6 +3497,55 @@ func TestSenderTransport(t *testing.T) {
 	}
 }
 
+// TestPProfLabelsAppliedToBatchRequestHeader tests that pprof labels on the
+// sender's context are copied to the BatchRequest.Header.
+func TestPProfLabelsAppliedToBatchRequestHeader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := hlc.NewClockForTesting(nil)
+	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
+	g := makeGossip(t, stopper, rpcContext)
+
+	observedLabels := make(map[string]string)
+	testFn := func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+		for i := 0; i < len(ba.Header.ProfileLabels)-1; i += 2 {
+			observedLabels[ba.Header.ProfileLabels[i]] = ba.Header.ProfileLabels[i+1]
+		}
+		return ba.CreateReply(), nil
+	}
+
+	cfg := DistSenderConfig{
+		AmbientCtx: log.MakeTestingAmbientCtxWithNewTracer(),
+		Clock:      clock,
+		NodeDescs:  g,
+		RPCContext: rpcContext,
+		TestingKnobs: ClientTestingKnobs{
+			TransportFactory: adaptSimpleTransport(testFn),
+		},
+		RangeDescriptorDB: defaultMockRangeDescriptorDB,
+		Settings:          cluster.MakeTestingClusterSettings(),
+	}
+	ds := NewDistSender(cfg)
+	ba := &kvpb.BatchRequest{}
+	ba.Add(kvpb.NewPut(roachpb.Key("a"), roachpb.MakeValueFromString("value")))
+	expectedLabels := map[string]string{"key": "value", "key2": "value2"}
+	var labels []string
+	for k, v := range expectedLabels {
+		labels = append(labels, k, v)
+	}
+	var undo func()
+	ctx, undo = pprofutil.SetProfilerLabels(ctx, labels...)
+	defer undo()
+	if _, err := ds.Send(ctx, ba); err != nil {
+		t.Fatalf("put encountered error: %s", err)
+	}
+	require.Equal(t, expectedLabels, observedLabels)
+}
+
 func TestGatewayNodeID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3598,7 +3650,7 @@ func TestMultipleErrorsMerged(t *testing.T) {
 	)
 
 	txn := roachpb.MakeTransaction(
-		"test", nil /* baseKey */, roachpb.NormalUserPriority,
+		"test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
 		clock.Now(), clock.MaxOffset().Nanoseconds(), 1, /* coordinatorNodeID */
 	)
 	// We're also going to check that the highest bumped WriteTimestamp makes it

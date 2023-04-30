@@ -2701,7 +2701,6 @@ Info contains an information about a single DistSQL remote flow.
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [int32](#cockroach.server.serverpb.ListDistSQLFlowsResponse-int32) |  | NodeID is the node on which this remote flow is either running or queued. | [reserved](#support-status) |
 | timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListDistSQLFlowsResponse-google.protobuf.Timestamp) |  | Timestamp must be in the UTC timezone. | [reserved](#support-status) |
-| status | [DistSQLRemoteFlows.Status](#cockroach.server.serverpb.ListDistSQLFlowsResponse-cockroach.server.serverpb.DistSQLRemoteFlows.Status) |  | Status is the current status of this remote flow. TODO(yuzefovich): remove this in 23.2. | [reserved](#support-status) |
 | stmt | [string](#cockroach.server.serverpb.ListDistSQLFlowsResponse-string) |  | Stmt is the SQL statement for which this flow is executing. | [reserved](#support-status) |
 
 
@@ -2795,7 +2794,6 @@ Info contains an information about a single DistSQL remote flow.
 | ----- | ---- | ----- | ----------- | -------------- |
 | node_id | [int32](#cockroach.server.serverpb.ListDistSQLFlowsResponse-int32) |  | NodeID is the node on which this remote flow is either running or queued. | [reserved](#support-status) |
 | timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListDistSQLFlowsResponse-google.protobuf.Timestamp) |  | Timestamp must be in the UTC timezone. | [reserved](#support-status) |
-| status | [DistSQLRemoteFlows.Status](#cockroach.server.serverpb.ListDistSQLFlowsResponse-cockroach.server.serverpb.DistSQLRemoteFlows.Status) |  | Status is the current status of this remote flow. TODO(yuzefovich): remove this in 23.2. | [reserved](#support-status) |
 | stmt | [string](#cockroach.server.serverpb.ListDistSQLFlowsResponse-string) |  | Stmt is the SQL statement for which this flow is executing. | [reserved](#support-status) |
 
 
@@ -2931,6 +2929,52 @@ Support status: [reserved](#support-status)
 
 
 #### Response Parameters
+
+
+
+## CriticalNodes
+
+`POST /_status/critical_nodes`
+
+CriticalNodes retrieves nodes that are considered critical. A critical node
+is one whose unexpected termination could result in data loss. A node is
+considered critical if any of its replicas are unavailable or
+under-replicated. The response includes a list of node descriptors that are
+considered critical, and the corresponding SpanConfigConformanceReport that
+includes details of non-conforming ranges contributing to the criticality.
+
+Support status: [reserved](#support-status)
+
+#### Request Parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Response Parameters
+
+
+
+
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| critical_nodes | [cockroach.roachpb.NodeDescriptor](#cockroach.server.serverpb.CriticalNodesResponse-cockroach.roachpb.NodeDescriptor) | repeated |  | [reserved](#support-status) |
+| report | [cockroach.roachpb.SpanConfigConformanceReport](#cockroach.server.serverpb.CriticalNodesResponse-cockroach.roachpb.SpanConfigConformanceReport) |  |  | [reserved](#support-status) |
+
+
+
+
 
 
 
@@ -4052,6 +4096,8 @@ tenant pods.
 | last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Timestamp) |  | Timestamp of the last stats reset. | [reserved](#support-status) |
 | internal_app_name_prefix | [string](#cockroach.server.serverpb.StatementsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 | transactions | [StatementsResponse.ExtendedCollectedTransactionStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedCollectedTransactionStatistics) | repeated | Transactions is transaction-level statistics for the collection of statements in this response. | [reserved](#support-status) |
+| stmts_total_runtime_secs | [float](#cockroach.server.serverpb.StatementsResponse-float) |  |  | [reserved](#support-status) |
+| txns_total_runtime_secs | [float](#cockroach.server.serverpb.StatementsResponse-float) |  |  | [reserved](#support-status) |
 
 
 
@@ -4068,6 +4114,7 @@ tenant pods.
 | key | [StatementsResponse.ExtendedStatementStatisticsKey](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedStatementStatisticsKey) |  |  | [reserved](#support-status) |
 | id | [uint64](#cockroach.server.serverpb.StatementsResponse-uint64) |  |  | [reserved](#support-status) |
 | stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.StatementStatistics) |  |  | [reserved](#support-status) |
+| txn_fingerprint_ids | [uint64](#cockroach.server.serverpb.StatementsResponse-uint64) | repeated | In 23.1 we expect the response to only group on fingerprint_id and app_name in the overview page. We now return the aggregated list of unique txn fingerprint ids, leaving the txn_fingerprint_id field in the key empty. | [reserved](#support-status) |
 
 
 
@@ -4124,7 +4171,23 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | start | [int64](#cockroach.server.serverpb.CombinedStatementsStatsRequest-int64) |  | Unix time range for aggregated statements. | [reserved](#support-status) |
 | end | [int64](#cockroach.server.serverpb.CombinedStatementsStatsRequest-int64) |  |  | [reserved](#support-status) |
+| fetch_mode | [CombinedStatementsStatsRequest.FetchMode](#cockroach.server.serverpb.CombinedStatementsStatsRequest-cockroach.server.serverpb.CombinedStatementsStatsRequest.FetchMode) |  | Note that if fetch_mode is set to transactions only, we will also include the statement statistics for the stmts in the transactions response. This is more of a hack-y method to get the complete stats for txns, because in the client we need to fill in some txn stats info from its stmt stats, such as the query string.<br><br>We prefer this hackier method right now to reduce surface area for backporting these changes, but in the future we will introduce more endpoints to properly organize these differing requests. TODO (xinhaoz) - Split this API into stmts and txns properly instead of using  this param. | [reserved](#support-status) |
+| limit | [int64](#cockroach.server.serverpb.CombinedStatementsStatsRequest-int64) |  |  | [reserved](#support-status) |
 
+
+
+
+
+
+<a name="cockroach.server.serverpb.CombinedStatementsStatsRequest-cockroach.server.serverpb.CombinedStatementsStatsRequest.FetchMode"></a>
+#### CombinedStatementsStatsRequest.FetchMode
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| stats_type | [CombinedStatementsStatsRequest.StatsType](#cockroach.server.serverpb.CombinedStatementsStatsRequest-cockroach.server.serverpb.CombinedStatementsStatsRequest.StatsType) |  |  | [reserved](#support-status) |
+| sort | [StatsSortOptions](#cockroach.server.serverpb.CombinedStatementsStatsRequest-cockroach.server.serverpb.StatsSortOptions) |  |  | [reserved](#support-status) |
 
 
 
@@ -4145,6 +4208,8 @@ Support status: [reserved](#support-status)
 | last_reset | [google.protobuf.Timestamp](#cockroach.server.serverpb.StatementsResponse-google.protobuf.Timestamp) |  | Timestamp of the last stats reset. | [reserved](#support-status) |
 | internal_app_name_prefix | [string](#cockroach.server.serverpb.StatementsResponse-string) |  | If set and non-empty, indicates the prefix to application_name used for statements/queries issued internally by CockroachDB. | [reserved](#support-status) |
 | transactions | [StatementsResponse.ExtendedCollectedTransactionStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedCollectedTransactionStatistics) | repeated | Transactions is transaction-level statistics for the collection of statements in this response. | [reserved](#support-status) |
+| stmts_total_runtime_secs | [float](#cockroach.server.serverpb.StatementsResponse-float) |  |  | [reserved](#support-status) |
+| txns_total_runtime_secs | [float](#cockroach.server.serverpb.StatementsResponse-float) |  |  | [reserved](#support-status) |
 
 
 
@@ -4161,6 +4226,7 @@ Support status: [reserved](#support-status)
 | key | [StatementsResponse.ExtendedStatementStatisticsKey](#cockroach.server.serverpb.StatementsResponse-cockroach.server.serverpb.StatementsResponse.ExtendedStatementStatisticsKey) |  |  | [reserved](#support-status) |
 | id | [uint64](#cockroach.server.serverpb.StatementsResponse-uint64) |  |  | [reserved](#support-status) |
 | stats | [cockroach.sql.StatementStatistics](#cockroach.server.serverpb.StatementsResponse-cockroach.sql.StatementStatistics) |  |  | [reserved](#support-status) |
+| txn_fingerprint_ids | [uint64](#cockroach.server.serverpb.StatementsResponse-uint64) | repeated | In 23.1 we expect the response to only group on fingerprint_id and app_name in the overview page. We now return the aggregated list of unique txn fingerprint ids, leaving the txn_fingerprint_id field in the key empty. | [reserved](#support-status) |
 
 
 
@@ -7070,7 +7136,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| snapshot_id | [int64](#cockroach.server.serverpb.ListTracingSnapshotsResponse-int64) |  |  | [reserved](#support-status) |
+| snapshot_id | [int64](#cockroach.server.serverpb.ListTracingSnapshotsResponse-int64) |  | SnapshotID identifies a specific snapshot which can be requested via a GetTracingSnapshotRequest. Negative IDs are used for "automatic" snapshots. | [reserved](#support-status) |
 | captured_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.ListTracingSnapshotsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 
 
@@ -7126,7 +7192,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| snapshot_id | [int64](#cockroach.server.serverpb.TakeTracingSnapshotResponse-int64) |  |  | [reserved](#support-status) |
+| snapshot_id | [int64](#cockroach.server.serverpb.TakeTracingSnapshotResponse-int64) |  | SnapshotID identifies a specific snapshot which can be requested via a GetTracingSnapshotRequest. Negative IDs are used for "automatic" snapshots. | [reserved](#support-status) |
 | captured_at | [google.protobuf.Timestamp](#cockroach.server.serverpb.TakeTracingSnapshotResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
 
 
@@ -7153,7 +7219,7 @@ Support status: [reserved](#support-status)
 
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
-| snapshot_id | [int64](#cockroach.server.serverpb.GetTracingSnapshotRequest-int64) |  |  | [reserved](#support-status) |
+| snapshot_id | [int64](#cockroach.server.serverpb.GetTracingSnapshotRequest-int64) |  | SnapshotId indicates which snapshot is requested. ID may be negative when requesting an "automatic" snapshot; see ListTracingSnapshotsResponse. | [reserved](#support-status) |
 
 
 
@@ -7212,6 +7278,7 @@ the tracing UI.
 | processed_tags | [SpanTag](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.SpanTag) | repeated |  | [reserved](#support-status) |
 | current | [bool](#cockroach.server.serverpb.GetTracingSnapshotResponse-bool) |  | current is set if the span is still alive (i.e. still present in the active spans registry). | [reserved](#support-status) |
 | current_recording_mode | [cockroach.util.tracing.tracingpb.RecordingMode](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.util.tracing.tracingpb.RecordingMode) |  | current_recording_mode represents the span's current recording mode. This is not set if current == false. | [reserved](#support-status) |
+| children_metadata | [NamedOperationMetadata](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.NamedOperationMetadata) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -7250,6 +7317,20 @@ of the tracing UI.
 | ----- | ---- | ----- | ----------- | -------------- |
 | key | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
 | val | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.server.serverpb.NamedOperationMetadata"></a>
+#### NamedOperationMetadata
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| name | [string](#cockroach.server.serverpb.GetTracingSnapshotResponse-string) |  |  | [reserved](#support-status) |
+| metadata | [cockroach.util.tracing.tracingpb.OperationMetadata](#cockroach.server.serverpb.GetTracingSnapshotResponse-cockroach.util.tracing.tracingpb.OperationMetadata) |  |  | [reserved](#support-status) |
 
 
 
@@ -7404,6 +7485,7 @@ Support status: [reserved](#support-status)
 | range_descriptor | [cockroach.roachpb.RangeDescriptor](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.roachpb.RangeDescriptor) |  |  | [reserved](#support-status) |
 | replica_info | [cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaInfo](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaInfo) |  |  | [reserved](#support-status) |
 | node_stream_restarted | [RecoveryCollectReplicaRestartNodeStream](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.server.serverpb.RecoveryCollectReplicaRestartNodeStream) |  |  | [reserved](#support-status) |
+| metadata | [cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ClusterMetadata](#cockroach.server.serverpb.RecoveryCollectReplicaInfoResponse-cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ClusterMetadata) |  |  | [reserved](#support-status) |
 
 
 
@@ -7492,7 +7574,8 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | plan | [cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaUpdatePlan](#cockroach.server.serverpb.RecoveryStagePlanRequest-cockroach.kv.kvserver.loqrecovery.loqrecoverypb.ReplicaUpdatePlan) |  | Plan is replica update plan to stage for application on next restart. Plan could be empty in that case existing plan is removed if present. | [reserved](#support-status) |
 | all_nodes | [bool](#cockroach.server.serverpb.RecoveryStagePlanRequest-bool) |  | If all nodes is true, then receiver should act as a coordinator and perform a fan-out to stage plan on all nodes of the cluster. | [reserved](#support-status) |
-| force_plan | [bool](#cockroach.server.serverpb.RecoveryStagePlanRequest-bool) |  | Force plan tells receiver to ignore any plan already staged on the node if it is present and replace it with new plan (including empty one). | [reserved](#support-status) |
+| force_plan | [bool](#cockroach.server.serverpb.RecoveryStagePlanRequest-bool) |  | ForcePlan tells receiver to ignore any plan already staged on the node if it is present and replace it with new plan (including empty one). | [reserved](#support-status) |
+| force_local_internal_version | [bool](#cockroach.server.serverpb.RecoveryStagePlanRequest-bool) |  | ForceLocalInternalVersion tells server to update internal component of plan version to the one of active cluster version. This option needs to be set if target cluster is stuck in recovery where only part of nodes were successfully migrated. | [reserved](#support-status) |
 
 
 

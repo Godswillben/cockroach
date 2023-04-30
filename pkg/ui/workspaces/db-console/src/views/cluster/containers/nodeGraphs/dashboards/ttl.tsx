@@ -11,7 +11,7 @@
 import React from "react";
 import _ from "lodash";
 
-import { LineGraph } from "src/views/cluster/components/linegraph";
+import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
@@ -23,7 +23,7 @@ export default function (props: GraphDashboardProps) {
   const percentiles = ["p50", "p75", "p90", "p95", "p99"];
 
   return [
-    <LineGraph title="Processing Rate" sources={nodeSources}>
+    <LineGraph title="Processing Rate" isKvGraph={false} sources={nodeSources}>
       <Axis label="rows per second" units={AxisUnits.Count}>
         <Metric
           name="cr.node.jobs.row_level_ttl.rows_selected"
@@ -37,7 +37,7 @@ export default function (props: GraphDashboardProps) {
         />
       </Axis>
     </LineGraph>,
-    <LineGraph title="Estimated Rows" sources={nodeSources}>
+    <LineGraph title="Estimated Rows" isKvGraph={false} sources={nodeSources}>
       <Axis label="row count" units={AxisUnits.Count}>
         <Metric
           name="cr.node.jobs.row_level_ttl.total_rows"
@@ -53,6 +53,7 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
     <LineGraph
       title="Job Latency"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`Latency of scanning and deleting within the job.`}
     >
@@ -75,6 +76,7 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
     <LineGraph
       title="Spans in Progress"
+      isKvGraph={false}
       sources={nodeSources}
       tooltip={`Number of active spans being processed by TTL.`}
     >

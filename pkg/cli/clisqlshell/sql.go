@@ -16,7 +16,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
 	"github.com/knz/bubbline/editline"
+	"github.com/knz/bubbline/history"
 )
 
 const (
@@ -95,6 +95,7 @@ Informational
   \du[S+] [PATTERN] same as \dg.
   \dv[S+] [PATTERN] list only views.
   \l[+] [PATTERN]   list databases.
+  \s                list command history.
   \sf[+] FUNCNAME   show a function's definition.
   \sv[+] VIEWNAME   show a view's definition.
   \z [PATTERN]      same as \dp.
@@ -128,10 +129,10 @@ Commands specific to the demo shell (EXPERIMENTAL):
   \demo add <locality>         add a node (locality specified as "region=<region>,zone=<zone>").
 `
 
-	defaultPromptPattern = "%n@%M/%/%x>"
+	defaultPromptPattern = "%n@%M/%C%/%x>"
 
 	// debugPromptPattern avoids substitution patterns that require a db roundtrip.
-	debugPromptPattern = "%n@%M>"
+	debugPromptPattern = "%n@%M %C>"
 )
 
 // cliState defines the current state of the CLI during
@@ -277,6 +278,33 @@ func (c *cliState) printCliHelp() {
 		docs.URL("use-the-built-in-sql-client.html"),
 	)
 	fmt.Fprintln(c.iCtx.stdout)
+}
+
+// printCommandHistory prints the recorded command history.
+func (c *cliState) printCommandHistory() {
+	// As long as we preserve compatibility with go-libedit, we cannot
+	// ask the line editor directly for a copy of the history; instead
+	// we need to load it from file.
+
+	// To do so, first we must save it to file: by default, it is
+	// not saved on every input.
+	if err := c.ins.saveHistory(); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot save history: %v", err)
+		return
+	}
+
+	// Then, we load it back from file. We can use the bubbline loader,
+	// because both bubbline and libedit use the same file format.
+	h, err := history.LoadHistory(c.iCtx.histFile)
+	if err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot load history: %v", err)
+		return
+	}
+
+	// Finally, we can print the entries.
+	for _, entry := range h {
+		fmt.Fprintln(c.iCtx.stdout, entry)
+	}
 }
 
 // addHistory persists a line of input to the readline history file.
@@ -905,7 +933,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 	} else {
 		// Configure the editor to use the new prompt.
 
-		parsedURL, err := url.Parse(c.conn.GetURL())
+		parsedURL, err := pgurl.Parse(c.conn.GetURL())
 		if err != nil {
 			// If parsing fails, we'll keep the entire URL. The Open call succeeded, and that
 			// is the important part.
@@ -914,10 +942,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			return nextState
 		}
 
-		userName := ""
-		if parsedURL.User != nil {
-			userName = parsedURL.User.Username()
-		}
+		userName := parsedURL.GetUsername()
 
 		dbName := unknownDbName
 		c.lastKnownTxnStatus = unknownTxnStatus
@@ -932,14 +957,35 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			dbName = c.refreshDatabaseName()
 		}
 
+		// Do we have a "cluster" option; either as an options= parameter
+		// or as a prefix to the database name?
+		opts := parsedURL.GetExtraOptions()
+		var logicalCluster string
+		if extOptsS := opts.Get("options"); extOptsS != "" {
+			extOpts, err := pgurl.ParseExtendedOptions(extOptsS)
+			if err == nil {
+				logicalCluster = extOpts.Get("cluster")
+			}
+		}
+		if urlDB := parsedURL.GetDatabase(); strings.HasPrefix(urlDB, "cluster:") {
+			parts := strings.SplitN(urlDB, "/", 2)
+			logicalCluster = parts[0][len("cluster:"):]
+		}
+		if logicalCluster != "" {
+			logicalCluster += "/"
+		}
+
 		c.fullPrompt = rePromptFmt.ReplaceAllStringFunc(c.iCtx.customPromptPattern, func(m string) string {
 			switch m {
 			case "%M":
-				return parsedURL.Host // full host name.
+				_, host, port := parsedURL.GetNetworking()
+				return host + ":" + port // server:port
 			case "%m":
-				return parsedURL.Hostname() // host name.
+				_, host, _ := parsedURL.GetNetworking()
+				return host
 			case "%>":
-				return parsedURL.Port() // port.
+				_, _, port := parsedURL.GetNetworking()
+				return port
 			case "%n": // user name.
 				return userName
 			case "%/": // database name.
@@ -948,6 +994,8 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 				return c.lastKnownTxnStatus
 			case "%%":
 				return "%"
+			case "%C":
+				return logicalCluster
 			default:
 				err = fmt.Errorf("unrecognized format code in prompt: %q", m)
 				return ""
@@ -1391,6 +1439,9 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		// Reset the input buffer so far. This is useful when e.g. a user
 		// got confused with string delimiters and multi-line input.
 		return cliStartLine
+
+	case `\s`:
+		c.printCommandHistory()
 
 	case `\show`:
 		if c.ins.multilineEdit() {
@@ -2297,17 +2348,16 @@ func (c *cliState) configurePreShellDefaults(
 	// all), to prevent abnormal situation where a history runs into
 	// megabytes and starts slowing down the shell.
 	const maxHistEntries = 10000
-	var histFile string
 	if useEditor {
 		homeDir, err := envutil.HomeDir()
 		if err != nil {
 			fmt.Fprintf(c.iCtx.stderr, "warning: cannot retrieve user information: %v\nwarning: history will not be saved\n", err)
 		} else {
-			histFile = filepath.Join(homeDir, cmdHistFile)
+			c.iCtx.histFile = filepath.Join(homeDir, cmdHistFile)
 		}
 	}
 
-	cleanupFn, c.exitErr = c.ins.init(cmdIn, c.iCtx.stdout, c.iCtx.stderr, c, maxHistEntries, histFile)
+	cleanupFn, c.exitErr = c.ins.init(cmdIn, c.iCtx.stdout, c.iCtx.stderr, c, maxHistEntries, c.iCtx.histFile)
 	if c.exitErr != nil {
 		return cleanupFn, c.exitErr
 	}

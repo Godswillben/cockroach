@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -44,18 +45,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -63,6 +70,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgtype"
 	"github.com/stretchr/testify/assert"
@@ -626,14 +635,10 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 	})
 
 	t.Log("checking the virtual tables")
-	const (
-		clusterScope  = "cluster"
-		nodeScope     = "node"
-		runningStatus = "running"
-		queuedStatus  = "queued"
-	)
-	getNum := func(db *sqlutils.SQLRunner, scope, status string) int {
-		querySuffix := fmt.Sprintf("FROM crdb_internal.%s_distsql_flows WHERE status = '%s'", scope, status)
+	const clusterScope = "cluster"
+	const nodeScope = "node"
+	getNum := func(db *sqlutils.SQLRunner, scope string) int {
+		querySuffix := fmt.Sprintf("FROM crdb_internal.%s_distsql_flows", scope)
 		// Check that all remote flows (if any) correspond to the expected
 		// statement.
 		stmts := db.QueryStr(t, "SELECT stmt "+querySuffix)
@@ -649,28 +654,20 @@ func TestDistSQLFlowsVirtualTables(t *testing.T) {
 		db := sqlutils.MakeSQLRunner(conn)
 
 		// Check cluster level table.
-		expRunning, expQueued := 2, 0
-		gotRunning, gotQueued := getNum(db, clusterScope, runningStatus), getNum(db, clusterScope, queuedStatus)
-		if gotRunning != expRunning {
-			t.Fatalf("unexpected output from cluster_distsql_flows on node %d (running=%d)", nodeID+1, gotRunning)
-		}
-		if gotQueued != expQueued {
-			t.Fatalf("unexpected output from cluster_distsql_flows on node %d (queued=%d)", nodeID+1, gotQueued)
+		actual := getNum(db, clusterScope)
+		if actual != 2 {
+			t.Fatalf("unexpected output from cluster_distsql_flows on node %d (found %d)", nodeID+1, actual)
 		}
 
 		// Check node level table.
 		if nodeID == gatewayNodeID {
-			if getNum(db, nodeScope, runningStatus) != 0 || getNum(db, nodeScope, queuedStatus) != 0 {
+			if getNum(db, nodeScope) != 0 {
 				t.Fatal("unexpectedly non empty output from node_distsql_flows on the gateway")
 			}
 		} else {
-			expRunning, expQueued = 1, 0
-			gotRunning, gotQueued = getNum(db, nodeScope, runningStatus), getNum(db, nodeScope, queuedStatus)
-			if gotRunning != expRunning {
-				t.Fatalf("unexpected output from node_distsql_flows on node %d (running=%d)", nodeID+1, gotRunning)
-			}
-			if gotQueued != expQueued {
-				t.Fatalf("unexpected output from node_distsql_flows on node %d (queued=%d)", nodeID+1, gotQueued)
+			actual = getNum(db, nodeScope)
+			if actual != 1 {
+				t.Fatalf("unexpected output from node_distsql_flows on node %d (found %d)", nodeID+1, actual)
 			}
 		}
 	}
@@ -833,8 +830,12 @@ func TestInternalJobsTableRetryColumns(t *testing.T) {
 			payloadBytes, err := protoutil.Marshal(&payload)
 			assert.NoError(t, err)
 			tdb.Exec(t,
-				"INSERT INTO system.jobs (id, status, created, payload) values ($1, $2, $3, $4)",
-				1, jobs.StatusRunning, timeutil.Now(), payloadBytes,
+				"INSERT INTO system.jobs (id, status, created) values ($1, $2, $3)",
+				1, jobs.StatusRunning, timeutil.Now(),
+			)
+			tdb.Exec(t,
+				"INSERT INTO system.job_info (job_id, info_key, value) values ($1, $2, $3)",
+				1, jobs.GetLegacyPayloadKey(), payloadBytes,
 			)
 
 			validateFn(ctx, tdb)
@@ -916,6 +917,61 @@ func TestTxnContentionEventsTable(t *testing.T) {
 	testTxnContentionEventsTableWithDroppedInfo(t, ctx, conn, sqlDB)
 }
 
+func TestTxnContentionEventsTableWithRangeDescriptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettings()
+	args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{Settings: settings}}
+	tc := testcluster.StartTestCluster(t, 1, args)
+	defer tc.Stopper().Stop(ctx)
+	sqlDB := tc.ServerConn(0)
+	_, err := sqlDB.Exec("SET CLUSTER SETTING sql.contention.event_store.resolution_interval = '10ms'")
+	require.NoError(t, err)
+	rangeKey := "/Local/Range/Table/106/1/-1704619207610523008/RangeDescriptor"
+	rangeKeyEscaped := fmt.Sprintf("\"%s\"", rangeKey)
+	tc.Server(0).SQLServer().(*sql.Server).GetExecutorConfig().ContentionRegistry.AddContentionEvent(contentionpb.ExtendedContentionEvent{
+		BlockingEvent: kvpb.ContentionEvent{
+			Key: roachpb.Key(rangeKey),
+			TxnMeta: enginepb.TxnMeta{
+				Key: roachpb.Key(rangeKey),
+				ID:  uuid.FastMakeV4(),
+			},
+
+			Duration: 1 * time.Minute,
+		},
+		BlockingTxnFingerprintID: 9001,
+		WaitingTxnID:             uuid.FastMakeV4(),
+		WaitingTxnFingerprintID:  9002,
+		WaitingStmtID:            clusterunique.ID{Uint128: uint128.Uint128{Lo: 9003, Hi: 1004}},
+		WaitingStmtFingerprintID: 9004,
+	})
+
+	// Contention flush can take some time to flush
+	// the events
+	testutils.SucceedsSoon(t, func() error {
+		row := sqlDB.QueryRow(`SELECT
+    database_name, 
+    schema_name, 
+    table_name, 
+    index_name 
+		FROM crdb_internal.transaction_contention_events
+		WHERE contending_pretty_key = $1`, rangeKeyEscaped)
+
+		var db, schema, table, index string
+		err = row.Scan(&db, &schema, &table, &index)
+		if err != nil {
+			return err
+		}
+		require.Equal(t, "", db)
+		require.Equal(t, "", schema)
+		require.Equal(t, "", table)
+		require.Equal(t, "", index)
+		return nil
+	})
+}
+
 func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -926,7 +982,7 @@ func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Test is designed to run with explicit tenants. No need to
 				// implicitly create a tenant.
-				DisableDefaultTestTenant: true,
+				DefaultTestTenant: base.TestTenantDisabled,
 			},
 		})
 	defer tc.Stopper().Stop(ctx)
@@ -1324,30 +1380,42 @@ func TestInternalSystemJobsTableMirrorsSystemJobsTable(t *testing.T) {
 	assert.NoError(t, err)
 
 	tdb.Exec(t,
-		"INSERT INTO system.jobs (id, status, created, payload) values ($1, $2, $3, $4)",
-		1, jobs.StatusRunning, timeutil.Now(), payloadBytes,
+		"INSERT INTO system.jobs (id, status, created) values ($1, $2, $3)",
+		1, jobs.StatusRunning, timeutil.Now(),
+	)
+	tdb.Exec(t,
+		"INSERT INTO system.job_info (job_id, info_key, value) values ($1, $2, $3)",
+		1, jobs.GetLegacyPayloadKey(), payloadBytes,
 	)
 
 	tdb.Exec(t,
-		"INSERT INTO system.jobs values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-		2, jobs.StatusRunning, timeutil.Now(), payloadBytes, []byte("progress"), "created by", 2, []byte("claim session id"),
+		`INSERT INTO system.jobs (id, status, created, created_by_type, created_by_id, 
+                         claim_session_id, claim_instance_id, num_runs, last_run, job_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		2, jobs.StatusRunning, timeutil.Now(), "created by", 2, []byte("claim session id"),
 		2, 2, timeutil.Now(), jobspb.TypeImport.String(),
 	)
+	tdb.Exec(t,
+		"INSERT INTO system.job_info (job_id, info_key, value) values ($1, $2, $3)",
+		2, jobs.GetLegacyPayloadKey(), payloadBytes,
+	)
+	tdb.Exec(t,
+		"INSERT INTO system.job_info (job_id, info_key, value) values ($1, $2, $3)",
+		2, jobs.GetLegacyProgressKey(), []byte("progress"),
+	)
 
-	res := tdb.QueryStr(t, "SELECT * FROM system.jobs ORDER BY id")
-	tdb.CheckQueryResults(t, `SELECT * FROM crdb_internal.system_jobs ORDER BY id`, res)
+	res := tdb.QueryStr(t, `
+			SELECT id, status, created, created_by_type, created_by_id, claim_session_id,
+      claim_instance_id, num_runs, last_run, job_type
+			FROM system.jobs ORDER BY id`,
+	)
 	tdb.CheckQueryResults(t, `
-			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id,
+			SELECT id, status, created, created_by_type, created_by_id, claim_session_id,
              claim_instance_id, num_runs, last_run, job_type
 			FROM crdb_internal.system_jobs ORDER BY id`,
 		res,
 	)
-	tdb.CheckQueryResults(t, `
-			SELECT id, status, created, payload, progress, created_by_type, created_by_id, claim_session_id,
-      claim_instance_id, num_runs, last_run, job_type
-			FROM system.jobs ORDER BY id`,
-		res,
-	)
+
+	// TODO(adityamaru): add checks for payload and progress
 }
 
 // TestInternalSystemJobsTableWorksWithVersionPreV23_1BackfillTypeColumnInJobsTable
@@ -1419,8 +1487,12 @@ func TestCorruptPayloadError(t *testing.T) {
 	tdb := sqlutils.MakeSQLRunner(db)
 
 	tdb.Exec(t,
-		"INSERT INTO system.jobs (id, status, created, payload) values ($1, $2, $3, $4)",
-		1, jobs.StatusRunning, timeutil.Now(), []byte("invalid payload"),
+		"INSERT INTO system.jobs (id, status, created) values ($1, $2, $3)",
+		1, jobs.StatusRunning, timeutil.Now(),
+	)
+	tdb.Exec(t,
+		"INSERT INTO system.job_info (job_id, info_key, value) values ($1, $2, $3)",
+		1, jobs.GetLegacyPayloadKey(), []byte("invalid payload"),
 	)
 
 	tdb.ExpectErrWithHint(t, "proto", "could not decode the payload for job 1. consider deleting this job from system.jobs", "SELECT * FROM crdb_internal.system_jobs")
@@ -1447,10 +1519,9 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 	// users requires jobs to be created and run. Thus, this test only creates jobs of type
 	// jobspb.TypeImport and overrides the import resumer.
 	registry := s.JobRegistry().(*jobs.Registry)
-	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{}
-	registry.TestingResumerCreationKnobs[jobspb.TypeImport] = func(r jobs.Resumer) jobs.Resumer {
+	registry.TestingWrapResumerConstructor(jobspb.TypeImport, func(r jobs.Resumer) jobs.Resumer {
 		return &fakeResumer{}
-	}
+	})
 
 	asUser := func(user string, f func(userDB *sqlutils.SQLRunner)) {
 		pgURL := url.URL{
@@ -1510,4 +1581,69 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 
 	// Admins can see all jobs.
 	rootDB.CheckQueryResults(t, "SELECT id FROM crdb_internal.system_jobs WHERE id IN (1,2,3) ORDER BY id", [][]string{{"1"}, {"2"}, {"3"}})
+}
+
+// TestVirtualTableDoesntHangOnQueryCanceledError is a regression test for
+// #99753 which verifies that virtual table generation doesn't hang when the
+// worker goroutine returns "query canceled error".
+//
+// The test aims to replicate the scenario observed in #99753 as closely as
+// possible. In particular, the following setup is used:
+//   - simulate automatic collection of table statistics for a table
+//   - automatic stats collection - before creating the corresponding job -
+//     verifies that there is no other concurrent job for the table already
+//   - that check is done via jobs.RunningJobExists which internally issues a
+//     query against crdb_internal.system_jobs virtual table
+//   - that virtual table is generated by issuing another "system-jobs-scan"
+//     internal query
+//   - during that "system-jobs-scan" query we're injecting the query canceled
+//     error (in other words, the error is injected during the generation of
+//     crdb_internal.system_jobs virtual table).
+//
+// The injection is achieved by adding a callback to DistSQLReceiver.Push which
+// replaces the first piece of metadata it sees with the error.
+func TestVirtualTableDoesntHangOnQueryCanceledError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// addCallback determines whether the push callback should be added.
+	var addCallback atomic.Bool
+	var numCallbacksAdded atomic.Int32
+	err := cancelchecker.QueryCanceledError
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLExecutor: &sql.ExecutorTestingKnobs{
+					DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
+						if !addCallback.Load() || strings.HasPrefix(query, sql.SystemJobsAndJobInfoBaseQuery) {
+							return nil
+						}
+						numCallbacksAdded.Add(1)
+						return func(_ rowenc.EncDatumRow, _ coldata.Batch, meta *execinfrapb.ProducerMetadata) {
+							if meta != nil {
+								*meta = execinfrapb.ProducerMetadata{}
+								meta.Err = err
+							}
+						}
+					},
+				},
+			},
+			Insecure: true,
+		}})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.ServerConn(0 /* idx */)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	// Disable auto stats so that it doesn't interfere with the test.
+	sqlDB.Exec(t, "CREATE TABLE t (k INT PRIMARY KEY) WITH (sql_stats_automatic_collection_enabled = false)")
+
+	addCallback.Store(true)
+	// Collect the stats on `t` as if it was done automatically.
+	statsQuery := fmt.Sprintf("CREATE STATISTICS %s FROM t", jobspb.AutoStatsName)
+	sqlDB.ExpectErr(t, err.Error(), statsQuery)
+	addCallback.Store(false)
+
+	// Sanity check that the callback was added at least once.
+	require.Greater(t, numCallbacksAdded.Load(), int32(0))
 }

@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -216,26 +215,34 @@ func comparePrivileges(
 	prevUserPrivileges []catpb.UserPrivileges,
 	objectType privilege.ObjectType,
 ) error {
-	computePrivilegeChanges := func(prev, cur *catpb.UserPrivileges) (granted, revoked []string) {
+	computePrivilegeChanges := func(prev, cur *catpb.UserPrivileges) (granted, revoked []string, retErr error) {
 		// User has no privileges anymore after upsert, all privileges revoked.
+		prevPrivList, err := privilege.ListFromBitField(prev.Privileges, objectType)
+		if err != nil {
+			return nil, nil, err
+		}
 		if cur == nil {
-			revoked = privilege.ListFromBitField(prev.Privileges, objectType).SortedNames()
-			return nil, revoked
+			revoked = prevPrivList.SortedNames()
+			return nil, revoked, nil
 		}
 
 		// User privileges have not changed.
 		if prev.Privileges == cur.Privileges {
-			return nil, nil
+			return nil, nil, nil
 		}
 
 		// Construct a set of this user's old privileges (before upsert).
 		prevPrivilegeSet := make(map[string]struct{})
-		for _, priv := range privilege.ListFromBitField(prev.Privileges, objectType).SortedNames() {
+		for _, priv := range prevPrivList.SortedNames() {
 			prevPrivilegeSet[priv] = struct{}{}
 		}
 
 		// Compare with this user's new privileges.
-		for _, priv := range privilege.ListFromBitField(cur.Privileges, objectType).SortedNames() {
+		curPrivList, err := privilege.ListFromBitField(cur.Privileges, objectType)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, priv := range curPrivList.SortedNames() {
 			if _, ok := prevPrivilegeSet[priv]; !ok {
 				// New privileges that do not exist in the old privileges set imply that they have been granted.
 				granted = append(granted, priv)
@@ -252,7 +259,7 @@ func comparePrivileges(
 		}
 		sort.Strings(revoked)
 
-		return granted, revoked
+		return granted, revoked, nil
 	}
 
 	curUserPrivileges := existing.GetPrivileges().Users
@@ -266,7 +273,10 @@ func comparePrivileges(
 		prev := &prevUserPrivileges[i]
 		username := prev.User().Normalized()
 		cur := curUserMap[username]
-		granted, revoked := computePrivilegeChanges(prev, cur)
+		granted, revoked, err := computePrivilegeChanges(prev, cur)
+		if err != nil {
+			return err
+		}
 		delete(curUserMap, username)
 		if granted == nil && revoked == nil {
 			continue
@@ -283,7 +293,11 @@ func comparePrivileges(
 	for i := range curUserPrivileges {
 		username := curUserPrivileges[i].User().Normalized()
 		if _, ok := curUserMap[username]; ok {
-			granted := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType).SortedNames()
+			privList, err := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType)
+			if err != nil {
+				return err
+			}
+			granted := privList.SortedNames()
 			if granted == nil {
 				continue
 			}
@@ -742,8 +756,7 @@ func (p *planner) ForceDeleteTableData(ctx context.Context, descID int64) error 
 		Key: tableSpan.Key, EndKey: tableSpan.EndKey,
 	}
 	b := &kv.Batch{}
-	if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2UseDelRangeInGCJob) &&
-		storage.CanUseMVCCRangeTombstones(ctx, p.execCfg.Settings) {
+	if storage.CanUseMVCCRangeTombstones(ctx, p.execCfg.Settings) {
 		b.AddRawRequest(&kvpb.DeleteRangeRequest{
 			RequestHeader:           requestHeader,
 			UseRangeTombstone:       true,

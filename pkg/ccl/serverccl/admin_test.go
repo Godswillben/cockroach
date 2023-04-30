@@ -47,13 +47,14 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Need to disable the test tenant because this test fails
+	// when run through a tenant (with internal server error).
+	// More investigation is required. Tracked with #76387.
+	defaultTestTenant := base.TestTenantDisabled
 	testCluster := serverutils.StartNewTestCluster(t, 3,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				// Need to disable the test tenant because this test fails
-				// when run through a tenant (with internal server error).
-				// More investigation is required. Tracked with #76387.
-				DisableDefaultTestTenant: true,
+				DefaultTestTenant: defaultTestTenant,
 			},
 		})
 	defer testCluster.Stopper().Stop(context.Background())
@@ -80,6 +81,11 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	// Would use locality constraints except this test cluster hasn't been started up with localities.
 	sqlDB.Exec(t, `ALTER PARTITION us OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9001`)
 	sqlDB.Exec(t, `ALTER PARTITION eu OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9002`)
+
+	if defaultTestTenant == base.TestTenantDisabled {
+		// Make sure secondary tenants don't cause the endpoint to error.
+		sqlDB.Exec(t, "CREATE TENANT 'app'")
+	}
 
 	// Assert that we get all roachblog zone configs back.
 	expectedZoneConfigNames := map[string]struct{}{
@@ -125,12 +131,12 @@ func TestAdminAPIJobs(t *testing.T) {
 	defer dirCleanupFn()
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Fails with the default test tenant. Tracked with #76378.
-		DisableDefaultTestTenant: true,
-		ExternalIODir:            dir})
+		DefaultTestTenant: base.TestTenantDisabled,
+		ExternalIODir:     dir})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 
-	sqlDB.Exec(t, `BACKUP INTO 'nodelocal://0/backup/1?AWS_SECRET_ACCESS_KEY=neverappears'`)
+	sqlDB.Exec(t, `BACKUP INTO 'nodelocal://1/backup/1?AWS_SECRET_ACCESS_KEY=neverappears'`)
 
 	var jobsRes serverpb.JobsResponse
 	err := getAdminJSONProto(s, "jobs", &jobsRes)
@@ -165,7 +171,7 @@ func TestListTenants(t *testing.T) {
 
 	ctx := context.Background()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DisableDefaultTestTenant: true,
+		DefaultTestTenant: base.TestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -200,7 +206,7 @@ func TestTableAndDatabaseDetailsAndStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled})
 	defer s.Stopper().Stop(ctx)
 
 	st, db := serverutils.StartTenant(t, s, base.TestTenantArgs{

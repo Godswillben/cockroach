@@ -136,14 +136,17 @@ func (s *Container) RecordStatement(
 	stats.mu.data.RowsRead.Record(stats.mu.data.Count, float64(value.RowsRead))
 	stats.mu.data.RowsWritten.Record(stats.mu.data.Count, float64(value.RowsWritten))
 	stats.mu.data.LastExecTimestamp = s.getTimeNow()
-	stats.mu.data.Nodes = util.CombineUniqueInt64(stats.mu.data.Nodes, value.Nodes)
-	stats.mu.data.PlanGists = util.CombineUniqueString(stats.mu.data.PlanGists, []string{value.PlanGist})
+	stats.mu.data.Nodes = util.CombineUnique(stats.mu.data.Nodes, value.Nodes)
+	stats.mu.data.Regions = util.CombineUnique(stats.mu.data.Regions, value.Regions)
+	stats.mu.data.PlanGists = util.CombineUnique(stats.mu.data.PlanGists, []string{value.PlanGist})
 	stats.mu.data.IndexRecommendations = value.IndexRecommendations
-	stats.mu.data.Indexes = util.CombineUniqueString(stats.mu.data.Indexes, value.Indexes)
+	stats.mu.data.Indexes = util.CombineUnique(stats.mu.data.Indexes, value.Indexes)
 
 	// Percentile latencies are only being sampled if the latency was above the
 	// AnomalyDetectionLatencyThreshold.
-	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID)
+	// The Insights detector already does a flush when detecting for anomaly latency,
+	// so there is no need to force a flush when retrieving the data during this step.
+	latencies := s.latencyInformation.GetPercentileValues(stmtFingerprintID, false)
 	latencyInfo := appstatspb.LatencyInfo{
 		Min: value.ServiceLatency,
 		Max: value.ServiceLatency,
@@ -199,6 +202,11 @@ func (s *Container) RecordStatement(
 		cpuSQLNanos = value.ExecStats.CPUTime.Nanoseconds()
 	}
 
+	var errorCode string
+	if value.StatementError != nil {
+		errorCode = pgerror.GetPGCode(value.StatementError).String()
+	}
+
 	s.insights.ObserveStatement(value.SessionID, &insights.Statement{
 		ID:                   value.StatementID,
 		FingerprintID:        stmtFingerprintID,
@@ -218,6 +226,7 @@ func (s *Container) RecordStatement(
 		IndexRecommendations: value.IndexRecommendations,
 		Database:             value.Database,
 		CPUSQLNanos:          cpuSQLNanos,
+		ErrorCode:            errorCode,
 	})
 
 	return stats.ID, nil

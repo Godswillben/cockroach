@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/storage/pebbleiter"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -157,11 +156,6 @@ func (i *MVCCIterator) checkAllowedValidPos(span roachpb.Span, errIfDisallowed b
 	} else {
 		i.invalid = err != nil
 	}
-}
-
-// Key is part of the storage.MVCCIterator interface.
-func (i *MVCCIterator) Key() storage.MVCCKey {
-	return i.i.Key()
 }
 
 // Value is part of the storage.MVCCIterator interface.
@@ -426,9 +420,9 @@ func (i *EngineIterator) UnsafeRawEngineKey() []byte {
 	return i.i.UnsafeRawEngineKey()
 }
 
-// GetRawIter is part of the storage.EngineIterator interface.
-func (i *EngineIterator) GetRawIter() pebbleiter.Iterator {
-	return i.i.GetRawIter()
+// CloneContext is part of the storage.EngineIterator interface.
+func (i *EngineIterator) CloneContext() storage.CloneContext {
+	return i.i.CloneContext()
 }
 
 // Stats is part of the storage.EngineIterator interface.

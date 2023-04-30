@@ -16,7 +16,7 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │         │    ├── PUBLIC → ABSENT     UserPrivileges:{DescID: 108, Name: admin}
  │         │    ├── PUBLIC → ABSENT     UserPrivileges:{DescID: 108, Name: root}
  │         │    ├── PUBLIC → DROPPED    Table:{DescID: 108}
- │         │    ├── PUBLIC → ABSENT     ObjectParent:{DescID: 108, ReferencedDescID: 105}
+ │         │    ├── PUBLIC → ABSENT     SchemaChild:{DescID: 108, ReferencedDescID: 105}
  │         │    ├── PUBLIC → ABSENT     TablePartitioning:{DescID: 108}
  │         │    ├── PUBLIC → ABSENT     TableLocalityRegionalByRow:{DescID: 108}
  │         │    ├── PUBLIC → ABSENT     ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
@@ -42,7 +42,6 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │              ├── MarkDescriptorAsDropped {"DescriptorID":108}
  │              ├── RemoveObjectParent {"ObjectID":108,"ParentSchemaID":105}
  │              ├── NotImplementedForPublicObjects {"DescID":108,"ElementType":"scpb.TablePartit..."}
- │              ├── NotImplementedForPublicObjects {"DescID":108,"ElementType":"scpb.ColumnFamil..."}
  │              ├── MakePublicColumnWriteOnly {"ColumnID":1,"TableID":108}
  │              ├── SetColumnName {"ColumnID":1,"Name":"crdb_internal_co...","TableID":108}
  │              ├── MakePublicColumnNotNullValidated {"ColumnID":1,"TableID":108}
@@ -62,7 +61,8 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │              ├── RemoveUserPrivileges {"DescriptorID":108,"User":"admin"}
  │              ├── RemoveUserPrivileges {"DescriptorID":108,"User":"root"}
  │              ├── RemoveDroppedColumnType {"ColumnID":2,"TableID":108}
- │              └── UpdateTableBackReferencesInTypes {"BackReferencedTableID":108}
+ │              ├── UpdateTableBackReferencesInTypes {"BackReferencedTableID":108}
+ │              └── AssertColumnFamilyIsRemoved {"TableID":108}
  ├── PreCommitPhase
  │    ├── Stage 1 of 2 in PreCommitPhase
  │    │    ├── 27 elements transitioning toward ABSENT
@@ -71,7 +71,7 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │    │    │    ├── ABSENT     → PUBLIC UserPrivileges:{DescID: 108, Name: admin}
  │    │    │    ├── ABSENT     → PUBLIC UserPrivileges:{DescID: 108, Name: root}
  │    │    │    ├── DROPPED    → PUBLIC Table:{DescID: 108}
- │    │    │    ├── ABSENT     → PUBLIC ObjectParent:{DescID: 108, ReferencedDescID: 105}
+ │    │    │    ├── ABSENT     → PUBLIC SchemaChild:{DescID: 108, ReferencedDescID: 105}
  │    │    │    ├── ABSENT     → PUBLIC TablePartitioning:{DescID: 108}
  │    │    │    ├── ABSENT     → PUBLIC TableLocalityRegionalByRow:{DescID: 108}
  │    │    │    ├── ABSENT     → PUBLIC ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
@@ -102,7 +102,7 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │         │    ├── PUBLIC → ABSENT  UserPrivileges:{DescID: 108, Name: admin}
  │         │    ├── PUBLIC → ABSENT  UserPrivileges:{DescID: 108, Name: root}
  │         │    ├── PUBLIC → DROPPED Table:{DescID: 108}
- │         │    ├── PUBLIC → ABSENT  ObjectParent:{DescID: 108, ReferencedDescID: 105}
+ │         │    ├── PUBLIC → ABSENT  SchemaChild:{DescID: 108, ReferencedDescID: 105}
  │         │    ├── PUBLIC → ABSENT  TablePartitioning:{DescID: 108}
  │         │    ├── PUBLIC → ABSENT  TableLocalityRegionalByRow:{DescID: 108}
  │         │    ├── PUBLIC → ABSENT  ColumnFamily:{DescID: 108, Name: primary, ColumnFamilyID: 0}
@@ -130,7 +130,6 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │              ├── MarkDescriptorAsDropped {"DescriptorID":108}
  │              ├── RemoveObjectParent {"ObjectID":108,"ParentSchemaID":105}
  │              ├── NotImplementedForPublicObjects {"DescID":108,"ElementType":"scpb.TablePartit..."}
- │              ├── NotImplementedForPublicObjects {"DescID":108,"ElementType":"scpb.ColumnFamil..."}
  │              ├── MakePublicColumnWriteOnly {"ColumnID":1,"TableID":108}
  │              ├── SetColumnName {"ColumnID":1,"Name":"crdb_internal_co...","TableID":108}
  │              ├── MakePublicColumnNotNullValidated {"ColumnID":1,"TableID":108}
@@ -155,6 +154,7 @@ Schema change plan for DROP TABLE ‹multi_region_test_db›.‹public›.‹tab
  │              ├── RemoveColumnNotNull {"ColumnID":2,"TableID":108}
  │              ├── MakeWriteOnlyColumnDeleteOnly {"ColumnID":4294967295,"TableID":108}
  │              ├── MakeWriteOnlyColumnDeleteOnly {"ColumnID":4294967294,"TableID":108}
+ │              ├── AssertColumnFamilyIsRemoved {"TableID":108}
  │              ├── MakeWriteOnlyColumnDeleteOnly {"ColumnID":1,"TableID":108}
  │              ├── MakeWriteOnlyColumnDeleteOnly {"ColumnID":2,"TableID":108}
  │              ├── MakeDeleteOnlyColumnAbsent {"ColumnID":4294967295,"TableID":108}

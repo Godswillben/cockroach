@@ -46,7 +46,7 @@ type BackupOptions struct {
 	Detached                   *DBool
 	EncryptionKMSURI           StringOrPlaceholderOptList
 	IncrementalStorage         StringOrPlaceholderOptList
-	CoordinatorLocality        Expr
+	ExecutionLocality          Expr
 }
 
 var _ NodeFormatter = &BackupOptions{}
@@ -126,24 +126,25 @@ func (node Backup) Coverage() DescriptorCoverage {
 
 // RestoreOptions describes options for the RESTORE execution.
 type RestoreOptions struct {
-	EncryptionPassphrase       Expr
-	DecryptionKMSURI           StringOrPlaceholderOptList
-	IntoDB                     Expr
-	SkipMissingFKs             bool
-	SkipMissingSequences       bool
-	SkipMissingSequenceOwners  bool
-	SkipMissingViews           bool
-	SkipMissingUDFs            bool
-	Detached                   bool
-	SkipLocalitiesCheck        bool
-	DebugPauseOn               Expr
-	NewDBName                  Expr
-	IncludeAllSecondaryTenants Expr
-	IncrementalStorage         StringOrPlaceholderOptList
-	AsTenant                   Expr
-	ForceTenantID              Expr
-	SchemaOnly                 bool
-	VerifyData                 bool
+	EncryptionPassphrase             Expr
+	DecryptionKMSURI                 StringOrPlaceholderOptList
+	IntoDB                           Expr
+	SkipMissingFKs                   bool
+	SkipMissingSequences             bool
+	SkipMissingSequenceOwners        bool
+	SkipMissingViews                 bool
+	SkipMissingUDFs                  bool
+	Detached                         bool
+	SkipLocalitiesCheck              bool
+	DebugPauseOn                     Expr
+	NewDBName                        Expr
+	IncludeAllSecondaryTenants       Expr
+	IncrementalStorage               StringOrPlaceholderOptList
+	AsTenant                         Expr
+	ForceTenantID                    Expr
+	SchemaOnly                       bool
+	VerifyData                       bool
+	UnsafeRestoreIncompatibleVersion bool
 }
 
 var _ NodeFormatter = &RestoreOptions{}
@@ -297,10 +298,10 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&o.IncrementalStorage)
 	}
 
-	if o.CoordinatorLocality != nil {
+	if o.ExecutionLocality != nil {
 		maybeAddSep()
-		ctx.WriteString("coordinator_locality = ")
-		ctx.FormatNode(o.CoordinatorLocality)
+		ctx.WriteString("execution locality = ")
+		ctx.FormatNode(o.ExecutionLocality)
 	}
 
 	if o.IncludeAllSecondaryTenants != nil {
@@ -347,10 +348,10 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 		return errors.New("incremental_location option specified multiple times")
 	}
 
-	if o.CoordinatorLocality == nil {
-		o.CoordinatorLocality = other.CoordinatorLocality
-	} else if other.CoordinatorLocality != nil {
-		return errors.New("coordinator_locality option specified multiple times")
+	if o.ExecutionLocality == nil {
+		o.ExecutionLocality = other.ExecutionLocality
+	} else if other.ExecutionLocality != nil {
+		return errors.New("execution locality option specified multiple times")
 	}
 
 	if o.IncludeAllSecondaryTenants != nil {
@@ -372,7 +373,7 @@ func (o BackupOptions) IsDefault() bool {
 		cmp.Equal(o.EncryptionKMSURI, options.EncryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage) &&
-		o.CoordinatorLocality == options.CoordinatorLocality &&
+		o.ExecutionLocality == options.ExecutionLocality &&
 		o.IncludeAllSecondaryTenants == options.IncludeAllSecondaryTenants
 }
 
@@ -485,6 +486,11 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 	if o.VerifyData {
 		maybeAddSep()
 		ctx.WriteString("verify_backup_table_data")
+	}
+
+	if o.UnsafeRestoreIncompatibleVersion {
+		maybeAddSep()
+		ctx.WriteString("unsafe_restore_incompatible_version")
 	}
 }
 
@@ -618,6 +624,14 @@ func (o *RestoreOptions) CombineWith(other *RestoreOptions) error {
 		o.IncludeAllSecondaryTenants = other.IncludeAllSecondaryTenants
 	}
 
+	if o.UnsafeRestoreIncompatibleVersion {
+		if other.UnsafeRestoreIncompatibleVersion {
+			return errors.New("unsafe_restore_incompatible_version specified multiple times")
+		}
+	} else {
+		o.UnsafeRestoreIncompatibleVersion = other.UnsafeRestoreIncompatibleVersion
+	}
+
 	return nil
 }
 
@@ -641,7 +655,8 @@ func (o RestoreOptions) IsDefault() bool {
 		o.ForceTenantID == options.ForceTenantID &&
 		o.SchemaOnly == options.SchemaOnly &&
 		o.VerifyData == options.VerifyData &&
-		o.IncludeAllSecondaryTenants == options.IncludeAllSecondaryTenants
+		o.IncludeAllSecondaryTenants == options.IncludeAllSecondaryTenants &&
+		o.UnsafeRestoreIncompatibleVersion == options.UnsafeRestoreIncompatibleVersion
 }
 
 // BackupTargetList represents a list of targets.

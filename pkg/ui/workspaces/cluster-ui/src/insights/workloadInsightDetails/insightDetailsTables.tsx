@@ -19,6 +19,7 @@ import {
   TransactionDetailsLink,
 } from "../workloadInsights/util";
 import { TimeScale } from "../../timeScaleDropdown";
+import { Timestamp, Timezone } from "../../timestamp";
 
 interface InsightDetailsTableProps {
   data: ContentionEvent[];
@@ -28,7 +29,6 @@ interface InsightDetailsTableProps {
 
 export function makeInsightDetailsColumns(
   execType: InsightExecEnum,
-  setTimeScale: (tw: TimeScale) => void,
 ): ColumnDescriptor<ContentionEvent>[] {
   return [
     {
@@ -41,11 +41,7 @@ export function makeInsightDetailsColumns(
       name: "fingerprintID",
       title: insightsTableTitles.fingerprintID(execType),
       cell: (item: ContentionEvent) =>
-        TransactionDetailsLink(
-          item.fingerprintID,
-          item.startTime,
-          setTimeScale,
-        ),
+        TransactionDetailsLink(item.fingerprintID),
       sort: (item: ContentionEvent) => item.fingerprintID,
     },
     {
@@ -61,7 +57,7 @@ export function makeInsightDetailsColumns(
       ),
       cell: (item: ContentionEvent) =>
         item.stmtInsightEvent
-          ? StatementDetailsLink(item.stmtInsightEvent, setTimeScale)
+          ? StatementDetailsLink(item.stmtInsightEvent)
           : item.waitingStmtFingerprintID,
       sort: (item: ContentionEvent) => item.waitingStmtFingerprintID,
     },
@@ -74,8 +70,13 @@ export function makeInsightDetailsColumns(
     {
       name: "contentionStartTime",
       title: insightsTableTitles.contentionStartTime(execType),
-      cell: (item: ContentionEvent) =>
-        item.startTime?.format(DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT),
+      cell: (item: ContentionEvent) => (
+        <Timestamp
+          time={item.startTime}
+          format={DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT}
+          fallback={"N/A"}
+        />
+      ),
       sort: (item: ContentionEvent) => item.startTime.unix(),
     },
     {
@@ -114,7 +115,7 @@ export function makeInsightDetailsColumns(
 export const WaitTimeDetailsTable: React.FC<
   InsightDetailsTableProps
 > = props => {
-  const columns = makeInsightDetailsColumns(props.execType, props.setTimeScale);
+  const columns = makeInsightDetailsColumns(props.execType);
   const [sortSetting, setSortSetting] = useState<SortSetting>({
     ascending: false,
     columnTitle: "contention",
@@ -130,9 +131,7 @@ export const WaitTimeDetailsTable: React.FC<
   );
 };
 
-export function makeInsightStatementContentionColumns(
-  setTimeScale: (ts: TimeScale) => void,
-): ColumnDescriptor<ContentionDetails>[] {
+export function makeInsightStatementContentionColumns(): ColumnDescriptor<ContentionDetails>[] {
   const execType = InsightExecEnum.STATEMENT;
   return [
     {
@@ -145,11 +144,7 @@ export function makeInsightStatementContentionColumns(
       name: "fingerprintId",
       title: insightsTableTitles.fingerprintID(InsightExecEnum.TRANSACTION),
       cell: (item: ContentionDetails) =>
-        TransactionDetailsLink(
-          item.blockingTxnFingerprintID,
-          item.collectionTimeStamp,
-          setTimeScale,
-        ),
+        TransactionDetailsLink(item.blockingTxnFingerprintID),
       sort: (item: ContentionDetails) => item.blockingTxnFingerprintID,
     },
     {
@@ -189,13 +184,12 @@ interface InsightContentionTableProps {
   data: ContentionDetails[];
   sortSetting?: SortSetting;
   onChangeSortSetting?: (ss: SortSetting) => void;
-  setTimeScale: (ts: TimeScale) => void;
 }
 
 export const ContentionStatementDetailsTable: React.FC<
   InsightContentionTableProps
 > = props => {
-  const columns = makeInsightStatementContentionColumns(props.setTimeScale);
+  const columns = makeInsightStatementContentionColumns();
   return (
     <SortedTable
       className="statements-table"

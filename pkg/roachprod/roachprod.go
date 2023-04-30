@@ -45,7 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/debug/replay"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -80,7 +79,7 @@ func verifyClusterName(l *logger.Logger, clusterName, username string) error {
 		accounts = []string{username}
 	} else {
 		seenAccounts := map[string]bool{}
-		active, err := vm.FindActiveAccounts()
+		active, err := vm.FindActiveAccounts(l)
 		if err != nil {
 			return err
 		}
@@ -89,7 +88,7 @@ func verifyClusterName(l *logger.Logger, clusterName, username string) error {
 				seenAccounts[account] = true
 				cleanAccount := vm.DNSSafeAccount(account)
 				if cleanAccount != account {
-					log.Infof(context.TODO(), "WARN: using `%s' as username instead of `%s'", cleanAccount, account)
+					l.Printf("WARN: using `%s' as username instead of `%s'", cleanAccount, account)
 				}
 				accounts = append(accounts, cleanAccount)
 			}
@@ -189,7 +188,7 @@ func userClusterNameRegexp(l *logger.Logger) (*regexp.Regexp, error) {
 	// but we still want to function even if this is not
 	// the case.
 	seenAccounts := map[string]bool{}
-	accounts, err := vm.FindActiveAccounts()
+	accounts, err := vm.FindActiveAccounts(l)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +260,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syncClustersCache(cld); err != nil {
+	if err := syncClustersCache(l, cld); err != nil {
 		return nil, err
 	}
 
@@ -301,7 +300,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 			l.Printf("Refreshing DNS entries...")
 		}
 		if err := gce.SyncDNS(l, vms); err != nil {
-			fmt.Fprintf(l.Stderr, "failed to update %s DNS: %v", gce.Subdomain, err)
+			l.Errorf("failed to update %s DNS: %v", gce.Subdomain, err)
 		}
 	} else {
 		if !config.Quiet {
@@ -310,7 +309,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	}
 
 	if err := vm.ProvidersSequential(vm.AllProviderNames(), func(p vm.Provider) error {
-		return p.CleanSSH()
+		return p.CleanSSH(l)
 	}); err != nil {
 		return nil, err
 	}
@@ -321,7 +320,9 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 // List returns a cloud.Cloud struct of all roachprod clusters matching clusterNamePattern.
 // Alternatively, the 'listMine' option can be provided to get the clusters that are owned
 // by the current user.
-func List(l *logger.Logger, listMine bool, clusterNamePattern string) (cloud.Cloud, error) {
+func List(
+	l *logger.Logger, listMine bool, clusterNamePattern string, opts vm.ListOptions,
+) (cloud.Cloud, error) {
 	if err := LoadClusters(); err != nil {
 		return cloud.Cloud{}, err
 	}
@@ -345,7 +346,7 @@ func List(l *logger.Logger, listMine bool, clusterNamePattern string) (cloud.Clo
 		}
 	}
 
-	cld, err := Sync(l, vm.ListOptions{})
+	cld, err := Sync(l, opts)
 	if err != nil {
 		return cloud.Cloud{}, err
 	}
@@ -367,6 +368,7 @@ func Run(
 	secure bool,
 	stdout, stderr io.Writer,
 	cmdArray []string,
+	opts ...install.ParallelOption,
 ) error {
 	if err := LoadClusters(); err != nil {
 		return err
@@ -387,7 +389,7 @@ func Run(
 	if len(title) > 30 {
 		title = title[:27] + "..."
 	}
-	return c.Run(ctx, l, stdout, stderr, c.Nodes, title, cmd)
+	return c.Run(ctx, l, stdout, stderr, c.Nodes, title, cmd, opts...)
 }
 
 // RunWithDetails runs a command on the nodes in a cluster.
@@ -469,14 +471,13 @@ func IP(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		var err error
-		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
-			return res, err
-		}, install.DefaultSSHRetryOpts); err != nil {
+			return res, nil
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -548,7 +549,7 @@ func Reset(l *logger.Logger, clusterName string) error {
 	}
 
 	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
-		return p.Reset(vms)
+		return p.Reset(l, vms)
 	})
 }
 
@@ -583,7 +584,7 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string) error {
 			return lockErr
 		}
 		defer unlock()
-		return p.ConfigSSH(zones[p.Name()])
+		return p.ConfigSSH(l, zones[p.Name()])
 	}); err != nil {
 		return err
 	}
@@ -592,9 +593,10 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string) error {
 	// Run ssh-keygen -R serially on each new VM in case an IP address has been recycled
 	for _, v := range cloudCluster.VMs {
 		cmd := exec.Command("ssh-keygen", "-R", v.PublicIP)
+
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			log.Infof(context.TODO(), "could not clear ssh key for hostname %s:\n%s", v.PublicIP, string(out))
+			l.Printf("could not clear ssh key for hostname %s:\n%s", v.PublicIP, string(out))
 		}
 
 	}
@@ -620,7 +622,7 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string) error {
 	}
 	// Fetch public keys from gcloud to set up ssh access for all users into the
 	// shared ubuntu user.
-	installCluster.AuthorizedKeys, err = gce.GetUserAuthorizedKeys()
+	installCluster.AuthorizedKeys, err = gce.GetUserAuthorizedKeys(l)
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve authorized keys from gcloud")
 	}
@@ -642,7 +644,7 @@ func Extend(l *logger.Logger, clusterName string, lifetime time.Duration) error 
 		return fmt.Errorf("cluster %s does not exist", clusterName)
 	}
 
-	if err := cloud.ExtendCluster(c, lifetime); err != nil {
+	if err := cloud.ExtendCluster(l, c, lifetime); err != nil {
 		return err
 	}
 
@@ -737,6 +739,18 @@ func Stop(ctx context.Context, l *logger.Logger, clusterName string, opts StopOp
 		return err
 	}
 	return c.Stop(ctx, l, opts.Sig, opts.Wait, opts.MaxWait)
+}
+
+// Signal sends a signal to nodes in the cluster.
+func Signal(ctx context.Context, l *logger.Logger, clusterName string, sig int) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+	return c.Signal(ctx, l, sig)
 }
 
 // Init initializes the cluster.
@@ -859,7 +873,7 @@ func Put(
 // Get copies a remote file from the nodes in a cluster.
 // If the file is retrieved from multiple nodes the destination
 // file name will be prefixed with the node number.
-func Get(l *logger.Logger, clusterName, src, dest string) error {
+func Get(ctx context.Context, l *logger.Logger, clusterName, src, dest string) error {
 	if err := LoadClusters(); err != nil {
 		return err
 	}
@@ -867,7 +881,7 @@ func Get(l *logger.Logger, clusterName, src, dest string) error {
 	if err != nil {
 		return err
 	}
-	return c.Get(l, c.Nodes, src, dest)
+	return c.Get(ctx, l, c.Nodes, src, dest)
 }
 
 type PGURLOptions struct {
@@ -895,14 +909,13 @@ func PgURL(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		var err error
-		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
-			return res, err
-		}, install.DefaultSSHRetryOpts); err != nil {
+			return res, nil
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -929,37 +942,39 @@ type urlConfig struct {
 }
 
 func urlGenerator(
-	c *install.SyncedCluster, l *logger.Logger, nodes install.Nodes, config urlConfig,
+	c *install.SyncedCluster, l *logger.Logger, nodes install.Nodes, uConfig urlConfig,
 ) ([]string, error) {
 	var urls []string
 	for i, node := range nodes {
 		host := vm.Name(c.Name, int(node)) + "." + gce.Subdomain
 
 		// verify DNS is working / fallback to IPs if not.
-		if i == 0 && !config.usePublicIP {
+		if i == 0 && !uConfig.usePublicIP {
 			if _, err := net.LookupHost(host); err != nil {
-				fmt.Fprintf(l.Stderr, "no valid DNS (yet?). might need to re-run `sync`?\n")
-				config.usePublicIP = true
+				l.Errorf("no valid DNS (yet?). might need to re-run `sync`?")
+				uConfig.usePublicIP = true
 			}
 		}
 
-		if config.usePublicIP {
+		if uConfig.usePublicIP {
 			host = c.VMs[node-1].PublicIP
 		}
-		if config.port == 0 {
-			config.port = c.NodeUIPort(node)
+		if uConfig.port == 0 {
+			uConfig.port = c.NodeUIPort(node)
 		}
 		scheme := "http"
 		if c.Secure {
 			scheme = "https"
 		}
-		if !strings.HasPrefix(config.path, "/") {
-			config.path = "/" + config.path
+		if !strings.HasPrefix(uConfig.path, "/") {
+			uConfig.path = "/" + uConfig.path
 		}
-		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, config.port, config.path)
+		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, uConfig.port, uConfig.path)
 		urls = append(urls, url)
-		if config.openInBrowser {
-			if err := exec.Command("python", "-m", "webbrowser", url).Run(); err != nil {
+		if uConfig.openInBrowser {
+			cmd := exec.Command("python", "-m", "webbrowser", url)
+
+			if err := cmd.Run(); err != nil {
 				return nil, err
 			}
 		}
@@ -996,7 +1011,7 @@ type PprofOpts struct {
 }
 
 // Pprof TODO
-func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
+func Pprof(ctx context.Context, l *logger.Logger, clusterName string, opts PprofOpts) error {
 	if err := LoadClusters(); err != nil {
 		return err
 	}
@@ -1028,7 +1043,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 	httpClient := httputil.NewClientWithTimeout(timeout)
 	startTime := timeutil.Now().Unix()
 	nodes := c.TargetNodes()
-	failed, err := c.ParallelE(l, description, len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+	err = c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 		node := nodes[i]
 		res := &install.RunResultDetails{Node: node}
 		host := c.Host(node)
@@ -1048,11 +1063,11 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 		defer func() {
 			err := file.Close()
 			if err != nil && !errors.Is(err, oserror.ErrClosed) {
-				fmt.Fprintf(l.Stderr, "warning: could not close temporary file")
+				l.Errorf("warning: could not close temporary file")
 			}
 			err = os.Remove(file.Name())
 			if err != nil && !oserror.IsNotExist(err) {
-				fmt.Fprintf(l.Stderr, "warning: could not remove temporary file")
+				l.Errorf("warning: could not remove temporary file")
 			}
 		}()
 
@@ -1090,17 +1105,13 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 		outputFiles = append(outputFiles, outputFile)
 		mu.Unlock()
 		return res, nil
-	}, install.DefaultSSHRetryOpts)
+	}, install.WithDisplay(description))
 
 	for _, s := range outputFiles {
 		l.Printf("Created %s", s)
 	}
 
 	if err != nil {
-		sort.Slice(failed, func(i, j int) bool { return failed[i].Index < failed[j].Index })
-		for _, f := range failed {
-			fmt.Fprintf(l.Stderr, "%d: %+v: %s\n", f.Index, f.Err, f.Out)
-		}
 		exit.WithCode(exit.UnspecifiedError())
 	}
 
@@ -1112,6 +1123,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 				"-http", fmt.Sprintf(":%d", port),
 				file)
 			waitCommands = append(waitCommands, cmd)
+
 			if err := cmd.Start(); err != nil {
 				return err
 			}
@@ -1199,7 +1211,7 @@ func destroyCluster(cld *cloud.Cloud, l *logger.Logger, clusterName string) erro
 		return fmt.Errorf("cluster %s does not exist", clusterName)
 	}
 	l.Printf("Destroying cluster %s with %d nodes", clusterName, len(c.VMs))
-	return cloud.DestroyCluster(c)
+	return cloud.DestroyCluster(l, c)
 }
 
 func destroyLocalCluster(ctx context.Context, l *logger.Logger, clusterName string) error {
@@ -1237,7 +1249,7 @@ func cleanupFailedCreate(l *logger.Logger, clusterName string) error {
 		// before failing. Not an error.
 		return nil
 	}
-	return cloud.DestroyCluster(c)
+	return cloud.DestroyCluster(l, c)
 }
 
 // Create TODO
@@ -1286,11 +1298,11 @@ func Create(
 			if retErr == nil {
 				return
 			}
-			fmt.Fprintf(l.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
+			l.Errorf("Cleaning up partially-created cluster (prev err: %s)\n", retErr)
 			if err := cleanupFailedCreate(l, clusterName); err != nil {
-				fmt.Fprintf(l.Stderr, "Error while cleaning up partially-created cluster: %s\n", err)
+				l.Errorf("Error while cleaning up partially-created cluster: %s\n", err)
 			} else {
-				fmt.Fprintf(l.Stderr, "Cleaning up OK\n")
+				l.Errorf("Cleaning up OK\n")
 			}
 		}()
 	} else {
@@ -1334,7 +1346,7 @@ func GC(l *logger.Logger, dryrun bool) error {
 		// GCClusters depends on ListCloud so only call it if ListCloud runs without errors
 		err = cloud.GCClusters(l, cld, dryrun)
 	}
-	otherErr := cloud.GCAWSKeyPairs(dryrun)
+	otherErr := cloud.GCAWSKeyPairs(l, dryrun)
 	return errors.CombineErrors(err, otherErr)
 }
 
@@ -1356,7 +1368,7 @@ func Logs(l *logger.Logger, clusterName, dest, username string, logsOpts LogsOpt
 		return err
 	}
 	return c.Logs(
-		logsOpts.Dir, dest, username, logsOpts.Filter, logsOpts.ProgramFilter,
+		l, logsOpts.Dir, dest, username, logsOpts.Filter, logsOpts.ProgramFilter,
 		logsOpts.Interval, logsOpts.From, logsOpts.To, logsOpts.Out,
 	)
 }
@@ -1461,7 +1473,7 @@ func StartGrafana(
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Grafana dashboard: %s\n", url)
+	l.Printf("Grafana dashboard: %s", url)
 	return nil
 }
 
@@ -1582,7 +1594,7 @@ func SnapshotVolume(
 					nameSuffix = fmt.Sprintf("-%d", nodeID)
 				}
 				err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
-					sID, err := provider.SnapshotVolume(volume, name+nameSuffix, description, labels)
+					sID, err := provider.SnapshotVolume(l, volume, name+nameSuffix, description, labels)
 					if err != nil {
 						return err
 					}
@@ -1687,11 +1699,8 @@ func sendCaptureCommand(
 ) error {
 	nodes := c.TargetNodes()
 	httpClient := httputil.NewClientWithTimeout(0 /* timeout: None */)
-	_, err := c.ParallelE(l,
-		fmt.Sprintf("Performing workload capture %s", action),
-		len(nodes),
-		0,
-		func(i int) (*install.RunResultDetails, error) {
+	_, err := c.ParallelE(ctx, l, len(nodes),
+		func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			host := c.Host(node)
@@ -1755,7 +1764,7 @@ func sendCaptureCommand(
 				}
 			}
 			return res, res.Err
-		}, install.DefaultSSHRetryOpts)
+		}, install.WithDisplay(fmt.Sprintf("Performing workload capture %s", action)))
 	return err
 }
 
@@ -1784,17 +1793,17 @@ func createAttachMountVolumes(
 			opts.Zone = cVM.Zone
 			opts.Labels = labels
 
-			volume, err := provider.CreateVolume(opts)
+			volume, err := provider.CreateVolume(l, opts)
 			if err != nil {
 				return err
 			}
 			l.Printf("Created Volume %s", volume.ProviderResourceID)
-			device, err := cVM.AttachVolume(volume)
+			device, err := cVM.AttachVolume(l, volume)
 			if err != nil {
 				return err
 			}
 			// Save the cluster to cache
-			err = saveCluster(&c.Cluster)
+			err = saveCluster(l, &c.Cluster)
 			if err != nil {
 				return err
 			}
@@ -1809,5 +1818,21 @@ func createAttachMountVolumes(
 		}
 		l.Printf("Successfully mounted volume to %s", cVM.ProviderID)
 	}
+	return nil
+}
+
+func FixLongRunningAWSHostnames(ctx context.Context, l *logger.Logger, clusterName string) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+
+	if err := c.FixLongRunningAWSHostnames(ctx, l); err != nil {
+		return err
+	}
+	l.Printf("Done! You are now able to use your AWS cluster normally.")
 	return nil
 }

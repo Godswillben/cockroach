@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -195,6 +196,7 @@ func runOneRoundQueryComparison(
 		sqlsmith.UnlikelyRandomNulls(), sqlsmith.DisableCrossJoins(),
 		sqlsmith.DisableIndexHints(), sqlsmith.DisableWith(), sqlsmith.DisableDecimals(),
 		sqlsmith.LowProbabilityWhereClauseWithJoinTables(),
+		sqlsmith.DisableUDFs(),
 		sqlsmith.SetComplexity(.3),
 		sqlsmith.SetScalarComplexity(.1),
 	)
@@ -299,10 +301,22 @@ type queryComparisonHelper struct {
 	statementsAndExplains []sqlAndOutput
 }
 
-// runQuery runs the given query and returns the output. As a side effect, it
-// also saves the query, the query plan, and the output of running the query so
-// they can be logged in case of failure.
+// runQuery runs the given query and returns the output. If the stmt doesn't
+// result in an error, as a side effect, it also saves the query, the query
+// plan, and the output of running the query so they can be logged in case of
+// failure.
 func (h *queryComparisonHelper) runQuery(stmt string) ([][]string, error) {
+	// Log this statement with a timestamp but commented out. This will help in
+	// cases when the stmt will get stuck and the whole test will time out (in
+	// such a scenario, since the stmt didn't execute successfully, it won't get
+	// logged by the caller).
+	h.logStmt(fmt.Sprintf("-- %s: %s", timeutil.Now(),
+		// Remove all newline symbols to log this stmt as a single line. This
+		// way this auxiliary logging takes up less space (if the stmt executes
+		// successfully, it'll still get logged with the nice formatting).
+		strings.ReplaceAll(stmt, "\n", "")),
+	)
+
 	runQueryImpl := func(stmt string) ([][]string, error) {
 		rows, err := h.conn.Query(stmt)
 		if err != nil {
@@ -323,11 +337,14 @@ func (h *queryComparisonHelper) runQuery(stmt string) ([][]string, error) {
 	}
 
 	// Now run the query and save the output.
-	h.statements = append(h.statements, stmt)
 	rows, err := runQueryImpl(stmt)
 	if err != nil {
 		return nil, err
 	}
+	// Only save the stmt on success - this makes it easier to reproduce the
+	// log. The caller still can include it into the statements later if
+	// necessary.
+	h.statements = append(h.statements, stmt)
 	h.statementsAndExplains = append(h.statementsAndExplains, sqlAndOutput{sql: stmt, output: rows})
 	return rows, nil
 }

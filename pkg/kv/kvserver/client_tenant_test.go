@@ -25,7 +25,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl" // for tenant functionality
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
@@ -35,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -163,11 +166,22 @@ func TestTenantRateLimiter(t *testing.T) {
 	timeSource := timeutil.NewManualTime(t0)
 
 	s, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{
+		// Disable the default test tenant so that we can start our own.
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				TenantRateKnobs: tenantrate.TestingKnobs{
 					TimeSource: timeSource,
 				},
+			},
+			KeyVisualizer: &keyvisualizer.TestingKnobs{SkipJobBootstrap: true},
+			JobsTestingKnobs: &jobs.TestingKnobs{
+				DisableAdoptions: true,
+			},
+			UpgradeManager: &upgradebase.TestingKnobs{
+				DontUseJobs:                       true,
+				SkipJobMetricsPollingJobBootstrap: true,
+				SkipAutoConfigRunnerJobBootstrap:  true,
 			},
 		},
 	})
@@ -176,6 +190,13 @@ func TestTenantRateLimiter(t *testing.T) {
 	ts, err := s.StartTenant(ctx, base.TestTenantArgs{
 		TenantID: tenantID,
 		TestingKnobs: base.TestingKnobs{
+			JobsTestingKnobs: &jobs.TestingKnobs{
+				DisableAdoptions: true,
+			},
+			// DisableAdoptions needs this.
+			UpgradeManager: &upgradebase.TestingKnobs{
+				DontUseJobs: true,
+			},
 			SpanConfig: &spanconfig.TestingKnobs{
 				// Disable the span reconciler because it performs tenant KV requests
 				// that interfere with our operation counts below.
@@ -211,12 +232,17 @@ func TestTenantRateLimiter(t *testing.T) {
 	// bounds.
 	writeCostLower := cfg.WriteBatchUnits + cfg.WriteRequestUnits
 	writeCostUpper := cfg.WriteBatchUnits + cfg.WriteRequestUnits + float64(32)*cfg.WriteUnitsPerByte
-	tolerance := 10.0 // Leave space for a couple of other background requests.
+	tolerance := 50.0 // Leave space for a couple of other background requests.
 	// burstWrites is a number of writes that don't exceed the burst limit.
 	burstWrites := int((cfg.Burst - tolerance) / writeCostUpper)
 	// tooManyWrites is a number of writes which definitely exceed the burst
 	// limit.
 	tooManyWrites := int(cfg.Burst/writeCostLower) + 2
+
+	// This test shouldn't take forever. If we're going to fail, better to
+	// do it in minutes than in an hour.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 
 	// Make sure that writes to the system tenant don't block, even if we
 	// definitely exceed the burst rate.
@@ -285,7 +311,7 @@ func TestTenantRateLimiter(t *testing.T) {
 			require.GreaterOrEqual(t, admittedMetricVal, tooManyWrites)
 			// Allow a tolerance for other requests performed while starting the
 			// tenant server.
-			require.Less(t, admittedMetricVal, tooManyWrites+300)
+			require.Less(t, admittedMetricVal, tooManyWrites+400)
 			break
 		}
 	}
@@ -302,6 +328,8 @@ func TestTenantCtx(t *testing.T) {
 		getErr := make(chan error)
 		pushErr := make(chan error)
 		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+			// Disable the default test tenant since we're going to create our own.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {

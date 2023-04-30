@@ -1038,6 +1038,16 @@ func MustBeDDecimal(e Expr) DDecimal {
 	panic(errors.AssertionFailedf("expected *DDecimal, found %T", e))
 }
 
+// AsDDecimal attempts to retrieve a DDecimal from an Expr, returning a DDecimal and
+// a flag signifying whether the assertion was successful.
+func AsDDecimal(e Expr) (*DDecimal, bool) {
+	switch t := e.(type) {
+	case *DDecimal:
+		return t, true
+	}
+	return nil, false
+}
+
 // ParseDDecimal parses and returns the *DDecimal Datum value represented by the
 // provided string, or an error if parsing is unsuccessful.
 func ParseDDecimal(s string) (*DDecimal, error) {
@@ -3612,6 +3622,45 @@ func NewDJSON(j json.JSON) *DJSON {
 	return &DJSON{j}
 }
 
+// IsComposite implements the CompositeDatum interface.
+func (d *DJSON) IsComposite() bool {
+	switch d.JSON.Type() {
+	case json.NumberJSONType:
+		dec, ok := d.JSON.AsDecimal()
+		if !ok {
+			panic(errors.AssertionFailedf("could not convert into JSON Decimal"))
+		}
+		DDec := DDecimal{Decimal: *dec}
+		return DDec.IsComposite()
+	case json.ArrayJSONType:
+		jsonArray, ok := d.AsArray()
+		if !ok {
+			panic(errors.AssertionFailedf("could not extract the JSON Array"))
+		}
+		for _, elem := range jsonArray {
+			dJsonVal := DJSON{elem}
+			if dJsonVal.IsComposite() {
+				return true
+			}
+		}
+	case json.ObjectJSONType:
+		if it, err := d.ObjectIter(); it != nil && err == nil {
+			// Assumption: no collated strings are present as JSON keys.
+			// Thus, JSON keys are not being checked if they are
+			// composite or not.
+			for it.Next() {
+				valDJSON := NewDJSON(it.Value())
+				if valDJSON.IsComposite() {
+					return true
+				}
+			}
+		} else if err != nil {
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "could not receive an ObjectKeyIterator"))
+		}
+	}
+	return false
+}
+
 // ParseDJSON takes a string of JSON and returns a DJSON value.
 func ParseDJSON(s string) (Datum, error) {
 	j, err := json.ParseJSON(s)
@@ -4059,7 +4108,7 @@ func (d *DTSVector) Min(_ CompareContext) (Datum, bool) {
 
 // Size implements the Datum interface.
 func (d *DTSVector) Size() uintptr {
-	return uintptr(len(d.TSVector.String()))
+	return uintptr(d.TSVector.StringSize())
 }
 
 // AsDTSVector attempts to retrieve a DTSVector from an Expr, returning a

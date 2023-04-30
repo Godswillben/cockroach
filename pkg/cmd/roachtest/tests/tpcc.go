@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -94,11 +93,6 @@ type tpccOptions struct {
 	// also be doing a rolling-restart into the new binary while the cluster
 	// is running, but that feels like jamming too much into the tpcc setup.
 	Start func(context.Context, test.Test, cluster.Cluster)
-	// EnableCircuitBreakers causes the kv.replica_circuit_breaker.slow_replication_threshold
-	// setting to be populated, which enables per-Replica circuit breakers.
-	//
-	// TODO(tbg): remove this once https://github.com/cockroachdb/cockroach/issues/74705 is completed.
-	EnableCircuitBreakers bool
 	// SkipPostRunCheck, if set, skips post TPC-C run checks.
 	SkipPostRunCheck              bool
 	DisableDefaultScheduledBackup bool
@@ -166,10 +160,6 @@ func setupTPCC(
 		opts.Start(ctx, t, c)
 		db := c.Conn(ctx, t.L(), 1)
 		defer db.Close()
-		if opts.EnableCircuitBreakers {
-			_, err := db.Exec(`SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '15s'`)
-			require.NoError(t, err)
-		}
 
 		if t.SkipInit() {
 			return
@@ -409,7 +399,7 @@ func runTPCCMixedHeadroom(
 		bankRows = 1000
 	}
 
-	history, err := clusterupgrade.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
+	history, err := version.PredecessorHistory(*t.BuildVersion(), versionsToUpgrade)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +491,7 @@ func registerTPCC(r registry.Registry) {
 		// running with the max supported warehouses.
 		Name:              "tpcc/headroom/" + headroomSpec.String(),
 		Owner:             registry.OwnerTestEng,
-		Tags:              []string{`default`, `release_qualification`},
+		Tags:              registry.Tags(`default`, `release_qualification`, `aws`),
 		Cluster:           headroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -509,10 +499,9 @@ func registerTPCC(r registry.Registry) {
 			headroomWarehouses := int(float64(maxWarehouses) * 0.7)
 			t.L().Printf("computed headroom warehouses of %d\n", headroomWarehouses)
 			runTPCC(ctx, t, c, tpccOptions{
-				Warehouses:            headroomWarehouses,
-				Duration:              120 * time.Minute,
-				SetupType:             usingImport,
-				EnableCircuitBreakers: true,
+				Warehouses: headroomWarehouses,
+				Duration:   120 * time.Minute,
+				SetupType:  usingImport,
 			})
 		},
 	})
@@ -523,11 +512,12 @@ func registerTPCC(r registry.Registry) {
 		// node and on a mixed version cluster which runs its long-running
 		// migrations while TPCC runs. It simulates a real production
 		// deployment in the middle of the migration into a new cluster version.
-		Name:  "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
-		Owner: registry.OwnerTestEng,
+		Name:    "tpcc/mixed-headroom/" + mixedHeadroomSpec.String(),
+		Timeout: 5 * time.Hour,
+		Owner:   registry.OwnerTestEng,
 		// TODO(tbg): add release_qualification tag once we know the test isn't
 		// buggy.
-		Tags:              []string{`default`},
+		Tags:              registry.Tags(`default`),
 		Cluster:           mixedHeadroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -537,8 +527,9 @@ func registerTPCC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		// run the same mixed-headroom test, but going back two versions
 		Name:              "tpcc/mixed-headroom/multiple-upgrades/" + mixedHeadroomSpec.String(),
+		Timeout:           5 * time.Hour,
 		Owner:             registry.OwnerTestEng,
-		Tags:              []string{`default`},
+		Tags:              registry.Tags(`default`),
 		Cluster:           mixedHeadroomSpec,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -562,7 +553,7 @@ func registerTPCC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "weekly/tpcc/headroom",
 		Owner:   registry.OwnerTestEng,
-		Tags:    []string{`weekly`},
+		Tags:    registry.Tags(`weekly`),
 		Cluster: r.MakeClusterSpec(4, spec.CPU(16)),
 		// Give the test a generous extra 10 hours to load the dataset and
 		// slowly ramp up the load.
@@ -835,6 +826,7 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehouses: gceOrAws(cloud, 3500, 3900),
 		EstimatedMax:   gceOrAws(cloud, 2900, 3500),
+		Tags:           registry.Tags(`aws`),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes: 12,
@@ -843,7 +835,7 @@ func registerTPCC(r registry.Registry) {
 		LoadWarehouses: gceOrAws(cloud, 11500, 11500),
 		EstimatedMax:   gceOrAws(cloud, 10000, 10000),
 
-		Tags: []string{`weekly`},
+		Tags: registry.Tags(`weekly`),
 	})
 	registerTPCCBenchSpec(r, tpccBenchSpec{
 		Nodes:        6,
@@ -871,6 +863,36 @@ func registerTPCC(r registry.Registry) {
 
 		LoadWarehouses: 2000,
 		EstimatedMax:   900,
+	})
+
+	// Encryption-At-Rest benchmarks. These are duplicates of variants above,
+	// using encrypted stores.
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  4,
+
+		LoadWarehouses:    1000,
+		EstimatedMax:      gceOrAws(cloud, 750, 900),
+		EncryptionEnabled: true,
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 3,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 3500, 3900),
+		EstimatedMax:      gceOrAws(cloud, 2900, 3500),
+		EncryptionEnabled: true,
+		Tags:              registry.Tags(`aws`),
+	})
+	registerTPCCBenchSpec(r, tpccBenchSpec{
+		Nodes: 12,
+		CPUs:  16,
+
+		LoadWarehouses:    gceOrAws(cloud, 11500, 11500),
+		EstimatedMax:      gceOrAws(cloud, 10000, 10000),
+		EncryptionEnabled: true,
+
+		Tags: registry.Tags(`weekly`),
 	})
 }
 
@@ -957,10 +979,8 @@ type tpccBenchSpec struct {
 	// change (i.e. CockroachDB gets faster!).
 	EstimatedMax int
 
-	// MinVersion to pass to testRegistryImpl.Add.
-	MinVersion string
 	// Tags to pass to testRegistryImpl.Add.
-	Tags []string
+	Tags map[string]struct{}
 	// EncryptionEnabled determines if the benchmark uses encrypted stores (i.e.
 	// Encryption-At-Rest / EAR).
 	EncryptionEnabled bool
@@ -1007,7 +1027,10 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 		nameParts = append(nameParts, "chaos")
 	}
 
-	opts := []spec.Option{spec.CPU(b.CPUs), spec.HighMem(b.HighMem)}
+	opts := []spec.Option{spec.CPU(b.CPUs)}
+	if b.HighMem {
+		opts = append(opts, spec.Mem(spec.High))
+	}
 	switch b.Distribution {
 	case singleZone:
 		// No specifier.
@@ -1043,15 +1066,11 @@ func registerTPCCBenchSpec(r registry.Registry, b tpccBenchSpec) {
 	numNodes := b.Nodes + b.LoadConfig.numLoadNodes(b.Distribution)
 	nodes := r.MakeClusterSpec(numNodes, opts...)
 
-	minVersion := b.MinVersion
-	if minVersion == "" {
-		minVersion = "v19.1.0" // needed for import
-	}
-
 	r.Add(registry.TestSpec{
 		Name:              name,
 		Owner:             owner,
 		Cluster:           nodes,
+		Timeout:           7 * time.Hour,
 		Tags:              b.Tags,
 		EncryptionSupport: encryptionSupport,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -1507,34 +1526,6 @@ func registerTPCCBench(r registry.Registry) {
 
 			LoadWarehouses: 10000,
 			EstimatedMax:   8000,
-		},
-
-		// Encryption-At-Rest benchmarks. These are duplicates of variants above,
-		// using encrypted stores.
-		{
-			Nodes: 3,
-			CPUs:  4,
-
-			LoadWarehouses:    1000,
-			EstimatedMax:      325,
-			EncryptionEnabled: true,
-		},
-		{
-			Nodes: 3,
-			CPUs:  16,
-
-			LoadWarehouses:    2000,
-			EstimatedMax:      1300,
-			EncryptionEnabled: true,
-		},
-		{
-			Nodes: 12,
-			CPUs:  16,
-
-			LoadWarehouses:    10000,
-			EstimatedMax:      6000,
-			LoadConfig:        singlePartitionedLoadgen,
-			EncryptionEnabled: true,
 		},
 	}
 

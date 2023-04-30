@@ -98,10 +98,19 @@ type RoutineExpr struct {
 	// its inputs are NULL. If false, the function will not be evaluated in the
 	// presence of null inputs, and will instead evaluate directly to NULL.
 	//
-	// NOTE: This boolean only affects evaluation of set-returning Routines.
+	// NOTE: This boolean only affects evaluation of Routines within project-set
+	// operators. This can apply to scalar routines if they are used as data
+	// source (e.g. SELECT * FROM scalar_udf()), and always applies to
+	// set-returning routines.
 	// Strict non-set-returning routines are not invoked when their arguments
 	// are NULL because optbuilder wraps them in a CASE expressions.
 	CalledOnNullInput bool
+
+	// MultiColOutput is true if the function may return multiple columns.
+	MultiColOutput bool
+
+	// Generator is true if the function may output a set of rows.
+	Generator bool
 }
 
 // NewTypedRoutineExpr returns a new RoutineExpr that is well-typed.
@@ -112,6 +121,8 @@ func NewTypedRoutineExpr(
 	typ *types.T,
 	enableStepping bool,
 	calledOnNullInput bool,
+	multiColOutput bool,
+	generator bool,
 ) *RoutineExpr {
 	return &RoutineExpr{
 		Args:              args,
@@ -120,6 +131,8 @@ func NewTypedRoutineExpr(
 		EnableStepping:    enableStepping,
 		Name:              name,
 		CalledOnNullInput: calledOnNullInput,
+		MultiColOutput:    multiColOutput,
+		Generator:         generator,
 	}
 }
 

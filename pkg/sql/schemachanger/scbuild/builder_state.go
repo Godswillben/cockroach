@@ -146,19 +146,23 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 	panic(errors.AssertionFailedf("unsupported incumbent target %s", oldTarget.Status()))
 }
 
+func (b *builderState) upsertElementState(es elementState) {
+	if existing := b.getExistingElementState(es.element); existing != nil {
+		if err := b.localMemAcc.Grow(b.ctx, es.byteSize()-existing.byteSize()); err != nil {
+			panic(err)
+		}
+		*existing = es
+	} else {
+		b.addNewElementState(es)
+	}
+}
+
 func (b *builderState) getExistingElementState(e scpb.Element) *elementState {
 	if e == nil {
 		panic(errors.AssertionFailedf("cannot define target for nil element"))
 	}
 	id := screl.GetDescID(e)
-	if b.newDescriptors.Contains(id) {
-		if _, ok := b.descCache[id]; !ok {
-			b.descCache[id] = b.newCachedDescForNewDesc()
-		}
-	} else {
-		b.ensureDescriptor(id)
-	}
-
+	b.ensureDescriptor(id)
 	c := b.descCache[id]
 
 	key := screl.ElementString(e)
@@ -175,6 +179,9 @@ func (b *builderState) getExistingElementState(e scpb.Element) *elementState {
 }
 
 func (b *builderState) addNewElementState(es elementState) {
+	if err := b.localMemAcc.Grow(b.ctx, es.byteSize()); err != nil {
+		panic(err)
+	}
 	id := screl.GetDescID(es.element)
 	key := screl.ElementString(es.element)
 	c := b.descCache[id]
@@ -690,6 +697,7 @@ func (b *builderState) BackReferences(id catid.DescID) scbuildstmt.ElementResult
 	{
 		b.ensureDescriptor(id)
 		c := b.descCache[id]
+		b.resolveBackReferences(c)
 		c.backrefs.ForEach(ids.Add)
 		c.backrefs.ForEach(b.ensureDescriptor)
 		for i := range b.output {
@@ -1098,6 +1106,8 @@ func (b *builderState) ResolveUDF(
 		panic(err)
 	}
 
+	// ResolveUDF is not concerned with builtin functions that are defined using
+	// a SQL string, so we don't check ol.HasSQLBody() here.
 	if !ol.IsUDF {
 		panic(
 			errors.Errorf(
@@ -1132,35 +1142,14 @@ func (b *builderState) newCachedDescForNewDesc() *cachedDesc {
 	}
 }
 
-func (b *builderState) ensureDescriptor(id catid.DescID) {
-	if _, found := b.descCache[id]; found {
+// resolveBackReferences resolves any back references that will take
+// additional look ups. This type of scan operation is expensive, so
+// limit to when its actually needed.
+func (b *builderState) resolveBackReferences(c *cachedDesc) {
+	// Already resolved, no need for extra work.
+	if c.backrefsResolved {
 		return
 	}
-	c := b.newCachedDesc(id)
-	// Collect privileges
-	if !c.hasOwnership {
-		var err error
-		c.hasOwnership, err = b.auth.HasOwnership(b.ctx, c.desc)
-		if err != nil {
-			panic(err)
-		}
-	}
-	// Collect backrefs and elements.
-	b.descCache[id] = c
-	crossRefLookupFn := func(id catid.DescID) catalog.Descriptor {
-		return b.readDescriptor(id)
-	}
-	visitorFn := func(status scpb.Status, e scpb.Element) {
-		b.addNewElementState(elementState{
-			element: e,
-			initial: status,
-			current: status,
-			target:  scpb.AsTargetStatus(status),
-		})
-	}
-
-	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn,
-		b.commentGetter, b.zoneConfigReader, b.evalCtx.Settings.Version.ActiveVersion(b.ctx))
 	// Name prefix and namespace lookups.
 	switch d := c.desc.(type) {
 	case catalog.DatabaseDescriptor:
@@ -1190,8 +1179,6 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 	case catalog.SchemaDescriptor:
 		b.ensureDescriptor(c.desc.GetParentID())
 		db := b.descCache[c.desc.GetParentID()].desc
-		c.prefix.CatalogName = tree.Name(db.GetName())
-		c.prefix.ExplicitCatalog = true
 		// Handle special case of schema children, which have to be added to
 		// the back-referenced ID set but which aren't explicitly referenced in
 		// the schema descriptor itself.
@@ -1200,6 +1187,60 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 			c.backrefs.Add(desc.GetID())
 			return nil
 		})
+	default:
+		// These are always done
+	}
+	c.backrefsResolved = true
+}
+
+// ensureDescriptor ensures descriptor `id` is "tracked" inside the builder state,
+// as a *cacheDesc.
+// For newly created descriptors, it merely creates a zero-valued *cacheDesc entry;
+// For existing descriptors, it creates and populate the *cacheDesc entry and
+// decompose it into elements (as tracked in b.output).
+func (b *builderState) ensureDescriptor(id catid.DescID) {
+	if _, found := b.descCache[id]; found {
+		return
+	}
+	if b.newDescriptors.Contains(id) {
+		b.descCache[id] = b.newCachedDescForNewDesc()
+		return
+	}
+
+	c := b.newCachedDesc(id)
+	// Collect privileges
+	if !c.hasOwnership {
+		var err error
+		c.hasOwnership, err = b.auth.HasOwnership(b.ctx, c.desc)
+		if err != nil {
+			panic(err)
+		}
+	}
+	// Collect backrefs and elements.
+	b.descCache[id] = c
+	crossRefLookupFn := func(id catid.DescID) catalog.Descriptor {
+		return b.readDescriptor(id)
+	}
+	visitorFn := func(status scpb.Status, e scpb.Element) {
+		b.addNewElementState(elementState{
+			element: e,
+			initial: status,
+			current: status,
+			target:  scpb.AsTargetStatus(status),
+		})
+	}
+
+	c.backrefs = scdecomp.WalkDescriptor(b.ctx, c.desc, crossRefLookupFn, visitorFn,
+		b.commentGetter, b.zoneConfigReader, b.evalCtx.Settings.Version.ActiveVersion(b.ctx))
+	// Name prefix and namespace lookups.
+	switch c.desc.(type) {
+	case catalog.DatabaseDescriptor:
+		// Nothing to do here.
+	case catalog.SchemaDescriptor:
+		b.ensureDescriptor(c.desc.GetParentID())
+		db := b.descCache[c.desc.GetParentID()].desc
+		c.prefix.CatalogName = tree.Name(db.GetName())
+		c.prefix.ExplicitCatalog = true
 	default:
 		b.ensureDescriptor(c.desc.GetParentID())
 		db := b.descCache[c.desc.GetParentID()].desc
@@ -1255,13 +1296,16 @@ func (b *builderState) BuildUserPrivilegesFromDefaultPrivileges(
 	if err != nil {
 		panic(err)
 	}
-	pd := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	pd, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		dbDesc.GetDefaultPrivilegeDescriptor(),
 		scDesc.GetDefaultPrivilegeDescriptor(),
 		db.DatabaseID,
 		b.CurrentUser(),
 		objType,
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	owner := &scpb.Owner{
 		DescriptorID: descID,

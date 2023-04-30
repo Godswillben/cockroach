@@ -130,7 +130,6 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"flow_id",
 			"node_id",
 			"since",
-			"status",
 			"crdb_internal.hide_sql_constants(stmt) as stmt",
 		},
 	},
@@ -304,6 +303,7 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"crdb_internal.hide_sql_constants(create_statement) as create_statement",
 			"crdb_internal.hide_sql_constants(alter_statements) as alter_statements",
 			"crdb_internal.hide_sql_constants(create_nofks) as create_nofks",
+			"crdb_internal.redact(create_redactable) as create_redactable",
 		},
 	},
 	// Ditto, for CREATE TYPE.
@@ -377,18 +377,25 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 	"crdb_internal.system_jobs": {
 		// `payload` column may contain customer info, such as URI params
 		// containing access keys, encryption salts, etc.
-		nonSensitiveCols: NonSensitiveColumns{
+		customQueryUnredacted: `SELECT *, 
+			to_hex(payload) AS hex_payload, 
+			to_hex(progress) AS hex_progress 
+			FROM crdb_internal.system_jobs`,
+		customQueryRedacted: `SELECT 
 			"id",
 			"status",
 			"created",
+			'redacted' AS "payload",
 			"progress",
 			"created_by_type",
 			"created_by_id",
 			"claim_session_id",
 			"claim_instance_id",
 			"num_runs",
-			"last_run",
-		},
+			"last_run", 
+			'<redacted>' AS "hex_payload", 
+			to_hex(progress) AS "hex_progress"
+			FROM crdb_internal.system_jobs`,
 	},
 	"crdb_internal.kv_node_liveness": {
 		nonSensitiveCols: NonSensitiveColumns{
@@ -616,7 +623,6 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 			"node_id",
 			"stmt",
 			"since",
-			"status",
 			"crdb_internal.hide_sql_constants(stmt) as stmt",
 		},
 	},
@@ -905,6 +911,13 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 			"implicit_count",
 		},
 	},
+	"crdb_internal.node_tenant_capabilities_cache": {
+		nonSensitiveCols: NonSensitiveColumns{
+			"tenant_id",
+			"capability_name",
+			"capability_value",
+		},
+	},
 }
 
 /**
@@ -920,6 +933,8 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
  * 	- system.statement_statistics: historical data, usually too much to
  *    download.
  * 	- system.transaction_statistics: ditto
+ *  - system.statement_activity: ditto
+ *  - system.transaction_activity: ditto
  *
  * A test makes this assertion in pkg/cli/zip_table_registry.go:TestNoForbiddenSystemTablesInDebugZip
  */
@@ -932,9 +947,6 @@ var zipSystemTables = DebugZipTableRegistry{
 		},
 	},
 	"system.descriptor": {
-		// `descriptor` column can contain customer-supplied default values
-		// for columns, e.g. `column_name STRING DEFAULT 'some value'`
-		nonSensitiveCols: NonSensitiveColumns{"id"},
 		customQueryUnredacted: `SELECT
 				id,
 				descriptor,
@@ -966,28 +978,38 @@ var zipSystemTables = DebugZipTableRegistry{
 		},
 	},
 	"system.jobs": {
-		// `payload` column may contain customer info, such as URI params
+		// NB: `payload` column may contain customer info, such as URI params
 		// containing access keys, encryption salts, etc.
-		nonSensitiveCols: NonSensitiveColumns{
-			"id",
-			"status",
-			"created",
-			"progress",
-			"created_by_type",
-			"created_by_id",
-			"claim_session_id",
-			"claim_instance_id",
-			"num_runs",
-			"last_run",
-		},
 		customQueryUnredacted: `SELECT *, 
 			to_hex(payload) AS hex_payload, 
 			to_hex(progress) AS hex_progress 
 			FROM system.jobs`,
-		customQueryRedacted: `SELECT *,
-			NULL AS hex_payload,
+		customQueryRedacted: `SELECT id,
+			status,
+			created,
+			'<redacted>' as payload,
+			progress,
+			created_by_type,
+			created_by_id,
+			claim_session_id,
+			claim_instance_id,
+			num_runs,
+			last_run,
+			'<redacted>' AS hex_payload,
 			to_hex(progress) AS hex_progress
 			FROM system.jobs`,
+	},
+	"system.job_info": {
+		// `value` column may contain customer info, such as URI params
+		// containing access keys, encryption salts, etc.
+		customQueryUnredacted: `SELECT *,
+			to_hex(value) AS hex_value
+			FROM system.job_info`,
+		customQueryRedacted: `SELECT job_id,
+			info_key,
+			written,
+			'redacted' AS value
+			FROM system.job_info`,
 	},
 	"system.lease": {
 		nonSensitiveCols: NonSensitiveColumns{
@@ -1207,6 +1229,30 @@ var zipSystemTables = DebugZipTableRegistry{
 			`"distinctCount"`,
 			`"nullCount"`,
 			`"avgSize"`,
+		},
+	},
+	"system.task_payloads": {
+		// `value` column may contain customer info, such as URI params
+		// containing access keys, encryption salts, etc.
+		// `description` is user-defined and may contain PII.
+		nonSensitiveCols: NonSensitiveColumns{
+			"id",
+			"created",
+			"owner",
+			"owner_id",
+			"min_version",
+			"type",
+		},
+	},
+	"system.tenant_tasks": {
+		nonSensitiveCols: NonSensitiveColumns{
+			"tenant_id",
+			"issuer",
+			"task_id",
+			"created",
+			"payload_id",
+			"owner",
+			"owner_id",
 		},
 	},
 	"system.tenant_settings": {

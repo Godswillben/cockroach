@@ -23,7 +23,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t1 DROP CONSTRAINT t1_i_fkey;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED ForeignKeyConstraint:{DescID: 105, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 2 Mutation operations
 │           │
@@ -67,7 +67,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t1 DROP CONSTRAINT t1_i_fkey;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED ForeignKeyConstraint:{DescID: 105, IndexID: 0, ConstraintID: 2, ReferencedDescID: 104}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 5 Mutation operations
 │           │
@@ -115,7 +115,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t1 DROP CONSTRAINT t1_i_fkey;
         │       │     rule: "ForeignKeyConstraint transitions to ABSENT uphold 2-version invariant: VALIDATED->ABSENT"
         │       │
         │       └── • Precedence dependency from ABSENT ConstraintWithoutIndexName:{DescID: 105, Name: t1_i_fkey, ConstraintID: 2}
-        │             rule: "dependents removed before constraint"
+        │             rule: "Constraint should be hidden before name"
         │
         └── • 5 Mutation operations
             │

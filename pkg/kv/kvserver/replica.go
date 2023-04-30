@@ -15,7 +15,6 @@ import (
 	"sort"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/docs"
@@ -97,19 +96,30 @@ var StrictGCEnforcement = settings.RegisterBoolSetting(
 	true,
 )
 
+type atomicDescInfo struct {
+	full           redact.RedactableString
+	fullUnredacted string // `full.StripMarkers()` for use in String() without extra allocs
+	idOnly         string // "<RangeID>/<ReplicaID>" only
+}
+
 type atomicDescString struct {
-	strPtr unsafe.Pointer
+	v atomic.Value // *atomicDescInfo
 }
 
 // store atomically updates d.strPtr with the string representation of desc.
 func (d *atomicDescString) store(replicaID roachpb.ReplicaID, desc *roachpb.RangeDescriptor) {
-	str := redact.Sprintfn(func(w redact.SafePrinter) {
+	printRid := func(w redact.SafePrinter) {
 		w.Printf("%d/", desc.RangeID)
 		if replicaID == 0 {
-			w.SafeString("?:")
+			w.SafeString("?")
 		} else {
-			w.Printf("%d:", replicaID)
+			w.Printf("%d", replicaID)
 		}
+	}
+
+	str := redact.Sprintfn(func(w redact.SafePrinter) {
+		printRid(w)
+		w.SafeString(":")
 
 		if !desc.IsInitialized() {
 			w.SafeString("{-}")
@@ -120,24 +130,37 @@ func (d *atomicDescString) store(replicaID roachpb.ReplicaID, desc *roachpb.Rang
 		}
 	})
 
-	atomic.StorePointer(&d.strPtr, unsafe.Pointer(&str))
+	ridOnly := redact.Sprintfn(func(w redact.SafePrinter) {
+		printRid(w)
+	}).StripMarkers()
+
+	d.v.Store(&atomicDescInfo{
+		full:           str,
+		fullUnredacted: str.StripMarkers(),
+		idOnly:         ridOnly,
+	})
 }
 
 // String returns the string representation of the range; since we are not
 // using a lock, the copy might be inconsistent.
 func (d *atomicDescString) String() string {
-	return d.get().StripMarkers()
+	return d.get().fullUnredacted
+}
+
+// ID returns `rX/Y`, i.e. omits the key range portion.
+func (d *atomicDescString) ID() string {
+	return d.get().idOnly
 }
 
 // SafeFormat renders the string safely.
 func (d *atomicDescString) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Print(d.get())
+	w.Print(d.get().full)
 }
 
 // Get returns the string representation of the range; since we are not
 // using a lock, the copy might be inconsistent.
-func (d *atomicDescString) get() redact.RedactableString {
-	return *(*redact.RedactableString)(atomic.LoadPointer(&d.strPtr))
+func (d *atomicDescString) get() *atomicDescInfo {
+	return d.v.Load().(*atomicDescInfo)
 }
 
 // atomicConnectionClass stores an rpc.ConnectionClass atomically.
@@ -405,7 +428,8 @@ type Replica struct {
 		// thus invalid) even when lastIndexNotDurable is known, in which case the
 		// term will have to be retrieved from the Raft log entry. Use the
 		// invalidLastTerm constant for this case.
-		lastIndexNotDurable, lastTermNotDurable uint64
+		lastIndexNotDurable kvpb.RaftIndex
+		lastTermNotDurable  kvpb.RaftTerm
 		// A map of raft log index of pending snapshots to deadlines.
 		// Used to prohibit raft log truncations that would leave a gap between
 		// the snapshot and the new first index. The map entry has a zero
@@ -501,7 +525,6 @@ type Replica struct {
 		// Instead, the buffer internally holds a reference to mu and will use
 		// it appropriately.
 		proposalBuf propBuf
-
 		// proposals stores the Raft in-flight commands which originated at this
 		// Replica, i.e. all commands for which propose has been called, but which
 		// have not yet applied. A proposal is "pending" until it is "finalized",
@@ -706,7 +729,7 @@ type Replica struct {
 		// The base index is the index up to (including) which quota was already
 		// released. That is, the first element in quotaReleaseQueue below is
 		// released as the base index moves up by one, etc.
-		proposalQuotaBaseIndex uint64
+		proposalQuotaBaseIndex kvpb.RaftIndex
 
 		// Once the leader observes a proposal come 'out of Raft', we add the size
 		// of the associated command to a queue of quotas we have yet to release
@@ -1592,13 +1615,8 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	var shouldExtend bool
-	postRUnlock := func() {}
 	r.mu.RLock()
-	defer func() {
-		r.mu.RUnlock()
-		postRUnlock()
-	}()
+	defer r.mu.RUnlock()
 
 	// Has the replica been initialized?
 	// NB: this should have already been checked in Store.Send, so we don't need
@@ -1623,7 +1641,7 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		return kvserverpb.LeaseStatus{}, err
 	}
 
-	st, shouldExtend, err := r.checkLeaseRLocked(ctx, ba)
+	st, err := r.checkLeaseRLocked(ctx, ba)
 	if err != nil {
 		return kvserverpb.LeaseStatus{}, err
 	}
@@ -1647,13 +1665,6 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		}
 	}
 
-	if shouldExtend {
-		// If we're asked to extend the lease, trigger (async) lease renewal.
-		// Kicking this off requires an exclusive lock, and we hold a read-only lock
-		// already, so we jump through a hoop to run it in a suitably positioned
-		// defer.
-		postRUnlock = func() { r.maybeExtendLeaseAsync(ctx, st) }
-	}
 	return st, nil
 }
 
@@ -1717,12 +1728,10 @@ func (r *Replica) checkExecutionCanProceedRWOrAdmin(
 // checkLeaseRLocked checks the provided batch against the GC
 // threshold and lease. A nil error indicates to go ahead with the batch, and
 // is accompanied either by a valid or zero lease status, the latter case
-// indicating that the request was permitted to bypass the lease check. The
-// returned bool indicates whether the lease should be extended (only on nil
-// error).
+// indicating that the request was permitted to bypass the lease check.
 func (r *Replica) checkLeaseRLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
-) (kvserverpb.LeaseStatus, bool, error) {
+) (kvserverpb.LeaseStatus, error) {
 	now := r.Clock().NowAsClockTimestamp()
 	// If the request is a write or a consistent read, it requires the
 	// replica serving it to hold the range lease. We pass the write
@@ -1734,7 +1743,6 @@ func (r *Replica) checkLeaseRLocked(
 	reqTS := ba.WriteTimestamp()
 	st := r.leaseStatusForRequestRLocked(ctx, now, reqTS)
 
-	var shouldExtend bool
 	// Write commands that skip the lease check in practice are exactly
 	// RequestLease and TransferLease. Both use the provided previous lease for
 	// verification below raft. We return a zero lease status from this method and
@@ -1745,26 +1753,24 @@ func (r *Replica) checkLeaseRLocked(
 	// doesn't check the lease.
 	if !ba.IsSingleSkipsLeaseCheckRequest() && ba.ReadConsistency != kvpb.INCONSISTENT {
 		// Check the lease.
-		var err error
-		shouldExtend, err = r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
+		err := r.leaseGoodToGoForStatusRLocked(ctx, now, reqTS, st)
 		if err != nil {
 			// No valid lease, but if we can serve this request via follower reads,
 			// we may continue.
 			if !r.canServeFollowerReadRLocked(ctx, ba) {
 				// If not, return the error.
-				return kvserverpb.LeaseStatus{}, false, err
+				return kvserverpb.LeaseStatus{}, err
 			}
 			// Otherwise, suppress the error. Also, remember that we're not serving
 			// this under the lease by zeroing out the status. We also intentionally
 			// do not pass the original status to checkTSAboveGCThreshold as
 			// this method assumes that a valid status indicates that this replica
-			// holds the lease (see #73123). `shouldExtend` is already false in this
-			// branch, but for completeness we zero it out as well.
-			st, shouldExtend, err = kvserverpb.LeaseStatus{}, false, nil
+			// holds the lease (see #73123).
+			st, err = kvserverpb.LeaseStatus{}, nil
 		}
 	}
 
-	return st, shouldExtend, nil
+	return st, nil
 }
 
 // checkExecutionCanProceedForRangeFeed returns an error if a rangefeed request
@@ -2247,9 +2253,9 @@ func (r *Replica) GetLeaseHistory() []roachpb.Lease {
 	return r.leaseHistory.get()
 }
 
-// EnableLeaseHistory turns on the lease history for testing purposes. Returns
-// a function to return it to its original state that can be deferred.
-func EnableLeaseHistory(maxEntries int) func() {
+// EnableLeaseHistoryForTesting turns on the lease history for testing purposes.
+// Returns a function to return it to its original state that can be deferred.
+func EnableLeaseHistoryForTesting(maxEntries int) func() {
 	originalValue := leaseHistoryMaxEntries
 	leaseHistoryMaxEntries = maxEntries
 	return func() {
@@ -2310,6 +2316,12 @@ func (r *Replica) measureNanosRunning(start time.Duration, f func(float64)) {
 // tracker state.
 func (r *Replica) GetLoadStatsForTesting() *load.ReplicaLoad {
 	return r.loadStats
+}
+
+// HasOutstandingLearnerSnapshotInFlightForTesting is for use only by tests to
+// gather whether there are in-flight snapshots to learner replcas.
+func (r *Replica) HasOutstandingLearnerSnapshotInFlightForTesting() bool {
+	return r.errOnOutstandingLearnerSnapshotInflight() != nil
 }
 
 // ReadProtectedTimestampsForTesting is for use only by tests to read and update

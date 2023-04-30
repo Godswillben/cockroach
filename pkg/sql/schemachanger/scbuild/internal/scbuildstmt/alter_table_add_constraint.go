@@ -50,11 +50,12 @@ func alterTableAddConstraint(
 				panic(sqlerrors.NewUnsupportedUnvalidatedConstraintError(catconstants.ConstraintTypeUnique))
 			}
 			CreateIndex(b, &tree.CreateIndex{
-				Name:      d.Name,
-				Table:     *tn,
-				Unique:    true,
-				Columns:   d.Columns,
-				Predicate: d.Predicate,
+				Name:        d.Name,
+				Table:       *tn,
+				Unique:      true,
+				Columns:     d.Columns,
+				Predicate:   d.Predicate,
+				IfNotExists: d.IfNotExists,
 			})
 		}
 	case *tree.CheckConstraintTableDef:
@@ -442,11 +443,11 @@ func alterTableAddUniqueWithoutIndex(
 			"partitioned unique constraints without an index are not supported",
 		))
 	}
-	if d.NotVisible {
+	if d.Invisibility != 0.0 {
 		// Theoretically, this should never happen because this is not supported by
 		// the parser. This is just a safe check.
 		panic(pgerror.Newf(pgcode.FeatureNotSupported,
-			"creating a unique constraint using UNIQUE WITH NOT VISIBLE INDEX is not supported",
+			"creating a unique constraint using UNIQUE WITHOUT NOT VISIBLE INDEX is not supported",
 		))
 	}
 

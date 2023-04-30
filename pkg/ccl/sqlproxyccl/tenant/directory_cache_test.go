@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -35,9 +34,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
-
-// To ensure tenant startup code is included.
-var _ = kvtenantccl.Connector{}
 
 func TestDirectoryErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -500,7 +496,7 @@ func newTestDirectoryCache(
 			Insecure: true,
 			// Test fails when run within a tenant. More investigation
 			// is required here. Tracked with #76387.
-			DisableDefaultTestTenant: true,
+			DefaultTestTenant: base.TestTenantDisabled,
 		},
 	})
 	clusterStopper := tc.Stopper()

@@ -1164,6 +1164,37 @@ func FindIndexPartitioning(b ElementStatusIterator) (current Status, target Targ
 	return current, target, element
 }
 
+func (e IndexZoneConfig) element() {}
+
+// ForEachIndexZoneConfig iterates over elements of type IndexZoneConfig.
+func ForEachIndexZoneConfig(
+	b ElementStatusIterator, fn func(current Status, target TargetStatus, e *IndexZoneConfig),
+) {
+  if b == nil {
+    return
+  }
+	b.ForEachElementStatus(func(current Status, target TargetStatus, e Element) {
+		if elt, ok := e.(*IndexZoneConfig); ok {
+			fn(current, target, elt)
+		}
+	})
+}
+
+// FindIndexZoneConfig finds the first element of type IndexZoneConfig.
+func FindIndexZoneConfig(b ElementStatusIterator) (current Status, target TargetStatus, element *IndexZoneConfig) {
+  if b == nil {
+    return current, target, element
+  }
+	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
+		if elt, ok := e.(*IndexZoneConfig); ok {
+			element = elt
+			current = c
+			target = t
+		}
+	})
+	return current, target, element
+}
+
 func (e Namespace) element() {}
 
 // ForEachNamespace iterates over elements of type Namespace.
@@ -1187,37 +1218,6 @@ func FindNamespace(b ElementStatusIterator) (current Status, target TargetStatus
   }
 	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
 		if elt, ok := e.(*Namespace); ok {
-			element = elt
-			current = c
-			target = t
-		}
-	})
-	return current, target, element
-}
-
-func (e ObjectParent) element() {}
-
-// ForEachObjectParent iterates over elements of type ObjectParent.
-func ForEachObjectParent(
-	b ElementStatusIterator, fn func(current Status, target TargetStatus, e *ObjectParent),
-) {
-  if b == nil {
-    return
-  }
-	b.ForEachElementStatus(func(current Status, target TargetStatus, e Element) {
-		if elt, ok := e.(*ObjectParent); ok {
-			fn(current, target, elt)
-		}
-	})
-}
-
-// FindObjectParent finds the first element of type ObjectParent.
-func FindObjectParent(b ElementStatusIterator) (current Status, target TargetStatus, element *ObjectParent) {
-  if b == nil {
-    return current, target, element
-  }
-	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
-		if elt, ok := e.(*ObjectParent); ok {
 			element = elt
 			current = c
 			target = t
@@ -1342,6 +1342,37 @@ func FindSchema(b ElementStatusIterator) (current Status, target TargetStatus, e
   }
 	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
 		if elt, ok := e.(*Schema); ok {
+			element = elt
+			current = c
+			target = t
+		}
+	})
+	return current, target, element
+}
+
+func (e SchemaChild) element() {}
+
+// ForEachSchemaChild iterates over elements of type SchemaChild.
+func ForEachSchemaChild(
+	b ElementStatusIterator, fn func(current Status, target TargetStatus, e *SchemaChild),
+) {
+  if b == nil {
+    return
+  }
+	b.ForEachElementStatus(func(current Status, target TargetStatus, e Element) {
+		if elt, ok := e.(*SchemaChild); ok {
+			fn(current, target, elt)
+		}
+	})
+}
+
+// FindSchemaChild finds the first element of type SchemaChild.
+func FindSchemaChild(b ElementStatusIterator) (current Status, target TargetStatus, element *SchemaChild) {
+  if b == nil {
+    return current, target, element
+  }
+	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
+		if elt, ok := e.(*SchemaChild); ok {
 			element = elt
 			current = c
 			target = t
@@ -1776,6 +1807,37 @@ func FindTablePartitioning(b ElementStatusIterator) (current Status, target Targ
   }
 	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
 		if elt, ok := e.(*TablePartitioning); ok {
+			element = elt
+			current = c
+			target = t
+		}
+	})
+	return current, target, element
+}
+
+func (e TableSchemaLocked) element() {}
+
+// ForEachTableSchemaLocked iterates over elements of type TableSchemaLocked.
+func ForEachTableSchemaLocked(
+	b ElementStatusIterator, fn func(current Status, target TargetStatus, e *TableSchemaLocked),
+) {
+  if b == nil {
+    return
+  }
+	b.ForEachElementStatus(func(current Status, target TargetStatus, e Element) {
+		if elt, ok := e.(*TableSchemaLocked); ok {
+			fn(current, target, elt)
+		}
+	})
+}
+
+// FindTableSchemaLocked finds the first element of type TableSchemaLocked.
+func FindTableSchemaLocked(b ElementStatusIterator) (current Status, target TargetStatus, element *TableSchemaLocked) {
+  if b == nil {
+    return current, target, element
+  }
+	b.ForEachElementStatus(func(c Status, t TargetStatus, e Element) {
+		if elt, ok := e.(*TableSchemaLocked); ok {
 			element = elt
 			current = c
 			target = t

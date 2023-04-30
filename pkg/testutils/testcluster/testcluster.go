@@ -28,17 +28,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -63,8 +65,8 @@ type TestCluster struct {
 
 	// Connection to the storage cluster. Typically, the first connection in
 	// Conns, but could be different if we're transparently running in a test
-	// tenant (see the DisableDefaultTestTenant flag of base.TestServerArgs for
-	// more detail).
+	// tenant (see the DefaultTestTenant flag of base.TestServerArgs for more
+	// detail).
 	storageConn *gosql.DB
 	stopper     *stop.Stopper
 	mu          struct {
@@ -121,17 +123,13 @@ func (tc *TestCluster) Stopper() *stop.Stopper {
 // StartedDefaultTestTenant returns whether this cluster started a default
 // test tenant.
 func (tc *TestCluster) StartedDefaultTestTenant() bool {
-	return !tc.Servers[0].Cfg.DisableDefaultTestTenant
+	return tc.Servers[0].StartedDefaultTestTenant()
 }
 
 // TenantOrServer returns either the ith server in the cluster or the tenant server associated with
 // the ith server if the cluster started with a default test tenant.
 func (tc *TestCluster) TenantOrServer(idx int) serverutils.TestTenantInterface {
-	s := tc.Server(idx)
-	if tc.StartedDefaultTestTenant() {
-		return s.TestTenants()[0]
-	}
-	return s
+	return tc.Server(idx).TenantOrServer()
 }
 
 // stopServers stops the stoppers for each individual server in the cluster.
@@ -203,8 +201,7 @@ func (tc *TestCluster) stopServers(ctx context.Context) {
 				fmt.Fprintln(&buf, trace)
 				fmt.Fprintln(&buf)
 			}
-			sl := make([]byte, 5<<20 /* 5mb */)
-			sl = sl[:runtime.Stack(sl, true /* all */)]
+			sl := allstacks.Get()
 			return errors.Newf("%s\n\ngoroutines of interest: %v\nstacks:\n\n%s", buf.String(), ids, sl)
 		})
 	}
@@ -359,7 +356,7 @@ func (tc *TestCluster) Start(t testing.TB) {
 	// (validated below).
 	probabilisticallyStartTestTenant := false
 	if !tc.Servers[0].Cfg.DisableDefaultTestTenant {
-		probabilisticallyStartTestTenant = serverutils.ShouldStartDefaultTestTenant(t)
+		probabilisticallyStartTestTenant = serverutils.ShouldStartDefaultTestTenant(t, tc.serverArgs[0])
 	}
 
 	startedTestTenant := true
@@ -400,6 +397,10 @@ func (tc *TestCluster) Start(t testing.TB) {
 		}
 	}
 
+	if tc.StartedDefaultTestTenant() {
+		t.Log(serverutils.DefaultTestTenantMessage)
+	}
+
 	if tc.clusterArgs.ParallelStart {
 		for i := 0; i < nodes; i++ {
 			if err := <-errCh; err != nil {
@@ -408,6 +409,14 @@ func (tc *TestCluster) Start(t testing.TB) {
 		}
 
 		tc.WaitForNStores(t, tc.NumServers(), tc.Servers[0].Gossip())
+	}
+
+	// Now that we have started all the servers on the bootstrap version, let us
+	// run the migrations up to the overridden BinaryVersion.
+	if v := tc.Servers[0].BinaryVersionOverride(); v != (roachpb.Version{}) {
+		if _, err := tc.Conns[0].Exec(`SET CLUSTER SETTING version = $1`, v.String()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// No need to disable the merge queue for SQL servers, as they don't have
@@ -562,6 +571,12 @@ func (tc *TestCluster) AddServer(serverArgs base.TestServerArgs) (*server.TestSe
 		return nil, err
 	}
 	s := srv.(*server.TestServer)
+
+	// If we only allowed probabilistic starting of the test tenant, we disable
+	// starting additional tenants, even if we didn't start the test tenant.
+	if serverArgs.DefaultTestTenant == base.TestTenantProbabilisticOnly {
+		s.DisableStartTenant(serverutils.PreventStartTenantError)
+	}
 
 	tc.Servers = append(tc.Servers, s)
 	tc.serverArgs = append(tc.serverArgs, serverArgs)
@@ -848,6 +863,14 @@ func (tc *TestCluster) WaitForVoters(
 	return tc.waitForNewReplicas(startKey, true /* waitForVoter */, targets...)
 }
 
+// WaitForVotersOrFatal is the same as WaitForVoters but it will Fatal the test
+// on error.
+func (tc *TestCluster) WaitForVotersOrFatal(
+	t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+) {
+	require.NoError(t, tc.WaitForVoters(startKey, targets...))
+}
+
 // waitForNewReplicas waits for each of the targets to have a fully initialized
 // replica of the range indicated by startKey.
 //
@@ -1051,11 +1074,25 @@ func (tc *TestCluster) IncrClockForLeaseUpgrade(t *testing.T, clock *hlc.HybridM
 	)
 }
 
+// MaybeWaitForLeaseUpgrade waits until the lease held for the given range
+// descriptor is upgraded to an epoch-based one, but only if we expect the lease
+// to be upgraded.
+func (tc *TestCluster) MaybeWaitForLeaseUpgrade(
+	ctx context.Context, t *testing.T, desc roachpb.RangeDescriptor,
+) {
+	if kvserver.ExpirationLeasesOnly.Get(&tc.Server(0).ClusterSettings().SV) {
+		return
+	}
+	tc.WaitForLeaseUpgrade(ctx, t, desc)
+}
+
 // WaitForLeaseUpgrade waits until the lease held for the given range descriptor
 // is upgraded to an epoch-based one.
 func (tc *TestCluster) WaitForLeaseUpgrade(
 	ctx context.Context, t *testing.T, desc roachpb.RangeDescriptor,
 ) {
+	require.False(t, kvserver.ExpirationLeasesOnly.Get(&tc.Server(0).ClusterSettings().SV),
+		"cluster configured to only use expiration leases")
 	testutils.SucceedsSoon(t, func() error {
 		li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
 		require.NoError(t, err)
@@ -1396,6 +1433,47 @@ func (tc *TestCluster) WaitForFullReplication() error {
 	return nil
 }
 
+// WaitFor5NodeReplication ensures that zone configs are applied and
+// up-replication is performed with new zone configs. This is the case for 5+
+// node clusters.
+// TODO: This code should be moved into WaitForFullReplication once #99812 is
+// fixed so that all test would benefit from this check implicitly.
+// This bug currently prevents LastUpdated to tick in metamorphic tests
+// with kv.expiration_leases_only.enabled = true.
+func (tc *TestCluster) WaitFor5NodeReplication() error {
+	if len(tc.Servers) > 4 && tc.ReplicationMode() == base.ReplicationAuto {
+		// We need to wait for zone config propagations before we could check
+		// conformance since zone configs are propagated synchronously.
+		// Generous timeout is added to allow rangefeeds to catch up. On startup
+		// they could get delayed making test to fail.
+		err := tc.WaitForZoneConfigPropagation()
+		if err != nil {
+			return err
+		}
+		return tc.WaitForFullReplication()
+	}
+	return nil
+}
+
+// WaitForZoneConfigPropagation ensures that all span config subscribers caught
+// up till now. That would guarantee that zone configs set prior to this call
+// are applied.
+func (tc *TestCluster) WaitForZoneConfigPropagation() error {
+	now := tc.Server(0).Clock().Now()
+	for _, s := range tc.Servers {
+		scs := s.SpanConfigKVSubscriber().(spanconfig.KVSubscriber)
+		if err := testutils.SucceedsSoonError(func() error {
+			if scs.LastUpdated().Less(now) {
+				return errors.New("zone configs not propagated")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // WaitForNodeStatuses waits until a NodeStatus is persisted for every node and
 // store in the cluster.
 func (tc *TestCluster) WaitForNodeStatuses(t testing.TB) {
@@ -1457,8 +1535,7 @@ func (tc *TestCluster) ReplicationMode() base.TestClusterReplicationMode {
 	return tc.clusterArgs.ReplicationMode
 }
 
-// ToggleReplicateQueues activates or deactivates the replication queues on all
-// the stores on all the nodes.
+// ToggleReplicateQueues implements TestClusterInterface.
 func (tc *TestCluster) ToggleReplicateQueues(active bool) {
 	for _, s := range tc.Servers {
 		_ = s.Stores().VisitStores(func(store *kvserver.Store) error {
@@ -1778,9 +1855,7 @@ func (tc *TestCluster) SplitTable(
 
 // WaitForTenantCapabilities implements TestClusterInterface.
 func (tc *TestCluster) WaitForTenantCapabilities(
-	t *testing.T,
-	tenID roachpb.TenantID,
-	capabilityNames ...tenantcapabilitiespb.TenantCapabilityName,
+	t *testing.T, tenID roachpb.TenantID, targetCaps map[tenantcapabilities.ID]string,
 ) {
 	for i, ts := range tc.Servers {
 		testutils.SucceedsSoon(t, func() error {
@@ -1788,31 +1863,19 @@ func (tc *TestCluster) WaitForTenantCapabilities(
 				return nil
 			}
 
-			if len(capabilityNames) > 0 {
-				missingCapabilityError := func(capabilityName tenantcapabilitiespb.TenantCapabilityName) error {
-					return errors.Newf("server=%d tenant %s does not have capability %q", i, tenID, capabilityName)
+			if len(targetCaps) > 0 {
+				missingCapabilityError := func(capID tenantcapabilities.ID) error {
+					return errors.Newf("server=%d tenant %s cap %q not at expected value", i, tenID, capID)
 				}
 				capabilities, found := ts.Server.TenantCapabilitiesReader().GetCapabilities(tenID)
 				if !found {
-					return missingCapabilityError(capabilityNames[0])
+					return errors.Newf("capabilities not ready for tenant %s", tenID)
 				}
 
-				for _, capabilityName := range capabilityNames {
-					switch capabilityName {
-					case tenantcapabilitiespb.CanAdminSplit:
-						if !capabilities.CanAdminSplit {
-							return missingCapabilityError(capabilityName)
-						}
-					case tenantcapabilitiespb.CanViewNodeInfo:
-						if !capabilities.CanViewNodeInfo {
-							return missingCapabilityError(capabilityName)
-						}
-					case tenantcapabilitiespb.CanViewTSDBMetrics:
-						if !capabilities.CanViewTSDBMetrics {
-							return missingCapabilityError(capabilityName)
-						}
-					default:
-						t.Fatalf("unrecognized capability: %q", capabilityName)
+				for capID, expectedValue := range targetCaps {
+					curVal := tenantcapabilities.MustGetValueByID(capabilities, capID).String()
+					if curVal != expectedValue {
+						return missingCapabilityError(capID)
 					}
 				}
 			}

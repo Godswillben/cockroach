@@ -51,11 +51,17 @@ WHERE name = %s
 		return nil, err
 	}
 
-	return parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
+	return d.parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
 }
 
 func (d *delegator) delegateShowCreateTable(n *tree.ShowCreate) (tree.Statement, error) {
-	const showCreateQuery = `
+	createField := "create_statement"
+	switch n.FmtOpt {
+	case tree.ShowCreateFormatOptionRedactedValues:
+		createField = "crdb_internal.redact(create_redactable)"
+	}
+
+	showCreateQuery := `
 WITH zone_configs AS (
 		SELECT
 			string_agg(
@@ -77,7 +83,7 @@ WITH zone_configs AS (
 )
 SELECT
     %[3]s AS table_name,
-    concat(create_statement,
+    concat(` + createField + `,
         CASE
 				WHEN is_multi_region THEN
 					CASE
@@ -89,7 +95,7 @@ SELECT
         WHEN NOT has_partitions
           THEN NULL
 				ELSE
-					e'\n-- Warning: Partitioned table with no zone configurations.'
+					e'\n-- Warning: Partitioned table with no zone configurations.\n'
         END
     ) AS create_statement
 FROM
@@ -149,7 +155,8 @@ SELECT
     direction,
     storing::BOOL,
     implicit::BOOL,
-    is_visible::BOOL AS visible`
+    is_visible::BOOL AS visible,
+    visibility`
 
 	if n.WithComment {
 		getIndexesQuery += `,
@@ -274,7 +281,7 @@ func (d *delegator) delegateShowCreateAllTables() (tree.Statement, error) {
 		lexbase.EscapeSQLString(databaseLiteral),
 	)
 
-	return parse(query)
+	return d.parse(query)
 }
 
 // showTableDetails returns the AST of a query which extracts information about
@@ -311,5 +318,5 @@ func (d *delegator) showTableDetails(
 		dataSource.PostgresDescriptorID(),
 	)
 
-	return parse(fullQuery)
+	return d.parse(fullQuery)
 }

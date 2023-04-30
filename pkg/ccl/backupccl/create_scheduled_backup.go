@@ -85,6 +85,7 @@ type scheduledBackupSpec struct {
 	kmsURIs                    []string
 	incrementalStorage         []string
 	includeAllSecondaryTenants *bool
+	execLoc                    *string
 }
 
 func makeScheduleDetails(opts map[string]string) (jobspb.ScheduleDetails, error) {
@@ -234,6 +235,10 @@ func doCreateBackupSchedules(
 		}
 	}
 
+	if eval.execLoc != nil && *eval.execLoc != "" {
+		backupNode.Options.ExecutionLocality = tree.NewStrVal(*eval.execLoc)
+	}
+
 	// Evaluate encryption KMS URIs if set.
 	// Only one of encryption passphrase and KMS URI should be set, but this check
 	// is done during backup planning so we do not need to worry about it here.
@@ -300,11 +305,27 @@ func doCreateBackupSchedules(
 	unpauseOnSuccessID := jobs.InvalidScheduleID
 
 	var chainProtectedTimestampRecords bool
-	// If needed, create incremental.
+	// If needed, create an incremental schedule.
 	var inc *jobs.ScheduledJob
 	scheduledJobs := jobs.ScheduledJobTxn(p.InternalSQLTxn())
 	var incScheduledBackupArgs *backuppb.ScheduledBackupExecutionArgs
 	if incRecurrence != nil {
+		incrementalScheduleDetails := details
+		// An incremental backup schedule must always wait if there is a running job
+		// that was previously scheduled by this incremental schedule. This is
+		// because until the previous incremental backup job completes, all future
+		// incremental jobs will attempt to backup data from the same `StartTime`
+		// corresponding to the `EndTime` of the last incremental layer. In this
+		// case only the first incremental job to complete will succeed, while the
+		// remaining jobs will either be rejected or worse corrupt the chain of
+		// backups. We can accept both `wait` and `skip` as valid
+		// `on_previous_running` options for an incremental schedule.
+		//
+		// NB: Ideally we'd have a way to configure options for both the full and
+		// incremental schedule separately, in which case we could reject the
+		// `on_previous_running = start` configuration for incremental schedules.
+		// Until then this interception will have to do.
+		incrementalScheduleDetails.Wait = jobspb.ScheduleDetails_WAIT
 		chainProtectedTimestampRecords = scheduledBackupGCProtectionEnabled.Get(&p.ExecCfg().Settings.SV)
 		backupNode.AppendToLatest = true
 
@@ -316,7 +337,7 @@ func doCreateBackupSchedules(
 			}
 		}
 		inc, incScheduledBackupArgs, err = makeBackupSchedule(
-			env, p.User(), scheduleLabel, incRecurrence, details, unpauseOnSuccessID,
+			env, p.User(), scheduleLabel, incRecurrence, incrementalScheduleDetails, unpauseOnSuccessID,
 			updateMetricOnSuccess, backupNode, chainProtectedTimestampRecords)
 		if err != nil {
 			return err
@@ -672,6 +693,17 @@ func makeScheduledBackupSpec(
 		}
 		spec.captureRevisionHistory = &capture
 	}
+
+	if schedule.BackupOptions.ExecutionLocality != nil {
+		loc, err := exprEval.String(
+			ctx, schedule.BackupOptions.ExecutionLocality,
+		)
+		if err != nil {
+			return nil, err
+		}
+		spec.execLoc = &loc
+	}
+
 	if schedule.BackupOptions.IncludeAllSecondaryTenants != nil {
 		includeSecondary, err := exprEval.Bool(ctx,
 			schedule.BackupOptions.IncludeAllSecondaryTenants)
@@ -745,6 +777,7 @@ func createBackupScheduleTypeCheck(
 		schedule.ScheduleLabelSpec.Label,
 		schedule.Recurrence,
 		schedule.BackupOptions.EncryptionPassphrase,
+		schedule.BackupOptions.ExecutionLocality,
 	}
 	if schedule.FullBackup != nil {
 		stringExprs = append(stringExprs, schedule.FullBackup.Recurrence)

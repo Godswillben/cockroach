@@ -45,10 +45,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
@@ -74,6 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -102,7 +105,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -739,6 +741,25 @@ var errTransactionInProgress = errors.New("there is already a transaction in pro
 const sqlTxnName string = "sql txn"
 const metricsSampleInterval = 10 * time.Second
 
+// enableDropTenant (or rather, its inverted boolean value) defines
+// the default value for the session var "disable_drop_tenant".
+//
+// Note:
+//   - We use a cluster setting here instead of a default role option
+//     because we need this to be settable also for the 'admin' role.
+//   - The cluster setting is named "enable" because boolean cluster
+//     settings are all ".enabled" -- we do not have ".disabled"
+//     settings anywhere.
+//   - The session var is named "disable_" because we want the Go
+//     default value (false) to mean that tenant deletion is enabled.
+//     This is needed for backward-compatibility with Cockroach Cloud.
+var enableDropTenant = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"sql.drop_tenant.enabled",
+	"default value (inverted) for the disable_drop_tenant session setting",
+	true,
+)
+
 // Fully-qualified names for metrics.
 var (
 	MetaSQLExecLatency = metric.Metadata{
@@ -1174,6 +1195,45 @@ type nodeStatusGenerator interface {
 	GenerateNodeStatus(ctx context.Context) *statuspb.NodeStatus
 }
 
+// SystemTenantOnly wraps an object in the ExecutorConfig that is only
+// available when accessed by the system tenant.
+type SystemTenantOnly[T any] interface {
+	// Get returns either the wrapped object if accessed by the system tenant
+	// or an error if accessed by a secondary tenant.
+	Get(op string) (t T, err error)
+}
+
+type systemTenantOnly[T any] struct {
+	wrapped T
+}
+
+// Get implements SystemTenantOnly.
+func (s *systemTenantOnly[T]) Get(string) (t T, err error) {
+	return s.wrapped, nil
+}
+
+// MakeSystemTenantOnly returns a SystemTenantOnly where SystemTenantOnly.Get
+// returns t.
+func MakeSystemTenantOnly[T any](t T) SystemTenantOnly[T] {
+	return &systemTenantOnly[T]{wrapped: t}
+}
+
+type emptySystemTenantOnly[T any] struct{}
+
+// Get implements SystemTenantOnly.
+func (emptySystemTenantOnly[T]) Get(op string) (t T, err error) {
+	err = errors.Newf("operation %s supported only by system tenant", op)
+	return
+}
+
+var empty = &emptySystemTenantOnly[any]{}
+
+// EmptySystemTenantOnly returns a SystemTenantOnly where SystemTenantOnly.Get
+// returns an error.
+func EmptySystemTenantOnly[T any]() SystemTenantOnly[T] {
+	return (*emptySystemTenantOnly[T])(empty)
+}
+
 // An ExecutorConfig encompasses the auxiliary objects and configuration
 // required to create an executor.
 // All fields holding a pointer or an interface are required to create
@@ -1204,7 +1264,7 @@ type ExecutorConfig struct {
 	MetricsRecorder    nodeStatusGenerator
 	SessionRegistry    *SessionRegistry
 	ClosedSessionCache *ClosedSessionCache
-	SQLLiveness        sqlliveness.Liveness
+	SQLLiveness        sqlliveness.Provider
 	JobRegistry        *jobs.Registry
 	VirtualSchemas     *VirtualSchemaHolder
 	DistSQLPlanner     *DistSQLPlanner
@@ -1372,6 +1432,12 @@ type ExecutorConfig struct {
 
 	// NodeDescs stores {Store,Node}Descriptors in an in-memory cache.
 	NodeDescs kvcoord.NodeDescStore
+
+	TenantCapabilitiesReader SystemTenantOnly[tenantcapabilities.Reader]
+
+	// AutoConfigProvider informs the auto config runner job of new
+	// tasks to run.
+	AutoConfigProvider acprovider.Provider
 }
 
 // UpdateVersionSystemSettingHook provides a callback that allows us
@@ -1385,6 +1451,7 @@ type ExecutorConfig struct {
 type UpdateVersionSystemSettingHook func(
 	ctx context.Context,
 	version clusterversion.ClusterVersion,
+	validate func(ctx context.Context) error,
 ) error
 
 // VersionUpgradeHook is used to run upgrades starting in v21.1.
@@ -1516,8 +1583,8 @@ type ExecutorTestingKnobs struct {
 	// DistSQLReceiverPushCallbackFactory, if set, will be called every time a
 	// DistSQLReceiver is created for a new query execution, and it should
 	// return, possibly nil, a callback that will be called every time
-	// DistSQLReceiver.Push is called.
-	DistSQLReceiverPushCallbackFactory func(query string) func(rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
+	// DistSQLReceiver.Push or DistSQLReceiver.PushBatch is called.
+	DistSQLReceiverPushCallbackFactory func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata)
 
 	// OnTxnRetry, if set, will be called if there is a transaction retry.
 	OnTxnRetry func(autoRetryReason error, evalCtx *eval.Context)
@@ -1545,6 +1612,10 @@ type ExecutorTestingKnobs struct {
 
 	// BeforeCopyFromInsert, if set, will be called during a COPY FROM insert statement.
 	BeforeCopyFromInsert func() error
+
+	// ForceSQLLivenessSession will force the use of a sqlliveness session for
+	// transaction deadlines even in the system tenant.
+	ForceSQLLivenessSession bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.
@@ -1570,7 +1641,6 @@ func (*PGWireTestingKnobs) ModuleTestingKnobs() {}
 
 // TenantTestingKnobs contains knobs for tenant behavior.
 type TenantTestingKnobs struct {
-
 	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
 	// server's codec, but nothing else (e.g. its certs).
 	TenantIDCodecOverride roachpb.TenantID
@@ -1579,14 +1649,15 @@ type TenantTestingKnobs struct {
 	// can optionally forward requests to the real provider).
 	OverrideTokenBucketProvider func(origProvider kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider
 
-	// SkipSQLSystemTentantCheck is a temporary knob to test which admin functions fail for secondary tenants.
-	// TODO(ewall): Remove when usages in multitenant_admin_function_test.go are removed.
-	SkipSQLSystemTentantCheck bool
-
 	// BeforeCheckingForDescriptorIDSequence, if set, is called before
 	// the connExecutor checks for the presence of system.descriptor_id_seq after
 	// handling a system tenant descriptor ID generator migration error.
 	BeforeCheckingForDescriptorIDSequence func(ctx context.Context)
+
+	// EnableTenantIDReuse avoids using the tenant ID sequence to ensure
+	// that automatic tenant ID allocation is always monotonic. This can
+	// be used in tests that wish to control the tenant ID.
+	EnableTenantIDReuse bool
 }
 
 var _ base.ModuleTestingKnobs = &TenantTestingKnobs{}
@@ -1681,6 +1752,14 @@ type StreamingTestingKnobs struct {
 
 	// AfterCutoverStarted allows blocking after the cutover has started.
 	AfterCutoverStarted func()
+
+	// OnCutoverProgressUpdate is called on every progress update
+	// call during the cutover process.
+	OnCutoverProgressUpdate func()
+
+	// CutoverProgressShouldUpdate overrides the standard logic
+	// for whether the job record is updated on a progress update.
+	CutoverProgressShouldUpdate func() bool
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -1995,7 +2074,7 @@ type queryMeta struct {
 	start time.Time
 
 	// The SQL statement being executed.
-	stmt parser.Statement
+	stmt statements.Statement[tree.Statement]
 
 	// The placeholders that the query was executed with if any.
 	placeholders *tree.PlaceholderInfo
@@ -2042,6 +2121,7 @@ type SessionDefaults map[string]string
 type SessionArgs struct {
 	User                        username.SQLUsername
 	IsSuperuser                 bool
+	IsSSL                       bool
 	SystemIdentity              username.SQLUsername
 	SessionDefaults             SessionDefaults
 	CustomOptionSessionDefaults SessionDefaults
@@ -2178,9 +2258,11 @@ func truncateStatementStringForTelemetry(stmt string) string {
 // hideNonVirtualTableNameFunc returns a function that can be used with
 // FmtCtx.SetReformatTableNames. It hides all table names that are not virtual
 // tables.
-func hideNonVirtualTableNameFunc(vt VirtualTabler) func(ctx *tree.FmtCtx, name *tree.TableName) {
+func hideNonVirtualTableNameFunc(
+	vt VirtualTabler, ns eval.ClientNoticeSender,
+) func(ctx *tree.FmtCtx, name *tree.TableName) {
 	reformatFn := func(ctx *tree.FmtCtx, tn *tree.TableName) {
-		virtual, err := vt.getVirtualTableEntry(tn)
+		virtual, err := vt.getVirtualTableEntry(tn, ns)
 
 		if err != nil || virtual == nil {
 			// Current table is non-virtual and therefore needs to be scrubbed (for statement stats) or redacted (for logs).
@@ -2224,14 +2306,16 @@ func hideNonVirtualTableNameFunc(vt VirtualTabler) func(ctx *tree.FmtCtx, name *
 	return reformatFn
 }
 
-func anonymizeStmtAndConstants(stmt tree.Statement, vt VirtualTabler) string {
+func anonymizeStmtAndConstants(
+	stmt tree.Statement, vt VirtualTabler, ns eval.ClientNoticeSender,
+) string {
 	// Re-format to remove most names.
 	fmtFlags := tree.FmtAnonymize | tree.FmtHideConstants
 	var f *tree.FmtCtx
 	if vt != nil {
 		f = tree.NewFmtCtx(
 			fmtFlags,
-			tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt)),
+			tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt, ns)),
 		)
 	} else {
 		f = tree.NewFmtCtx(fmtFlags)
@@ -2242,8 +2326,10 @@ func anonymizeStmtAndConstants(stmt tree.Statement, vt VirtualTabler) string {
 
 // WithAnonymizedStatement attaches the anonymized form of a statement
 // to an error object.
-func WithAnonymizedStatement(err error, stmt tree.Statement, vt VirtualTabler) error {
-	anonStmtStr := anonymizeStmtAndConstants(stmt, vt)
+func WithAnonymizedStatement(
+	err error, stmt tree.Statement, vt VirtualTabler, ns eval.ClientNoticeSender,
+) error {
+	anonStmtStr := anonymizeStmtAndConstants(stmt, vt, ns)
 	anonStmtStr = truncateStatementStringForTelemetry(anonStmtStr)
 	return errors.WithSafeDetails(err,
 		"while executing: %s", errors.Safe(anonStmtStr))
@@ -2856,6 +2942,19 @@ type sessionDataMutatorIterator struct {
 	sessionDataMutatorCallbacks
 }
 
+func makeSessionDataMutatorIterator(
+	sds *sessiondata.Stack, defaults SessionDefaults, settings *cluster.Settings,
+) *sessionDataMutatorIterator {
+	return &sessionDataMutatorIterator{
+		sds: sds,
+		sessionDataMutatorBase: sessionDataMutatorBase{
+			defaults: defaults,
+			settings: settings,
+		},
+		sessionDataMutatorCallbacks: sessionDataMutatorCallbacks{},
+	}
+}
+
 // mutator returns a mutator for the given sessionData.
 func (it *sessionDataMutatorIterator) mutator(
 	applyCallbacks bool, sd *sessiondata.SessionData,
@@ -3090,6 +3189,10 @@ func (m *sessionDataMutator) SetSerialNormalizationMode(val sessiondatapb.Serial
 
 func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
+}
+
+func (m *sessionDataMutator) SetDisableDropTenant(val bool) {
+	m.data.DisableDropTenant = val
 }
 
 func (m *sessionDataMutator) SetCheckFunctionBodies(val bool) {
@@ -3420,6 +3523,46 @@ func (m *sessionDataMutator) SetInjectRetryErrorsOnCommitEnabled(val bool) {
 	m.data.InjectRetryErrorsOnCommitEnabled = val
 }
 
+func (m *sessionDataMutator) SetEnforceHomeRegionFollowerReadsEnabled(val bool) {
+	m.data.EnforceHomeRegionFollowerReadsEnabled = val
+}
+
+func (m *sessionDataMutator) SetOptimizerAlwaysUseHistograms(val bool) {
+	m.data.OptimizerAlwaysUseHistograms = val
+}
+
+func (m *sessionDataMutator) SetOptimizerHoistUncorrelatedEqualitySubqueries(val bool) {
+	m.data.OptimizerHoistUncorrelatedEqualitySubqueries = val
+}
+
+func (m *sessionDataMutator) SetEnableCreateStatsUsingExtremes(val bool) {
+	m.data.EnableCreateStatsUsingExtremes = val
+}
+
+func (m *sessionDataMutator) SetAllowRoleMembershipsToChangeDuringTransaction(val bool) {
+	m.data.AllowRoleMembershipsToChangeDuringTransaction = val
+}
+
+func (m *sessionDataMutator) SetDefaultTextSearchConfig(val string) {
+	m.data.DefaultTextSearchConfig = val
+}
+
+func (m *sessionDataMutator) SetPreparedStatementsCacheSize(val int64) {
+	m.data.PreparedStatementsCacheSize = val
+}
+
+func (m *sessionDataMutator) SetStreamerEnabled(val bool) {
+	m.data.StreamerEnabled = val
+}
+
+func (m *sessionDataMutator) SetMultipleActivePortalsEnabled(val bool) {
+	m.data.MultipleActivePortalsEnabled = val
+}
+
+func (m *sessionDataMutator) SetUnboundedParallelScans(val bool) {
+	m.data.UnboundedParallelScans = val
+}
+
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3447,7 +3590,7 @@ func quantizeCounts(d *appstatspb.StatementStatistics) {
 	d.FirstAttemptCount = int64((float64(d.FirstAttemptCount) / float64(oldCount)) * float64(newCount))
 }
 
-func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
+func scrubStmtStatKey(vt VirtualTabler, key string, ns eval.ClientNoticeSender) (string, bool) {
 	// Re-parse the statement to obtain its AST.
 	stmt, err := parser.ParseOne(key)
 	if err != nil {
@@ -3457,7 +3600,7 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 	// Re-format to remove most names.
 	f := tree.NewFmtCtx(
 		tree.FmtAnonymize,
-		tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt)),
+		tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt, ns)),
 	)
 	f.FormatNode(stmt.AST)
 	return f.CloseAndGetString(), true
@@ -3466,12 +3609,16 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 // formatStmtKeyAsRedactableString given an AST node this function will fully
 // qualify names using annotations to format it out into a redactable string.
 func formatStmtKeyAsRedactableString(
-	vt VirtualTabler, rootAST tree.Statement, ann *tree.Annotations, fs tree.FmtFlags,
+	vt VirtualTabler,
+	rootAST tree.Statement,
+	ann *tree.Annotations,
+	fs tree.FmtFlags,
+	ns eval.ClientNoticeSender,
 ) redact.RedactableString {
 	f := tree.NewFmtCtx(
 		tree.FmtAlwaysQualifyTableNames|tree.FmtMarkRedactionNode|fs,
 		tree.FmtAnnotations(ann),
-		tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt)))
+		tree.FmtReformatTableNames(hideNonVirtualTableNameFunc(vt, ns)))
 	f.FormatNode(rootAST)
 	formattedRedactableStatementString := f.CloseAndGetString()
 	return redact.RedactableString(formattedRedactableStatementString)
@@ -3560,20 +3707,6 @@ func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 		return cfg.InternalRowMetrics
 	}
 	return cfg.RowMetrics
-}
-
-// RequireSystemTenant returns an unsupported error if executed from inside a
-// secondary tenant. Tests may circumvent this check using a testing knob.
-// TODO(ewall): Replace usages of this with tenant capability checks in KV.
-func (cfg *ExecutorConfig) RequireSystemTenant() error {
-	if cfg.Codec.ForSystemTenant() {
-		return nil
-	}
-	knobs := cfg.TenantTestingKnobs
-	if knobs != nil && knobs.SkipSQLSystemTentantCheck {
-		return nil
-	}
-	return errorutil.UnsupportedWithMultiTenancy(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
 }
 
 // RequireSystemTenantOrClusterSetting returns a setting disabled error if

@@ -1,6 +1,9 @@
 /* setup */
 CREATE TABLE t (i INT PRIMARY KEY, j INT);
 CREATE INDEX idx ON t(j) USING HASH;
+INSERT INTO t VALUES(-1);
+INSERT INTO t VALUES(-2);
+INSERT INTO t VALUES(-3);
 
 /* test */
 EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
@@ -50,7 +53,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 6 Mutation operations
 │           │
@@ -150,7 +153,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 8 Mutation operations
 │           │
@@ -264,7 +267,7 @@ EXPLAIN (ddl, verbose) DROP INDEX idx CASCADE;
     │   │       │     rule: "CheckConstraint transitions to ABSENT uphold 2-version invariant: VALIDATED->ABSENT"
     │   │       │
     │   │       └── • Precedence dependency from ABSENT ConstraintWithoutIndexName:{DescID: 104, Name: check_crdb_internal_j_shard_16, ConstraintID: 2}
-    │   │             rule: "dependents removed before constraint"
+    │   │             rule: "Constraint should be hidden before name"
     │   │
     │   └── • 10 Mutation operations
     │       │

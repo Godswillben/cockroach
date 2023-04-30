@@ -331,9 +331,7 @@ $$`)
 			stmt: `SELECT
                a, b, c,
                (CASE WHEN (cdc_prev).c IS NULL THEN 'not there' ELSE (cdc_prev).c END) AS old_c
-             FROM foo
-             WHERE (cdc_prev).crdb_internal_mvcc_timestamp IS NULL OR
-                   (cdc_prev).crdb_internal_mvcc_timestamp < crdb_internal_mvcc_timestamp`,
+             FROM foo`,
 			expectMainFamily: []decodeExpectation{
 				{
 					expectUnwatchedErr: true,
@@ -786,8 +784,12 @@ func newEvaluatorWithNormCheck(
 		defaultDBSessionData, hlc.Timestamp{}, withDiff), nil
 }
 
-var defaultDBSessionData = sessiondatapb.SessionData{
-	Database:                   "defaultdb",
-	SearchPath:                 sessiondata.DefaultSearchPath.GetPathArray(),
-	TrigramSimilarityThreshold: 0.3,
+var defaultDBSessionData = &sessiondata.SessionData{
+	SessionData: sessiondatapb.SessionData{
+		Database:                   "defaultdb",
+		TrigramSimilarityThreshold: 0.3,
+		UserProto:                  username.RootUserName().EncodeProto(),
+	},
+	SequenceState: sessiondata.NewSequenceState(),
+	SearchPath:    sessiondata.DefaultSearchPathForUser(username.RootUserName()),
 }

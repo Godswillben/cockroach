@@ -764,12 +764,13 @@ func (r *Replica) AdminMerge(
 			Commit: true,
 			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
 				MergeTrigger: &roachpb.MergeTrigger{
-					LeftDesc:             updatedLeftDesc,
-					RightDesc:            rightDesc,
-					RightMVCCStats:       rhsSnapshotRes.MVCCStats,
-					FreezeStart:          rhsSnapshotRes.FreezeStart,
-					RightClosedTimestamp: rhsSnapshotRes.ClosedTimestamp,
-					RightReadSummary:     rhsSnapshotRes.ReadSummary,
+					LeftDesc:                   updatedLeftDesc,
+					RightDesc:                  rightDesc,
+					RightMVCCStats:             rhsSnapshotRes.MVCCStats,
+					RightRangeIDLocalMVCCStats: rhsSnapshotRes.RangeIDLocalMVCCStats,
+					FreezeStart:                rhsSnapshotRes.FreezeStart,
+					RightClosedTimestamp:       rhsSnapshotRes.ClosedTimestamp,
+					RightReadSummary:           rhsSnapshotRes.ReadSummary,
 				},
 			},
 		})
@@ -816,7 +817,7 @@ func waitForApplication(
 	dialer *nodedialer.Dialer,
 	rangeID roachpb.RangeID,
 	replicas []roachpb.ReplicaDescriptor,
-	leaseIndex uint64,
+	leaseIndex kvpb.LeaseAppliedIndex,
 ) error {
 	g := ctxgroup.WithContext(ctx)
 	for _, repl := range replicas {
@@ -1334,9 +1335,9 @@ func (r *Replica) maybeLeaveAtomicChangeReplicasAndRemoveLearners(
 	// periods of time on a single range without making progress, which can stall
 	// other operations that they are expected to perform (see
 	// https://github.com/cockroachdb/cockroach/issues/79249 for example).
-	if r.hasOutstandingLearnerSnapshotInFlight() {
+	if err := r.errOnOutstandingLearnerSnapshotInflight(); err != nil {
 		return nil /* desc */, 0, /* learnersRemoved */
-			errCannotRemoveLearnerWhileSnapshotInFlight
+			errors.WithSecondaryError(errCannotRemoveLearnerWhileSnapshotInFlight, err)
 	}
 
 	if fn := r.store.TestingKnobs().BeforeRemovingDemotedLearner; fn != nil {
@@ -1839,7 +1840,7 @@ func (r *Replica) lockLearnerSnapshot(
 	var cleanups []func()
 	for _, addition := range additions {
 		lockUUID := uuid.MakeV4()
-		_, cleanup := r.addSnapshotLogTruncationConstraint(ctx, lockUUID, addition.StoreID)
+		_, cleanup := r.addSnapshotLogTruncationConstraint(ctx, lockUUID, true /* initial */, addition.StoreID)
 		cleanups = append(cleanups, cleanup)
 	}
 	return func() {
@@ -2793,7 +2794,7 @@ func (r *Replica) sendSnapshotUsingDelegate(
 		senderQueuePriority = 0
 	}
 	snapUUID := uuid.MakeV4()
-	appliedIndex, cleanup := r.addSnapshotLogTruncationConstraint(ctx, snapUUID, recipient.StoreID)
+	appliedIndex, cleanup := r.addSnapshotLogTruncationConstraint(ctx, snapUUID, snapType == kvserverpb.SnapshotRequest_INITIAL, recipient.StoreID)
 	// The cleanup function needs to be called regardless of success or failure of
 	// sending to release the log truncation constraint.
 	defer cleanup()
@@ -2814,7 +2815,7 @@ func (r *Replica) sendSnapshotUsingDelegate(
 		SenderQueueName:      senderQueueName,
 		SenderQueuePriority:  senderQueuePriority,
 		Type:                 snapType,
-		Term:                 status.Term,
+		Term:                 kvpb.RaftTerm(status.Term),
 		DelegatedSender:      sender,
 		FirstIndex:           appliedIndex,
 		DescriptorGeneration: r.Desc().Generation,
@@ -2838,11 +2839,14 @@ func (r *Replica) sendSnapshotUsingDelegate(
 			ctx, 2, "delegating snapshot transmission attempt %v for %v to %v", n+1, recipient, sender,
 		)
 
-		selfDelegate := n == len(senders)-1
+		selfDelegate := sender.StoreID == r.StoreID()
 
 		// On the last attempt, always queue on the delegate to time out naturally.
 		if selfDelegate {
 			delegateRequest.QueueOnDelegateLen = -1
+		}
+		if !selfDelegate {
+			r.store.Metrics().DelegateSnapshotInProgress.Inc(1)
 		}
 
 		retErr = contextutil.RunWithTimeout(
@@ -2851,6 +2855,10 @@ func (r *Replica) sendSnapshotUsingDelegate(
 				return r.store.cfg.Transport.DelegateSnapshot(ctx, delegateRequest)
 			},
 		)
+		if !selfDelegate {
+			r.store.Metrics().DelegateSnapshotInProgress.Dec(1)
+		}
+
 		// Return once we have success.
 		if retErr == nil {
 			if !selfDelegate {
@@ -2861,7 +2869,7 @@ func (r *Replica) sendSnapshotUsingDelegate(
 			if !selfDelegate {
 				r.store.Metrics().DelegateSnapshotFailures.Inc(1)
 			}
-			log.Warningf(ctx, "attempt %d: delegate snapshot %+v request failed %v", n+1, delegateRequest, retErr)
+			log.KvDistribution.Warningf(ctx, "attempt %d: delegate snapshot %+v request failed %v", n+1, delegateRequest, retErr)
 		}
 	}
 	return
@@ -2928,7 +2936,7 @@ func (r *Replica) validateSnapshotDelegationRequest(
 		// haven't woken up yet.
 		return errors.Errorf("raft status not initialized")
 	}
-	replTerm := status.Term
+	replTerm := kvpb.RaftTerm(status.Term)
 	r.mu.RUnlock()
 
 	// Delegate has a different term than the coordinator. This typically means
@@ -3079,9 +3087,9 @@ func (r *Replica) followerSendSnapshot(
 	// subject to mapping across replicas). The actual sending happens in
 	// kvBatchSnapshotStrategy.Send and results in no log entries being sent at
 	// all. Note that Metadata.Index is really the applied index of the replica.
-	snap.State.TruncatedState = &roachpb.RaftTruncatedState{
-		Index: snap.RaftSnap.Metadata.Index,
-		Term:  snap.RaftSnap.Metadata.Term,
+	snap.State.TruncatedState = &kvserverpb.RaftTruncatedState{
+		Index: kvpb.RaftIndex(snap.RaftSnap.Metadata.Index),
+		Term:  kvpb.RaftTerm(snap.RaftSnap.Metadata.Term),
 	}
 
 	// See comment on DeprecatedUsingAppliedStateKey for why we need to set this
@@ -3100,7 +3108,7 @@ func (r *Replica) followerSendSnapshot(
 				Type:     raftpb.MsgSnap,
 				From:     uint64(req.CoordinatorReplica.ReplicaID),
 				To:       uint64(req.RecipientReplica.ReplicaID),
-				Term:     req.Term,
+				Term:     uint64(req.Term),
 				Snapshot: &snap.RaftSnap,
 			},
 		},
@@ -3111,8 +3119,8 @@ func (r *Replica) followerSendSnapshot(
 		Strategy:            kvserverpb.SnapshotRequest_KV_BATCH,
 		Type:                req.Type,
 	}
-	newBatchFn := func() storage.Batch {
-		return r.store.TODOEngine().NewUnindexedBatch(true /* writeOnly */)
+	newBatchFn := func() storage.WriteBatch {
+		return r.store.TODOEngine().NewWriteBatch()
 	}
 	sent := func() {
 		r.store.metrics.RangeSnapshotsGenerated.Inc(1)

@@ -22,7 +22,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t DROP CONSTRAINT check_i;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 2 Mutation operations
 │           │
@@ -66,7 +66,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t DROP CONSTRAINT check_i;
 │       │       │ PUBLIC → ABSENT
 │       │       │
 │       │       └── • Precedence dependency from VALIDATED CheckConstraint:{DescID: 104, IndexID: 0, ConstraintID: 2}
-│       │             rule: "constraint no longer public before dependents"
+│       │             rule: "Constraint should be hidden before name"
 │       │
 │       └── • 4 Mutation operations
 │           │
@@ -109,7 +109,7 @@ EXPLAIN (ddl, verbose) ALTER TABLE t DROP CONSTRAINT check_i;
         │       │     rule: "CheckConstraint transitions to ABSENT uphold 2-version invariant: VALIDATED->ABSENT"
         │       │
         │       └── • Precedence dependency from ABSENT ConstraintWithoutIndexName:{DescID: 104, Name: check_i, ConstraintID: 2}
-        │             rule: "dependents removed before constraint"
+        │             rule: "Constraint should be hidden before name"
         │
         └── • 3 Mutation operations
             │

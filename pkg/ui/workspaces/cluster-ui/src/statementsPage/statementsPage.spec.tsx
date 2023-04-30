@@ -10,7 +10,7 @@
 
 import { assert } from "chai";
 
-import { filterBySearchQuery } from "src/statementsPage";
+import { filterBySearchQuery } from "src/sqlActivity/util";
 import { AggregateStatistics } from "../statementsTable";
 import { FlatPlanNode } from "../statementDetails";
 
@@ -56,7 +56,6 @@ describe("StatementsPage", () => {
       aggregatedFingerprintID: "",
       aggregatedFingerprintHexID: "",
       aggregatedTs: 0,
-      aggregationInterval: 0,
       database: "",
       applicationName: "",
       fullScan: false,

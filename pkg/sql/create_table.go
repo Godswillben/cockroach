@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -356,13 +357,16 @@ func (n *createTableNode) startExec(params runParams) error {
 	// TODO(ajwerner): remove the timestamp from newTableDesc and its friends,
 	// it's	currently relied on in import and restore code and tests.
 	var creationTime hlc.Timestamp
-	privs := catprivilege.CreatePrivilegesFromDefaultPrivileges(
+	privs, err := catprivilege.CreatePrivilegesFromDefaultPrivileges(
 		n.dbDesc.GetDefaultPrivilegeDescriptor(),
 		schema.GetDefaultPrivilegeDescriptor(),
 		n.dbDesc.GetID(),
 		params.SessionData().User(),
 		privilege.Tables,
 	)
+	if err != nil {
+		return err
+	}
 	if n.n.As() {
 		asCols := planColumns(n.sourcePlan)
 		if !n.n.AsHasUserSpecifiedPrimaryKey() {
@@ -471,10 +475,9 @@ func (n *createTableNode) startExec(params runParams) error {
 
 		if err := ApplyZoneConfigForMultiRegionTable(
 			params.ctx,
-			params.p.Txn(),
+			params.p.InternalSQLTxn(),
 			params.p.ExecCfg(),
 			params.p.extendedEvalCtx.Tracing.KVTracingEnabled(),
-			params.p.Descriptors(),
 			regionConfig,
 			desc,
 			ApplyZoneConfigForMultiRegionTableOptionTableAndIndexes,
@@ -702,7 +705,7 @@ func addUniqueWithoutIndexTableDef(
 			"partitioned unique constraints without an index are not supported",
 		)
 	}
-	if d.NotVisible {
+	if d.Invisibility != 0.0 {
 		// Theoretically, this should never happen because this is not supported by
 		// the parser. This is just a safe check.
 		return pgerror.Newf(pgcode.FeatureNotSupported,
@@ -1472,14 +1475,14 @@ func NewTableDesc(
 			for _, def := range n.Defs {
 				switch def := def.(type) {
 				case *tree.ColumnTableDef:
-					if def.Name == colinfo.TTLDefaultExpirationColumnName {
+					if def.Name == catpb.TTLDefaultExpirationColumnName {
 						// If we find the column, make sure it has the expected type.
 						if def.Type.SQLString() != types.TimestampTZ.SQLString() {
 							return nil, pgerror.Newf(
 								pgcode.InvalidTableDefinition,
 								`table %s has TTL defined, but column %s is not a %s`,
 								def.Name,
-								colinfo.TTLDefaultExpirationColumnName,
+								catpb.TTLDefaultExpirationColumnName,
 								types.TimestampTZ.SQLString(),
 							)
 						}
@@ -1786,11 +1789,16 @@ func NewTableDesc(
 			if err := checkIndexColumns(&desc, d.Columns, d.Storing, d.Inverted); err != nil {
 				return nil, err
 			}
+			if !version.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
+				d.Invisibility > 0.0 && d.Invisibility < 1.0 {
+				return nil, unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
+			}
 			idx := descpb.IndexDescriptor{
 				Name:             string(d.Name),
 				StoreColumnNames: d.Storing.ToStrings(),
 				Version:          indexEncodingVersion,
-				NotVisible:       d.NotVisible,
+				NotVisible:       d.Invisibility != 0.0,
+				Invisibility:     d.Invisibility,
 			}
 			if d.Inverted {
 				idx.Type = descpb.IndexDescriptor_INVERTED
@@ -1897,12 +1905,17 @@ func NewTableDesc(
 			); err != nil {
 				return nil, err
 			}
+			if !version.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
+				d.Invisibility > 0.0 && d.Invisibility < 1.0 {
+				return nil, unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
+			}
 			idx := descpb.IndexDescriptor{
 				Name:             string(d.Name),
 				Unique:           true,
 				StoreColumnNames: d.Storing.ToStrings(),
 				Version:          indexEncodingVersion,
-				NotVisible:       d.NotVisible,
+				NotVisible:       d.Invisibility != 0.0,
+				Invisibility:     d.Invisibility,
 			}
 			columns := d.Columns
 			if d.Sharded != nil {
@@ -2433,7 +2446,7 @@ func CreateRowLevelTTLScheduledJob(
 
 func rowLevelTTLAutomaticColumnDef(ttl *catpb.RowLevelTTL) (*tree.ColumnTableDef, error) {
 	def := &tree.ColumnTableDef{
-		Name:   colinfo.TTLDefaultExpirationColumnName,
+		Name:   catpb.TTLDefaultExpirationColumnName,
 		Type:   types.TimestampTZ,
 		Hidden: true,
 	}
@@ -2601,11 +2614,11 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					continue
 				}
 				indexDef := tree.IndexTableDef{
-					Name:       tree.Name(idx.GetName()),
-					Inverted:   idx.GetType() == descpb.IndexDescriptor_INVERTED,
-					Storing:    make(tree.NameList, 0, idx.NumSecondaryStoredColumns()),
-					Columns:    make(tree.IndexElemList, 0, idx.NumKeyColumns()),
-					NotVisible: idx.IsNotVisible(),
+					Name:         tree.Name(idx.GetName()),
+					Inverted:     idx.GetType() == descpb.IndexDescriptor_INVERTED,
+					Storing:      make(tree.NameList, 0, idx.NumSecondaryStoredColumns()),
+					Columns:      make(tree.IndexElemList, 0, idx.NumKeyColumns()),
+					Invisibility: idx.GetInvisibility(),
 				}
 				numColumns := idx.NumKeyColumns()
 				if idx.IsSharded() {

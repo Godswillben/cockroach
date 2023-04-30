@@ -11,7 +11,7 @@
 import React from "react";
 import { TimeScaleOptions } from "@cockroachlabs/cluster-ui";
 import TimeScaleDropdown from "src/views/cluster/containers/timeScaleDropdownWithSearchParams";
-import moment from "moment";
+import moment from "moment-timezone";
 
 export const KeyVisualizerTimeWindow = () => {
   const keyVisualizerTimeScaleOptions: TimeScaleOptions = {
@@ -47,11 +47,6 @@ export const KeyVisualizerTimeWindow = () => {
     },
     "Past Week": {
       windowSize: moment.duration(7, "days"),
-      windowValid: moment.duration(15, "minutes"),
-      sampleSize: moment.duration(1, "minutes"),
-    },
-    "Past 2 Weeks": {
-      windowSize: moment.duration(14, "days"),
       windowValid: moment.duration(15, "minutes"),
       sampleSize: moment.duration(1, "minutes"),
     },

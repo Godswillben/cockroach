@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -64,14 +65,15 @@ type KVBatchFetcherResponse struct {
 	// fetch has already been completed and this response doesn't have any
 	// fetched data.
 	//
-	// Note that it is possible that MoreKVs is true when neither KVs nor
-	// BatchResponse is set. This can occur when there was nothing to fetch for
-	// a Scan or a ReverseScan request, so the caller should just skip over such
-	// a response.
+	// Note that it is possible that MoreKVs is true when neither KVs,
+	// BatchResponse, nor ColBatch is set. This can occur when there was nothing
+	// to fetch for a Scan or a ReverseScan request, so the caller should just
+	// skip over such a response.
 	MoreKVs bool
-	// Only one of KVs and BatchResponse will be set. Which one is set depends
-	// on the request type (KVs is used for Gets and BatchResponse for Scans and
-	// ReverseScans). Both must be handled by calling code.
+	// Only one of KVs, BatchResponse, and ColBatch will be set. Which one is
+	// set depends on the request type (KVs is used for Gets and BatchResponse /
+	// ColBatch for Scans and ReverseScans). All must be handled by calling
+	// code.
 	//
 	// KVs, if set, is a slice of roachpb.KeyValue, the deserialized kv pairs
 	// that were fetched.
@@ -79,9 +81,23 @@ type KVBatchFetcherResponse struct {
 	// BatchResponse, if set, is either a packed byte slice containing the keys
 	// and values (for BATCH_RESPONSE scan format) or serialized representation
 	// of a coldata.Batch (for COL_BATCH_RESPONSE scan format). An empty
-	// BatchResponse indicates that nothing was fetched for the corresponding
-	// ScanRequest, and the caller is expected to skip over the response.
+	// BatchResponse and nil ColBatch indicate that nothing was fetched for the
+	// corresponding ScanRequest, and the caller is expected to skip over the
+	// response.
 	BatchResponse []byte
+	// ColBatch is used for COL_BATCH_RESPONSE scan format when the request was
+	// evaluated locally. An empty BatchResponse and nil ColBatch indicate that
+	// nothing was fetched for the corresponding ScanRequest, and the caller is
+	// expected to skip over the response.
+	//
+	// Note that this batch will be accounted for by the txnKVFetcher, and the
+	// memory reservation is only released when the fetcher performs another
+	// BatchRequest.
+	//
+	// Note that the datum-backed vectors in this batch are "incomplete" in a
+	// sense they are missing the eval.Context. It is the caller's
+	// responsibility to update all datum-backed vectors with the eval context.
+	ColBatch coldata.Batch
 	// spanID is the ID associated with the span that generated this response.
 	spanID int
 }
@@ -89,12 +105,21 @@ type KVBatchFetcherResponse struct {
 // KVBatchFetcher abstracts the logic of fetching KVs in batches.
 type KVBatchFetcher interface {
 	// SetupNextFetch prepares the fetch of the next set of spans.
+	//
+	// spansCanOverlap indicates whether spans might be unordered and
+	// overlapping. If true, then spanIDs must be non-nil.
+	//
+	// NOTE: if spansCanOverlap is true and a single span can touch multiple
+	// ranges, then fetched rows from different spans can be interspersed with
+	// one another. See the comment on txnKVFetcher.SetupNextFetch for more
+	// details.
 	SetupNextFetch(
 		ctx context.Context,
 		spans roachpb.Spans,
 		spanIDs []int,
 		batchBytesLimit rowinfra.BytesLimit,
 		firstBatchKeyLimit rowinfra.KeyLimit,
+		spansCanOverlap bool,
 	) error
 
 	// NextBatch returns the next batch of rows. See KVBatchFetcherResponse for
@@ -502,7 +527,7 @@ func (rf *Fetcher) StartScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, spanIDs, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint), rf.args.SpansCanOverlap,
 	); err != nil {
 		return err
 	}
@@ -602,7 +627,8 @@ func (rf *Fetcher) StartInconsistentScan(
 	}
 
 	if err := rf.kvFetcher.SetupNextFetch(
-		ctx, spans, nil /* spanIDs */, batchBytesLimit, rf.rowLimitToKeyLimit(rowLimitHint),
+		ctx, spans, nil, batchBytesLimit,
+		rf.rowLimitToKeyLimit(rowLimitHint), false, /* spansCanOverlap */
 	); err != nil {
 		return err
 	}

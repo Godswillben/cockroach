@@ -11,6 +11,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -165,8 +166,12 @@ func TestMVCCHistories(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Everything reads/writes under the same prefix.
-	span := roachpb.Span{Key: keys.LocalMax, EndKey: roachpb.KeyMax}
+	// intentInterleavingIter doesn't allow iterating from the local to the global
+	// keyspace, so we have to process these key spans separately.
+	spans := []roachpb.Span{
+		{Key: keys.MinKey, EndKey: roachpb.LocalMax},
+		{Key: keys.LocalMax, EndKey: roachpb.KeyMax},
+	}
 
 	// Timestamp for MVCC stats calculations, in nanoseconds.
 	const statsTS = 100e9
@@ -195,48 +200,51 @@ func TestMVCCHistories(t *testing.T) {
 		reportDataEntries := func(buf *redact.StringBuilder) error {
 			var hasData bool
 
-			err = engine.MVCCIterate(
-				span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypeRangesOnly,
-				func(_ storage.MVCCKeyValue, rangeKeys storage.MVCCRangeKeyStack) error {
-					hasData = true
-					buf.Printf("rangekey: %s/[", rangeKeys.Bounds)
-					for i, version := range rangeKeys.Versions {
-						val, err := storage.DecodeMVCCValue(version.Value)
-						require.NoError(t, err)
-						if i > 0 {
-							buf.Printf(" ")
+			for _, span := range spans {
+				err = engine.MVCCIterate(
+					span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypeRangesOnly,
+					func(_ storage.MVCCKeyValue, rangeKeys storage.MVCCRangeKeyStack) error {
+						hasData = true
+						buf.Printf("rangekey: %s/[", rangeKeys.Bounds)
+						for i, version := range rangeKeys.Versions {
+							val, err := storage.DecodeMVCCValue(version.Value)
+							require.NoError(t, err)
+							if i > 0 {
+								buf.Printf(" ")
+							}
+							buf.Printf("%s=%s", version.Timestamp, val)
 						}
-						buf.Printf("%s=%s", version.Timestamp, val)
-					}
-					buf.Printf("]\n")
-					return nil
-				})
-			if err != nil {
-				return err
+						buf.Printf("]\n")
+						return nil
+					})
+				if err != nil {
+					return err
+				}
+
+				err = engine.MVCCIterate(
+					span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+					func(r storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+						hasData = true
+						if r.Key.Timestamp.IsEmpty() {
+							// Meta is at timestamp zero.
+							meta := enginepb.MVCCMetadata{}
+							if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
+								buf.Printf("meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
+							} else {
+								buf.Printf("meta: %v -> %+v\n", r.Key, &meta)
+							}
+						} else {
+							val, err := storage.DecodeMVCCValue(r.Value)
+							if err != nil {
+								buf.Printf("data: %v -> error decoding value %v: %v\n", r.Key, r.Value, err)
+							} else {
+								buf.Printf("data: %v -> %s\n", r.Key, val)
+							}
+						}
+						return nil
+					})
 			}
 
-			err = engine.MVCCIterate(
-				span.Key, span.EndKey, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
-				func(r storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
-					hasData = true
-					if r.Key.Timestamp.IsEmpty() {
-						// Meta is at timestamp zero.
-						meta := enginepb.MVCCMetadata{}
-						if err := protoutil.Unmarshal(r.Value, &meta); err != nil {
-							buf.Printf("meta: %v -> error decoding proto from %v: %v\n", r.Key, r.Value, err)
-						} else {
-							buf.Printf("meta: %v -> %+v\n", r.Key, &meta)
-						}
-					} else {
-						val, err := storage.DecodeMVCCValue(r.Value)
-						if err != nil {
-							buf.Printf("data: %v -> error decoding value %v: %v\n", r.Key, r.Value, err)
-						} else {
-							buf.Printf("data: %v -> %s\n", r.Key, val)
-						}
-					}
-					return nil
-				})
 			if !hasData {
 				buf.SafeString("<no data>\n")
 			}
@@ -549,8 +557,11 @@ func TestMVCCHistories(t *testing.T) {
 					// that we can compare the deltas.
 					var msEngineBefore enginepb.MVCCStats
 					if stats {
-						msEngineBefore, err = storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-						require.NoError(t, err)
+						for _, span := range spans {
+							ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+							require.NoError(t, err)
+							msEngineBefore.Add(ms)
+						}
 					}
 					msEvalBefore := *e.ms
 
@@ -571,8 +582,12 @@ func TestMVCCHistories(t *testing.T) {
 					if stats && cmd.typ == typDataUpdate {
 						// If stats are enabled, emit evaluated stats returned by the
 						// command, and compare them with the real computed stats diff.
-						msEngineDiff, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-						require.NoError(t, err)
+						var msEngineDiff enginepb.MVCCStats
+						for _, span := range spans {
+							ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+							require.NoError(t, err)
+							msEngineDiff.Add(ms)
+						}
 						msEngineDiff.Subtract(msEngineBefore)
 
 						msEvalDiff := *e.ms
@@ -615,9 +630,13 @@ func TestMVCCHistories(t *testing.T) {
 
 				// Calculate and output final stats if requested and the data changed.
 				if stats && dataChange {
-					ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
-					require.NoError(t, err)
-					buf.Printf("stats: %s\n", formatStats(ms, false))
+					var msFinal enginepb.MVCCStats
+					for _, span := range spans {
+						ms, err := storage.ComputeStats(e.engine, span.Key, span.EndKey, statsTS)
+						require.NoError(t, err)
+						msFinal.Add(ms)
+					}
+					buf.Printf("stats: %s\n", formatStats(msFinal, false))
 				}
 
 				signalError := e.t.Errorf
@@ -1362,8 +1381,9 @@ func cmdExport(e *evalCtx) error {
 		ExportAllRevisions: e.hasArg("allRevisions"),
 		StopMidKey:         e.hasArg("stopMidKey"),
 		FingerprintOptions: storage.MVCCExportFingerprintOptions{
-			StripTenantPrefix:  e.hasArg("stripTenantPrefix"),
-			StripValueChecksum: e.hasArg("stripValueChecksum"),
+			StripTenantPrefix:            e.hasArg("stripTenantPrefix"),
+			StripValueChecksum:           e.hasArg("stripValueChecksum"),
+			StripIndexPrefixAndTimestamp: e.hasArg("stripped"),
 		},
 	}
 	if e.hasArg("maxIntents") {
@@ -1383,7 +1403,7 @@ func cmdExport(e *evalCtx) error {
 	r := e.newReader()
 	defer r.Close()
 
-	sstFile := &storage.MemFile{}
+	var sstFile bytes.Buffer
 
 	var summary kvpb.BulkOpSummary
 	var resumeInfo storage.ExportRequestResumeInfo
@@ -1392,17 +1412,17 @@ func cmdExport(e *evalCtx) error {
 	var err error
 	if shouldFingerprint {
 		summary, resumeInfo, fingerprint, hasRangeKeys, err = storage.MVCCExportFingerprint(e.ctx, e.st, r,
-			opts, sstFile)
+			opts, &sstFile)
 		if err != nil {
 			return err
 		}
 		if !hasRangeKeys {
-			sstFile = &storage.MemFile{}
+			sstFile.Reset()
 		}
 		e.results.buf.Printf("export: %s", &summary)
 		e.results.buf.Print(" fingerprint=true")
 	} else {
-		summary, resumeInfo, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, sstFile)
+		summary, resumeInfo, err = storage.MVCCExportToSST(e.ctx, e.st, r, opts, &sstFile)
 		if err != nil {
 			return err
 		}
@@ -2088,7 +2108,7 @@ type evalCtx struct {
 	locks             map[string]*roachpb.Transaction
 	ms                *enginepb.MVCCStats
 	sstWriter         *storage.SSTWriter
-	sstFile           *storage.MemFile
+	sstFile           *storage.MemObject
 	ssts              [][]byte
 }
 
@@ -2341,7 +2361,7 @@ func (e *evalCtx) newTxn(
 
 func (e *evalCtx) sst() *storage.SSTWriter {
 	if e.sstWriter == nil {
-		e.sstFile = &storage.MemFile{}
+		e.sstFile = &storage.MemObject{}
 		w := storage.MakeIngestionSSTWriter(e.ctx, e.st, e.sstFile)
 		e.sstWriter = &w
 	}

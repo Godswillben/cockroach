@@ -12,16 +12,17 @@ package sql
 
 import (
 	"context"
-	"strconv"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -36,7 +37,7 @@ type tenantValues struct {
 }
 
 type showTenantNodeCapability struct {
-	name  tenantcapabilitiespb.TenantCapabilityName
+	name  string
 	value string
 }
 
@@ -55,9 +56,10 @@ type showTenantNode struct {
 
 // ShowTenant constructs a showTenantNode.
 func (p *planner) ShowTenant(ctx context.Context, n *tree.ShowTenant) (planNode, error) {
-	if err := p.RequireAdminRole(ctx, "show tenant"); err != nil {
+	if err := CanManageTenant(ctx, p); err != nil {
 		return nil, err
 	}
+
 	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "show"); err != nil {
 		return nil, err
 	}
@@ -83,6 +85,18 @@ func (p *planner) ShowTenant(ctx context.Context, n *tree.ShowTenant) (planNode,
 	}
 
 	return node, nil
+}
+
+func CanManageTenant(ctx context.Context, p AuthorizationAccessor) error {
+	isAdmin, err := p.HasAdminRole(ctx)
+	if err != nil {
+		return err
+	}
+	if isAdmin {
+		return nil
+	}
+
+	return p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MANAGETENANT)
 }
 
 func (n *showTenantNode) startExec(params runParams) error {
@@ -111,30 +125,20 @@ func (n *showTenantNode) getTenantValues(
 
 	// Add capabilities if requested.
 	if n.withCapabilities {
-		capabilities := tenantInfo.Capabilities
-		values.capabilities = []showTenantNodeCapability{
-			{
-				name:  tenantcapabilitiespb.CanAdminSplit,
-				value: strconv.FormatBool(capabilities.CanAdminSplit),
-			},
-			{
-				name:  tenantcapabilitiespb.CanViewNodeInfo,
-				value: strconv.FormatBool(capabilities.CanViewNodeInfo),
-			},
-			{
-				name:  tenantcapabilitiespb.CanViewTSDBMetrics,
-				value: strconv.FormatBool(capabilities.CanViewTSDBMetrics),
-			},
+		showTenantNodeCapabilities := make([]showTenantNodeCapability, 0, len(tenantcapabilities.IDs))
+		for _, id := range tenantcapabilities.IDs {
+			value := tenantcapabilities.MustGetValueByID(&tenantInfo.Capabilities, id)
+			showTenantNodeCapabilities = append(showTenantNodeCapabilities, showTenantNodeCapability{
+				name:  id.String(),
+				value: value.String(),
+			})
 		}
+		values.capabilities = showTenantNodeCapabilities
 	}
 
 	// Tenant status + replication status fields.
 	jobId := tenantInfo.TenantReplicationJobID
 	if jobId == 0 {
-		// No replication job, this is a non-replicating tenant.
-		if n.withReplication {
-			return nil, errors.Newf("tenant %q does not have an active replication job", tenantInfo.Name)
-		}
 		values.dataState = values.tenantInfo.DataState.String()
 	} else {
 		switch values.tenantInfo.DataState {
@@ -222,13 +226,14 @@ func (n *showTenantNode) Values() tree.Datums {
 		// This is a 'SHOW TENANT name WITH REPLICATION STATUS' command.
 		sourceTenantName := tree.DNull
 		sourceClusterUri := tree.DNull
-		replicationJobId := tree.NewDInt(tree.DInt(tenantInfo.TenantReplicationJobID))
+		replicationJobId := tree.DNull
 		replicatedTimestamp := tree.DNull
 		retainedTimestamp := tree.DNull
 		cutoverTimestamp := tree.DNull
 
 		replicationInfo := v.replicationInfo
 		if replicationInfo != nil {
+			replicationJobId = tree.NewDInt(tree.DInt(tenantInfo.TenantReplicationJobID))
 			sourceTenantName = tree.NewDString(string(replicationInfo.IngestionDetails.SourceTenantName))
 			sourceClusterUri = tree.NewDString(replicationInfo.IngestionDetails.StreamAddress)
 			if replicationInfo.ReplicationLagInfo != nil {
@@ -266,7 +271,7 @@ func (n *showTenantNode) Values() tree.Datums {
 	if n.withCapabilities {
 		capability := n.capability
 		result = append(result,
-			tree.NewDString(capability.name.String()),
+			tree.NewDString(capability.name),
 			tree.NewDString(capability.value),
 		)
 	}

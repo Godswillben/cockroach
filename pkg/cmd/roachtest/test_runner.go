@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -161,7 +162,8 @@ type clustersOpt struct {
 	cpuQuota int
 
 	// Controls whether the cluster is cleaned up at the end of the test.
-	debugMode debugMode
+	debugMode  debugMode
+	enableFIPS bool
 }
 
 type debugMode int
@@ -437,6 +439,7 @@ func defaultClusterAllocator(
 			username:     clustersOpt.user,
 			localCluster: clustersOpt.typ == localCluster,
 			alloc:        alloc,
+			enableFIPS:   clustersOpt.enableFIPS,
 		}
 		return clusterFactory.newCluster(ctx, cfg, wStatus.SetStatus, lopt.tee)
 	}
@@ -806,12 +809,6 @@ fi'`
 	}
 }
 
-func allStacks() []byte {
-	// Collect up to 5mb worth of stacks.
-	b := make([]byte, 5*(1<<20))
-	return b[:runtime.Stack(b, true /* all */)]
-}
-
 // An error is returned if the test is still running (on another goroutine) when
 // this returns. This happens when the test doesn't respond to cancellation.
 //
@@ -834,9 +831,7 @@ func (r *testRunner) runTest(
 	if runCount > 1 {
 		runID += fmt.Sprintf("#%d", runNum)
 	}
-	if teamCity {
-		shout(ctx, l, stdout, "##teamcity[testStarted name='%s' flowId='%s']", t.Name(), runID)
-	} else {
+	if !teamCity {
 		shout(ctx, l, stdout, "=== RUN   %s", runID)
 	}
 
@@ -847,6 +842,7 @@ func (r *testRunner) runTest(
 	t.runner = callerName()
 	t.runnerID = goid.Get()
 
+	s := t.Spec().(*registry.TestSpec)
 	defer func() {
 		t.end = timeutil.Now()
 
@@ -862,28 +858,49 @@ func (r *testRunner) runTest(
 		t.mu.done = true
 		t.mu.Unlock()
 
-		durationStr := fmt.Sprintf("%.2fs", t.duration().Seconds())
-		if t.Failed() {
-			output := fmt.Sprintf("test artifacts and logs in: %s\n%s", t.ArtifactsDir(), t.failureMsg())
+		if s.Skip != "" {
+			// When skipping a test, we should not report ##teamcity[testStarted...] or ##teamcity[testFinished...]
+			// service messages else the test will be reported as having run twice.
+			if teamCity {
+				shout(ctx, l, stdout, "##teamcity[testIgnored name='%s' message='%s' duration='%d']\n",
+					s.Name, teamCityEscape(s.Skip), t.duration().Milliseconds())
+			}
+			shout(ctx, l, stdout, "--- SKIP: %s (%s)\n\t%s\n", s.Name, "N/A", s.Skip)
+		} else {
+			// Delaying the ##teamcity[testStarted...] service message until the test is finished allows us to branch
+			// separately for skipped tests. The duration of the test is passed to ##teamcity[testFinished...] for
+			// accurate reporting in the TC UI.
+			if teamCity {
+				shout(ctx, l, stdout, "##teamcity[testStarted name='%s' flowId='%s']", t.Name(), runID)
+			}
+
+			durationStr := fmt.Sprintf("%.2fs", t.duration().Seconds())
+			if t.Failed() {
+				output := fmt.Sprintf("test artifacts and logs in: %s\n%s", t.ArtifactsDir(), t.failureMsg())
+
+				if teamCity {
+					// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
+					// TeamCity regards the test as successful.
+					shout(ctx, l, stdout, "##teamcity[testFailed name='%s' details='%s' flowId='%s']",
+						s.Name, teamCityEscape(output), runID)
+				}
+
+				shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", runID, durationStr, output)
+
+				if err := github.MaybePost(t, l, output); err != nil {
+					shout(ctx, l, stdout, "failed to post issue: %s", err)
+				}
+			} else {
+				shout(ctx, l, stdout, "--- PASS: %s (%s)", runID, durationStr)
+			}
 
 			if teamCity {
-				shout(ctx, l, stdout, "##teamcity[testFailed name='%s' details='%s' flowId='%s']",
-					t.Name(), teamCityEscape(output), runID)
+				shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s' duration='%d']",
+					t.Name(), runID, t.duration().Milliseconds())
 			}
-
-			shout(ctx, l, stdout, "--- FAIL: %s (%s)\n%s", runID, durationStr, output)
-
-			if err := github.MaybePost(t, l, output); err != nil {
-				shout(ctx, l, stdout, "failed to post issue: %s", err)
-			}
-		} else {
-			shout(ctx, l, stdout, "--- PASS: %s (%s)", runID, durationStr)
-			// If `##teamcity[testFailed ...]` is not present before `##teamCity[testFinished ...]`,
-			// TeamCity regards the test as successful.
 		}
 
 		if teamCity {
-			shout(ctx, l, stdout, "##teamcity[testFinished name='%s' flowId='%s']", t.Name(), runID)
 
 			// Zip the artifacts. This improves the TeamCity UX where we can navigate
 			// through zip files just fine, but we can't download subtrees of the
@@ -915,13 +932,13 @@ func (r *testRunner) runTest(
 		r.status.Lock()
 		delete(r.status.running, t)
 		// Only include tests with a Run function in the summary output.
-		if t.Spec().(*registry.TestSpec).Run != nil {
+		if s.Run != nil {
 			if t.Failed() {
 				r.status.fail[t] = struct{}{}
-			} else if t.Spec().(*registry.TestSpec).Skip == "" {
-				r.status.pass[t] = struct{}{}
-			} else {
+			} else if s.Skip != "" {
 				r.status.skip[t] = struct{}{}
+			} else {
+				r.status.pass[t] = struct{}{}
 			}
 		}
 		r.status.Unlock()
@@ -929,8 +946,8 @@ func (r *testRunner) runTest(
 
 	t.start = timeutil.Now()
 
-	timeout := 10 * time.Hour
-	if d := t.Spec().(*registry.TestSpec).Timeout; d != 0 {
+	timeout := 3 * time.Hour
+	if d := s.Timeout; d != 0 {
 		timeout = d
 	}
 	// Make sure the cluster has enough life left for the test plus enough headroom
@@ -972,7 +989,7 @@ func (r *testRunner) runTest(
 		}()
 
 		// This is the call to actually run the test.
-		t.Spec().(*registry.TestSpec).Run(runCtx, t, c)
+		s.Run(runCtx, t, c)
 	}()
 
 	var timedOut bool
@@ -1032,7 +1049,7 @@ func (r *testRunner) teardownTest(
 			// We make sure to fail the test later when handling the timedOut variable.
 			const stacksFile = "__stacks"
 			if cl, err := t.L().ChildLogger(stacksFile, logger.QuietStderr, logger.QuietStdout); err == nil {
-				sl := allStacks()
+				sl := allstacks.Get()
 				if c.Spec().NodeCount == 0 {
 					sl = []byte("<elided during unit test>") // keep test outputs clutter-free
 				}
@@ -1062,12 +1079,18 @@ func (r *testRunner) teardownTest(
 			}
 		}
 
-		// Detect dead nodes. This will call t.Error() when appropriate. Note that
-		// we do this even if t.Failed() since a down node is often the reason for
-		// the failure, and it's helpful to have the listing in the teardown logs
-		// as well (it is typically already in the main logs if the test used a
-		// monitor).
-		c.assertNoDeadNode(ctx, t)
+		// When a dead node is detected, the subsequent post validation queries are likely
+		// to hang (reason unclear), and eventually timeout according to the statement_timeout.
+		// If this occurs frequently enough, we can look at skipping post validations on a node
+		// failure (or even on any test failure).
+		if err := c.assertNoDeadNode(ctx, t); err != nil {
+			// Some tests expect dead nodes, so they may opt out of this check.
+			if t.spec.SkipPostValidations&registry.PostValidationNoDeadNodes == 0 {
+				t.Error(err)
+			} else {
+				t.L().Printf("dead node(s) detected but expected")
+			}
+		}
 
 		// We avoid trying to do this when t.Failed() (and in particular when there
 		// are dead nodes) because for reasons @tbg does not understand this gets
@@ -1081,10 +1104,16 @@ func (r *testRunner) teardownTest(
 		if db != nil {
 			defer db.Close()
 			t.L().Printf("running validation checks on node %d (<10m)", node)
-			c.FailOnInvalidDescriptors(ctx, db, t)
+			// If this validation fails due to a timeout, it is very likely that
+			// the replica divergence check below will also fail.
+			if t.spec.SkipPostValidations&registry.PostValidationInvalidDescriptors == 0 {
+				c.FailOnInvalidDescriptors(ctx, db, t)
+			}
 			// Detect replica divergence (i.e. ranges in which replicas have arrived
 			// at the same log position with different states).
-			c.FailOnReplicaDivergence(ctx, db, t)
+			if t.spec.SkipPostValidations&registry.PostValidationReplicaDivergence == 0 {
+				c.FailOnReplicaDivergence(ctx, db, t)
+			}
 		} else {
 			t.L().Printf("no live node found, skipping validation checks")
 		}

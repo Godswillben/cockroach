@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -56,7 +58,7 @@ var defaultKVBatchSize = rowinfra.KeyLimit(util.ConstantWithMetamorphicTestValue
 ))
 
 // sendFunc is the function used to execute a KV batch; normally
-// wraps (*client.Txn).Send.
+// wraps (*kv.Txn).Send.
 type sendFunc func(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, error)
@@ -162,8 +164,9 @@ type txnKVFetcher struct {
 	batchIdx       int
 	reqsScratch    []kvpb.RequestUnion
 
-	responses        []kvpb.ResponseUnion
-	remainingBatches [][]byte
+	responses           []kvpb.ResponseUnion
+	remainingBatches    [][]byte
+	remainingColBatches []coldata.Batch
 
 	// getResponseScratch is reused to return the result of Get requests.
 	getResponseScratch [1]roachpb.KeyValue
@@ -309,13 +312,43 @@ func (f *txnKVFetcher) setTxnAndSendFn(txn *kv.Txn, sendFn sendFunc) {
 //
 // If spanIDs is non-nil, then it must be of the same length as spans.
 //
-// Batch limits can only be used if the spans are ordered.
+// Batch limits can only be used if the spans are ordered or if spansCanOverlap
+// is set.
+//
+// Note that if
+// - spansCanOverlap is true
+// - multiple spans are given
+// - a single span touches multiple ranges
+// - batch limits are used,
+// then fetched rows from different spans can be interspersed with one another.
+//
+// Consider the following example: we have two ranges [a, b) and [b, c) and each
+// has a single row inside ("a" and "b"). If SetupNextFetch were to be called
+// with:
+//
+//	spans = [[a, c), [a, d)]  spanIDs = [0, 1]  batchBytesLimit = 2  spansCanOverlap = true
+//
+// then we would return
+//
+//	"a", spanID = 0
+//	"a", spanID = 1
+//
+// on the first batch, and then
+//
+//	"b", spanID = 0
+//	"b", spanID = 1.
+//
+// Note that since we never split ranges in the middle of SQL rows, the returned
+// rows will still be complete (or the last row might be incomplete, but it'll
+// be resumed by the next returned batch (when we have multiple column
+// families)).
 func (f *txnKVFetcher) SetupNextFetch(
 	ctx context.Context,
 	spans roachpb.Spans,
 	spanIDs []int,
 	batchBytesLimit rowinfra.BytesLimit,
 	firstBatchKeyLimit rowinfra.KeyLimit,
+	spansCanOverlap bool,
 ) error {
 	f.reset(ctx)
 
@@ -327,43 +360,50 @@ func (f *txnKVFetcher) SetupNextFetch(
 		return errors.Errorf("invalid batch limit %d (batchBytesLimit: %d)", firstBatchKeyLimit, batchBytesLimit)
 	}
 
-	if batchBytesLimit != 0 {
-		// Verify the spans are ordered if a batch limit is used.
-		for i := 1; i < len(spans); i++ {
-			prevKey := spans[i-1].EndKey
-			if prevKey == nil {
-				// This is the case of a GetRequest.
-				prevKey = spans[i-1].Key
-			}
-			if spans[i].Key.Compare(prevKey) < 0 {
-				return errors.Errorf("unordered spans (%s %s)", spans[i-1], spans[i])
-			}
+	if spansCanOverlap {
+		if spanIDs == nil {
+			return errors.AssertionFailedf("spanIDs must be non-nil when spansCanOverlap is true")
 		}
-	} else if util.RaceEnabled {
-		// Otherwise, just verify the spans don't contain consecutive overlapping
-		// spans.
-		for i := 1; i < len(spans); i++ {
-			prevEndKey := spans[i-1].EndKey
-			if prevEndKey == nil {
-				prevEndKey = spans[i-1].Key
+	} else {
+		if batchBytesLimit != 0 {
+			// Verify the spans are ordered if a batch limit is used.
+			for i := 1; i < len(spans); i++ {
+				prevKey := spans[i-1].EndKey
+				if prevKey == nil {
+					// This is the case of a GetRequest.
+					prevKey = spans[i-1].Key
+				}
+				if spans[i].Key.Compare(prevKey) < 0 {
+					return errors.Errorf("unordered spans (%s %s)", spans[i-1], spans[i])
+				}
 			}
-			curEndKey := spans[i].EndKey
-			if curEndKey == nil {
-				curEndKey = spans[i].Key
+		} else if util.RaceEnabled {
+			// Otherwise, just verify the spans don't contain consecutive
+			// overlapping spans.
+			for i := 1; i < len(spans); i++ {
+				prevEndKey := spans[i-1].EndKey
+				if prevEndKey == nil {
+					prevEndKey = spans[i-1].Key
+				}
+				curEndKey := spans[i].EndKey
+				if curEndKey == nil {
+					curEndKey = spans[i].Key
+				}
+				if spans[i].Key.Compare(prevEndKey) >= 0 {
+					// Current span's start key is greater than or equal to the
+					// last span's end key - we're good.
+					continue
+				} else if curEndKey.Compare(spans[i-1].Key) <= 0 {
+					// Current span's end key is less than or equal to the last
+					// span's start key - also good.
+					continue
+				}
+				// Otherwise, the two spans overlap, which isn't allowed - it
+				// leaves us at risk of incorrect results, since the row fetcher
+				// can't distinguish between identical rows in two different
+				// batches.
+				return errors.Errorf("overlapping neighbor spans (%s %s)", spans[i-1], spans[i])
 			}
-			if spans[i].Key.Compare(prevEndKey) >= 0 {
-				// Current span's start key is greater than or equal to the last span's
-				// end key - we're good.
-				continue
-			} else if curEndKey.Compare(spans[i-1].Key) <= 0 {
-				// Current span's end key is less than or equal to the last span's start
-				// key - also good.
-				continue
-			}
-			// Otherwise, the two spans overlap, which isn't allowed - it leaves us at
-			// risk of incorrect results, since the row fetcher can't distinguish
-			// between identical rows in two different batches.
-			return errors.Errorf("overlapping neighbor spans (%s %s)", spans[i-1], spans[i])
 		}
 	}
 
@@ -530,13 +570,32 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	return nil
 }
 
-// popBatch returns the 0th byte slice in a slice of byte slices, as well as
-// the rest of the slice of the byte slices. It nils the pointer to the 0th
-// element before reslicing the outer slice.
-func popBatch(batches [][]byte) (batch []byte, remainingBatches [][]byte) {
-	batch, remainingBatches = batches[0], batches[1:]
-	batches[0] = nil
-	return batch, remainingBatches
+// popBatch returns the 0th "batch" in a slice of "batches", as well as the rest
+// of the slice of the "batches". It nils the pointer to the 0th element before
+// reslicing the outer slice.
+//
+// Note that since we nil out the 0th element, the caller of nextBatch() will
+// have the only reference to it. As a result, the next time nextBatch() is
+// called previously-returned element should become garbage, and we could shrink
+// the memory usage accordingly. In other words, we're still accounting for some
+// memory after it became garbage. However, given our history of
+// under-accounting in most places, this seems acceptable.
+func popBatch(
+	batches [][]byte, colBatches []coldata.Batch,
+) (
+	batch []byte,
+	remainingBatches [][]byte,
+	colBatch coldata.Batch,
+	remainingColBatches []coldata.Batch,
+) {
+	if batches != nil {
+		batch, remainingBatches = batches[0], batches[1:]
+		batches[0] = nil
+		return batch, remainingBatches, nil, nil
+	}
+	colBatch, remainingColBatches = colBatches[0], colBatches[1:]
+	colBatches[0] = nil
+	return nil, nil, colBatch, remainingColBatches
 }
 
 func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherResponse, err error) {
@@ -549,14 +608,16 @@ func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherRespon
 	// each of which is a byte slice containing result data from KV. Since this
 	// function, by contract, returns just a single byte slice at a time, we store
 	// the inner list as state for the next invocation to pop from.
-	if len(f.remainingBatches) > 0 {
+	if len(f.remainingBatches) > 0 || len(f.remainingColBatches) > 0 {
 		// Are there remaining data batches? If so, just pop one off from the
 		// list and return it.
 		var batchResp []byte
-		batchResp, f.remainingBatches = popBatch(f.remainingBatches)
+		var colBatch coldata.Batch
+		batchResp, f.remainingBatches, colBatch, f.remainingColBatches = popBatch(f.remainingBatches, f.remainingColBatches)
 		return KVBatchFetcherResponse{
 			MoreKVs:       true,
 			BatchResponse: batchResp,
+			ColBatch:      colBatch,
 			spanID:        f.curSpanID,
 		}, nil
 	}
@@ -594,8 +655,8 @@ func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherRespon
 
 		switch t := reply.(type) {
 		case *kvpb.ScanResponse:
-			if len(t.BatchResponses) > 0 {
-				ret.BatchResponse, f.remainingBatches = popBatch(t.BatchResponses)
+			if len(t.BatchResponses) > 0 || len(t.ColBatches.ColBatches) > 0 {
+				ret.BatchResponse, f.remainingBatches, ret.ColBatch, f.remainingColBatches = popBatch(t.BatchResponses, t.ColBatches.ColBatches)
 			}
 			if len(t.Rows) > 0 {
 				return KVBatchFetcherResponse{}, errors.AssertionFailedf(
@@ -607,12 +668,12 @@ func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherRespon
 					"unexpectedly got a ScanResponse with non-nil IntentRows",
 				)
 			}
-			// Note that ret.BatchResponse might be nil when the ScanResponse is
-			// empty, and the caller (the KVFetcher) will skip over it.
+			// Note that ret.BatchResponse and ret.ColBatch might be nil when
+			// the ScanResponse is empty, and the callers will skip over it.
 			return ret, nil
 		case *kvpb.ReverseScanResponse:
-			if len(t.BatchResponses) > 0 {
-				ret.BatchResponse, f.remainingBatches = popBatch(t.BatchResponses)
+			if len(t.BatchResponses) > 0 || len(t.ColBatches.ColBatches) > 0 {
+				ret.BatchResponse, f.remainingBatches, ret.ColBatch, f.remainingColBatches = popBatch(t.BatchResponses, t.ColBatches.ColBatches)
 			}
 			if len(t.Rows) > 0 {
 				return KVBatchFetcherResponse{}, errors.AssertionFailedf(
@@ -624,8 +685,9 @@ func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherRespon
 					"unexpectedly got a ScanResponse with non-nil IntentRows",
 				)
 			}
-			// Note that ret.BatchResponse might be nil when the ScanResponse is
-			// empty, and the caller (the KVFetcher) will skip over it.
+			// Note that ret.BatchResponse and ret.ColBatch might be nil when
+			// the ReverseScanResponse is empty, and the callers will skip over
+			// it.
 			return ret, nil
 		case *kvpb.GetResponse:
 			if t.IntentValue != nil {
@@ -671,6 +733,7 @@ func (f *txnKVFetcher) reset(ctx context.Context) {
 	f.batchIdx = 0
 	f.responses = nil
 	f.remainingBatches = nil
+	f.remainingColBatches = nil
 	f.spans = identifiableSpans{}
 	f.scratchSpans = identifiableSpans{}
 	// Release only the allocations made by this fetcher. Note that we're still
@@ -796,7 +859,12 @@ func (h *kvBatchFetcherHelper) NextBatch(ctx context.Context) (KVBatchFetcherRes
 	if !resp.MoreKVs || err != nil {
 		return resp, err
 	}
-	nBytes := len(resp.BatchResponse)
+	// Note that if resp.ColBatch is nil, then GetBatchMemSize will return 0.
+	// TODO(yuzefovich, 23.1): for resp.ColBatch this includes the decoded
+	// footprint as well as the overhead of slices and whatnot which is
+	// different from what "bytes read" is about. Figure out how we want to
+	// track it here.
+	nBytes := len(resp.BatchResponse) + int(colmem.GetBatchMemSize(resp.ColBatch))
 	for i := range resp.KVs {
 		nBytes += len(resp.KVs[i].Key)
 		nBytes += len(resp.KVs[i].Value.RawBytes)

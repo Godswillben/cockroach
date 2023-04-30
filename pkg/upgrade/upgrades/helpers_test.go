@@ -13,8 +13,10 @@ package upgrades
 import (
 	"context"
 	gosql "database/sql"
+	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -29,11 +31,12 @@ import (
 )
 
 var (
-	HasColumn         = hasColumn
-	HasIndex          = hasIndex
-	DoesNotHaveIndex  = doesNotHaveIndex
-	HasColumnFamily   = hasColumnFamily
-	CreateSystemTable = createSystemTable
+	HasColumn           = hasColumn
+	HasIndex            = hasIndex
+	DoesNotHaveIndex    = doesNotHaveIndex
+	HasColumnFamily     = hasColumnFamily
+	CreateSystemTable   = createSystemTable
+	OnlyHasColumnFamily = onlyHasColumnFamily
 )
 
 type Schema struct {
@@ -167,3 +170,31 @@ func GetTable(
 
 // WaitForJobStatement is exported so that it can be detected by a testing knob.
 const WaitForJobStatement = waitForJobStatement
+
+// ExecForCountInTxns allows statements to be repeatedly run on a database
+// in transactions of a specified size.
+func ExecForCountInTxns(
+	ctx context.Context,
+	t *testing.T,
+	db *gosql.DB,
+	count int,
+	txnSize int,
+	fn func(tx *gosql.Tx, i int) error,
+) {
+	numTxns := int(math.Ceil(float64(count) / float64(txnSize)))
+	for txnNum := 0; txnNum < numTxns; txnNum++ {
+		iterEnd := (txnNum + 1) * txnSize
+		if count < iterEnd {
+			iterEnd = count
+		}
+		err := crdb.ExecuteTx(ctx, db, nil /* opts */, func(tx *gosql.Tx) error {
+			for i := txnNum * txnSize; i < iterEnd; i++ {
+				if err := fn(tx, i); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		require.NoError(t, err)
+	}
+}

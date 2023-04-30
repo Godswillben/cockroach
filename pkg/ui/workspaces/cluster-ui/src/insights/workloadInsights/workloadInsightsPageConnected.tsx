@@ -56,8 +56,8 @@ const transactionMapStateToProps = (
   state: AppState,
   _props: RouteComponentProps,
 ): TransactionInsightsViewStateProps => ({
-  isDataValid: state.adminUI.txnInsights?.valid,
-  lastUpdated: state.adminUI.txnInsights.lastUpdated,
+  isDataValid: state.adminUI?.txnInsights?.valid,
+  lastUpdated: state.adminUI?.txnInsights.lastUpdated,
   transactions: selectTransactionInsights(state),
   transactionsError: selectTransactionInsightsError(state),
   insightTypes: selectInsightTypes(),
@@ -72,8 +72,8 @@ const statementMapStateToProps = (
   state: AppState,
   _props: RouteComponentProps,
 ): StatementInsightsViewStateProps => ({
-  isDataValid: state.adminUI.stmtInsights?.valid,
-  lastUpdated: state.adminUI.stmtInsights.lastUpdated,
+  isDataValid: state.adminUI?.stmtInsights?.valid,
+  lastUpdated: state.adminUI?.stmtInsights.lastUpdated,
   statements: selectStmtInsights(state),
   statementsError: selectStmtInsightsError(state),
   insightTypes: selectInsightTypes(),

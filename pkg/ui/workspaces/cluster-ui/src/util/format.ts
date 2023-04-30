@@ -8,6 +8,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import moment from "moment-timezone";
+import { CoordinatedUniversalTime } from "src/contexts";
 import { longToInt } from "./fixLong";
 
 export const kibi = 1024;
@@ -187,12 +189,20 @@ export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT =
   "MMM DD, YYYY [at] H:mm:ss:ms";
 
 /**
- * Alternate 24 hour UTC formats
+ * Alternate 24 hour formats
  */
-export const DATE_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm UTC";
-export const DATE_WITH_SECONDS_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm:ss UTC";
-export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_UTC =
-  "MMM DD, YYYY [at] H:mm:ss:ms UTC";
+export const DATE_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm z";
+export const DATE_WITH_SECONDS_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm:ss z";
+export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ =
+  "MMM DD, YYYY [at] H:mm:ss:ms z";
+
+export function FormatWithTimezone(
+  m: moment.Moment,
+  formatString = DATE_WITH_SECONDS_FORMAT_24_TZ,
+  timezone = CoordinatedUniversalTime,
+): string {
+  return moment.tz(m, timezone).format(formatString);
+}
 
 export function RenderCount(yesCount: Long, totalCount: Long): string {
   if (longToInt(yesCount) == 0) {
@@ -229,6 +239,9 @@ export function Count(count: number): string {
 
 // limitText returns a shortened form of text that surpasses a given limit
 export const limitText = (text: string, limit: number): string => {
+  if (!text) {
+    return "";
+  }
   return text?.length > limit ? text.slice(0, limit - 3).concat("...") : text;
 };
 
@@ -238,7 +251,13 @@ export const limitStringArray = (arr: string[], limit: number): string => {
     return "";
   }
 
-  if (arr.length == 1 || arr[0].length > limit) {
+  // Remove null and undefined entries in the array.
+  arr = arr.filter(n => n);
+  if (arr.length == 0) {
+    return "";
+  }
+
+  if (arr.length == 1 || arr[0]?.length > limit) {
     return limitText(arr[0], limit);
   }
 
@@ -273,7 +292,7 @@ function add(a: string, b: string): string {
 // to an int64 (in string form).
 export function HexStringToInt64String(s: string): string {
   let dec = "0";
-  s.split("").forEach(function (chr: string) {
+  s?.split("").forEach(function (chr: string) {
     const n = parseInt(chr, 16);
     for (let t = 8; t; t >>= 1) {
       dec = add(dec, dec);
@@ -342,4 +361,52 @@ export function EncodeDatabaseTableIndexUri(
 
 export function EncodeDatabaseUri(db: string): string {
   return `/database/${EncodeUriName(db)}`;
+}
+
+interface BreakLineReplacement {
+  [key: string]: string;
+}
+
+const breakLinesKeywords: BreakLineReplacement = {
+  " FROM ": " FROM ",
+  " WHERE ": "   WHERE ",
+  " AND ": "    AND ",
+  " ORDER ": " ORDER ",
+  " LIMIT ": " LIMIT ",
+  " JOIN ": "   JOIN ",
+  " ON ": "    ON ",
+  " VALUES ": "   VALUES ",
+};
+const LINE_BREAK_LIMIT = 100;
+
+export function FormatQuery(query: string): string {
+  if (query == null) {
+    return "";
+  }
+  Object.keys(breakLinesKeywords).forEach(key => {
+    query = query.replace(new RegExp(key, "g"), `\n${breakLinesKeywords[key]}`);
+  });
+  const lines = query.split("\n").map(line => {
+    if (line.length <= LINE_BREAK_LIMIT) {
+      return line;
+    }
+    return breakLongLine(line, LINE_BREAK_LIMIT);
+  });
+
+  return lines.join("\n");
+}
+
+function breakLongLine(line: string, limit: number): string {
+  if (line.length <= limit) {
+    return line;
+  }
+  const idxComma = line.indexOf(",", limit);
+  if (idxComma == -1) {
+    return line;
+  }
+
+  return `${line.substring(0, idxComma + 1)}\n${breakLongLine(
+    line.substring(idxComma + 1).trim(),
+    limit,
+  )}`;
 }

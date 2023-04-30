@@ -14,16 +14,19 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/clusterstats"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -31,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -64,10 +66,15 @@ type clusterInfo struct {
 }
 
 type c2cSetup struct {
-	src          clusterInfo
-	dst          clusterInfo
+	src *clusterInfo
+	dst *clusterInfo
+
+	// workloadNode identifies the node in the roachprod cluster that runs the workload.
 	workloadNode option.NodeListOption
-	metrics      c2cMetrics
+
+	// gatewayNodes  identify the nodes in the source cluster to connect the main workload to.
+	gatewayNodes option.NodeListOption
+	promCfg      *prometheus.Config
 }
 
 var c2cPromMetrics = map[string]clusterstats.ClusterStat{
@@ -90,78 +97,6 @@ func sumOverLabel(stats map[string]map[string]clusterstats.StatPoint, label stri
 	return mean
 }
 
-func (cc *c2cSetup) startStatsCollection(
-	ctx context.Context, t test.Test, c cluster.Cluster,
-) func(time.Time) map[string]float64 {
-
-	if c.IsLocal() {
-		// Grafana does not run locally.
-		return func(snapTime time.Time) map[string]float64 {
-			return map[string]float64{}
-		}
-	}
-	// TODO(msbutler): pass a proper cluster replication dashboard and figure out why we need to
-	// pass a grafana dashboard for this to work
-	cfg := (&prometheus.Config{}).
-		WithPrometheusNode(cc.workloadNode.InstallNodes()[0]).
-		WithCluster(cc.dst.nodes.InstallNodes()).
-		WithNodeExporter(cc.dst.nodes.InstallNodes()).
-		WithGrafanaDashboard("https://go.crdb.dev/p/changefeed-roachtest-grafana-dashboard")
-
-	require.NoError(t, c.StartGrafana(ctx, t.L(), cfg))
-	t.L().Printf("Prom has started")
-
-	client, err := clusterstats.SetupCollectorPromClient(ctx, c, t.L(), cfg)
-	require.NoError(t, err, "error creating prometheus client for stats collector")
-	collector := clusterstats.NewStatsCollector(ctx, client)
-
-	return func(snapTime time.Time) map[string]float64 {
-		metricSnap := make(map[string]float64)
-		for name, stat := range c2cPromMetrics {
-			point, err := collector.CollectPoint(ctx, t.L(), snapTime, stat.Query)
-			if err != nil {
-				t.L().Errorf("Could not query prom %s", err.Error())
-			}
-			// TODO(msbutler): update the CollectPoint api to conduct the sum in Prom instead.
-			metricSnap[name] = sumOverLabel(point, stat.LabelName)
-			t.L().Printf("%s: %.2f", name, metricSnap[name])
-		}
-		return metricSnap
-	}
-}
-
-// DiskUsageTracker can grab the disk usage of the provided cluster.
-//
-// TODO(msbutler): deprecate this, once restore roachtests also use prom setup.
-type DiskUsageTracker struct {
-	c cluster.Cluster
-	l *logger.Logger
-}
-
-// GetDiskUsage sums the disk usage for the given nodes in megabytes.
-func (du *DiskUsageTracker) GetDiskUsage(ctx context.Context, nodes option.NodeListOption) int {
-	var usage int
-	for _, n := range nodes {
-		cur, err := getDiskUsageInBytes(ctx, du.c, du.l, n)
-		if err != nil {
-			du.l.Printf("Unable to get disk usage for node %d", n)
-			return 0
-		}
-		usage += cur
-	}
-	return usage / 1e6
-}
-
-func NewDiskUsageTracker(
-	c cluster.Cluster, parentLogger *logger.Logger,
-) (*DiskUsageTracker, error) {
-	diskLogger, err := parentLogger.ChildLogger("disk-usage", logger.QuietStdout)
-	if err != nil {
-		return nil, err
-	}
-	return &DiskUsageTracker{c: c, l: diskLogger}, nil
-}
-
 type metricSnapshot struct {
 	metrics map[string]float64
 	time    time.Time
@@ -170,11 +105,10 @@ type metricSnapshot struct {
 func newMetricSnapshot(
 	metricSnapper func(time.Time) map[string]float64, ts time.Time,
 ) metricSnapshot {
-	snap := metricSnapshot{
+	return metricSnapshot{
 		time:    ts,
 		metrics: metricSnapper(ts),
 	}
-	return snap
 }
 
 // calcThroughput estimates throughput between two time intervals as metric_unit/s/node
@@ -252,14 +186,173 @@ func (m c2cMetrics) export(t test.Test, nodeCount int) {
 	aggregate(m.cutoverTo, m.cutoverStart, "Cutover", m.cutoverEnd.time.Sub(m.cutoverStart.time))
 }
 
-func setupC2C(
-	ctx context.Context, t test.Test, c cluster.Cluster, srcKVNodes,
-	dstKVNodes int,
-) *c2cSetup {
+type streamingWorkload interface {
+	// sourceInitCmd returns a command that will populate the src cluster with data before the
+	// replication stream begins
+	sourceInitCmd(tenantName string, nodes option.NodeListOption) string
+
+	// sourceRunCmd returns a command that will run a workload
+	sourceRunCmd(tenantName string, nodes option.NodeListOption) string
+
+	runDriver(workloadCtx context.Context, c cluster.Cluster, t test.Test, setup *c2cSetup) error
+}
+
+func defaultWorkloadDriver(
+	workloadCtx context.Context, setup *c2cSetup, c cluster.Cluster, workload streamingWorkload,
+) error {
+	return c.RunE(workloadCtx, setup.workloadNode, workload.sourceRunCmd(setup.src.name, setup.gatewayNodes))
+}
+
+type replicateTPCC struct {
+	warehouses int
+}
+
+func (tpcc replicateTPCC) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
+	return fmt.Sprintf(`./workload init tpcc --data-loader import --warehouses %d {pgurl%s:%s}`,
+		tpcc.warehouses, nodes, tenantName)
+}
+
+func (tpcc replicateTPCC) sourceRunCmd(tenantName string, nodes option.NodeListOption) string {
+	// added --tolerate-errors flags to prevent test from flaking due to a transaction retry error
+	return fmt.Sprintf(`./workload run tpcc --warehouses %d --tolerate-errors {pgurl%s:%s}`,
+		tpcc.warehouses, nodes, tenantName)
+}
+
+func (tpcc replicateTPCC) runDriver(
+	workloadCtx context.Context, c cluster.Cluster, t test.Test, setup *c2cSetup,
+) error {
+	return defaultWorkloadDriver(workloadCtx, setup, c, tpcc)
+}
+
+type replicateKV struct {
+	readPercent int
+
+	// This field is merely used to debug the c2c framework for finite workloads.
+	debugRunDurationMinutes int
+
+	// initDuration, if nonzero, will pre-populate the src cluster
+	initDurationMinutes int
+}
+
+func (kv replicateKV) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
+	if kv.initDurationMinutes == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`./workload run kv --tolerate-errors --init --duration %dm --read-percent 0 {pgurl%s:%s}`,
+		kv.initDurationMinutes,
+		nodes,
+		tenantName)
+}
+
+func (kv replicateKV) sourceRunCmd(tenantName string, nodes option.NodeListOption) string {
+	debugDuration := ""
+	if kv.debugRunDurationMinutes != 0 {
+		debugDuration = fmt.Sprintf("--duration %dm", kv.debugRunDurationMinutes)
+	}
+	// added --tolerate-errors flags to prevent test from flaking due to a transaction retry error
+	return fmt.Sprintf(`./workload run kv --tolerate-errors --init %s --read-percent %d {pgurl%s:%s}`,
+		debugDuration,
+		kv.readPercent,
+		nodes,
+		tenantName)
+}
+
+func (kv replicateKV) runDriver(
+	workloadCtx context.Context, c cluster.Cluster, t test.Test, setup *c2cSetup,
+) error {
+	return defaultWorkloadDriver(workloadCtx, setup, c, kv)
+}
+
+type replicateBulkOps struct {
+}
+
+func (bo replicateBulkOps) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
+	return ""
+}
+
+func (bo replicateBulkOps) sourceRunCmd(tenantName string, nodes option.NodeListOption) string {
+	return ""
+}
+
+func (bo replicateBulkOps) runDriver(
+	workloadCtx context.Context, c cluster.Cluster, t test.Test, setup *c2cSetup,
+) error {
+	runBackupMVCCRangeTombstones(workloadCtx, t, c, mvccRangeTombstoneConfig{
+		skipBackupRestore: true,
+		skipClusterSetup:  true,
+		tenantName:        setup.src.name})
+	return nil
+}
+
+// replicationSpec are inputs to a c2c roachtest set during roachtest
+// registration, and can not be modified during roachtest execution.
+type replicationSpec struct {
+	// name specifies the name of the roachtest
+	name string
+
+	// srcodes is the number of nodes on the source cluster.
+	srcNodes int
+
+	// dstNodes is the number of nodes on the destination cluster.
+	dstNodes int
+
+	// cpus is the per node cpu count.
+	cpus int
+
+	// pdSize specifies the pd-ssd volume (in GB). If set to 0, local ssds are used.
+	pdSize int
+
+	// workload specifies the streaming workload.
+	workload streamingWorkload
+
+	// additionalDuration specifies how long the workload will run after the initial scan
+	//completes. If the time out is set to 0, it will run until completion.
+	additionalDuration time.Duration
+
+	// cutover specifies how soon before the workload ends to choose a cutover timestamp.
+	cutover time.Duration
+
+	// timeout specifies when the roachtest should fail due to timeout.
+	timeout time.Duration
+
+	expectedNodeDeaths int32
+
+	// If non-empty, the test will be skipped with the supplied reason.
+	skip string
+
+	// tags are used to categorize the test.
+	tags map[string]struct{}
+}
+
+// replicationDriver manages c2c roachtest execution.
+type replicationDriver struct {
+	rs replicationSpec
+
+	// beforeWorkloadHook is called before the main workload begins.
+	beforeWorkloadHook func()
+
+	// replicationStartHook is called as soon as the replication job begins.
+	replicationStartHook func(ctx context.Context, sp *replicationDriver)
+
+	setup   *c2cSetup
+	t       test.Test
+	c       cluster.Cluster
+	metrics *c2cMetrics
+}
+
+func makeReplicationDriver(t test.Test, c cluster.Cluster, rs replicationSpec) replicationDriver {
+	return replicationDriver{
+		t:  t,
+		c:  c,
+		rs: rs,
+	}
+}
+
+func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluster.Cluster) {
 	c.Put(ctx, t.Cockroach(), "./cockroach")
-	srcCluster := c.Range(1, srcKVNodes)
-	dstCluster := c.Range(srcKVNodes+1, srcKVNodes+dstKVNodes)
-	workloadNode := c.Node(srcKVNodes + dstKVNodes + 1)
+	srcCluster := c.Range(1, rd.rs.srcNodes)
+	dstCluster := c.Range(rd.rs.srcNodes+1, rd.rs.srcNodes+rd.rs.dstNodes)
+	workloadNode := c.Node(rd.rs.srcNodes + rd.rs.dstNodes + 1)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
 
 	// TODO(msbutler): allow for backups once this test stabilizes a bit more.
@@ -270,7 +363,7 @@ func setupC2C(
 
 	// TODO(msbutler): allow for backups once this test stabilizes a bit more.
 	dstStartOps := option.DefaultStartOptsNoBackups()
-	dstStartOps.RoachprodOpts.InitTarget = srcKVNodes + 1
+	dstStartOps.RoachprodOpts.InitTarget = rd.rs.srcNodes + 1
 	dstClusterSetting := install.MakeClusterSettings(install.SecureOption(true))
 	c.Start(ctx, t.L(), dstStartOps, dstClusterSetting, dstCluster)
 
@@ -314,86 +407,314 @@ func setupC2C(
 		db:     destDB,
 		nodes:  dstCluster}
 
-	setup := &c2cSetup{
-		src:          srcTenantInfo,
-		dst:          destTenantInfo,
+	rd.setup = &c2cSetup{
+		src:          &srcTenantInfo,
+		dst:          &destTenantInfo,
 		workloadNode: workloadNode,
-		metrics:      c2cMetrics{}}
+		gatewayNodes: srcTenantInfo.nodes}
 
-	return setup
+	rd.t = t
+	rd.c = c
+	rd.metrics = &c2cMetrics{}
+	rd.replicationStartHook = func(ctx context.Context, sp *replicationDriver) {}
+	rd.beforeWorkloadHook = func() {}
+
+	if !c.IsLocal() {
+		// TODO(msbutler): pass a proper cluster replication dashboard and figure out why we need to
+		// pass a grafana dashboard for this to work
+		rd.setup.promCfg = (&prometheus.Config{}).
+			WithPrometheusNode(rd.setup.workloadNode.InstallNodes()[0]).
+			WithCluster(rd.setup.dst.nodes.InstallNodes()).
+			WithNodeExporter(rd.setup.dst.nodes.InstallNodes()).
+			WithGrafanaDashboard("https://go.crdb.dev/p/changefeed-roachtest-grafana-dashboard")
+
+		require.NoError(rd.t, rd.c.StartGrafana(ctx, rd.t.L(), rd.setup.promCfg))
+		rd.t.L().Printf("Prom has started")
+	}
 }
 
-type streamingWorkload interface {
-	// sourceInitCmd returns a command that will populate the src cluster with data before the
-	// replication stream begins
-	sourceInitCmd(tenantName string, nodes option.NodeListOption) string
-
-	// sourceRunCmd returns a command that will run a workload
-	sourceRunCmd(tenantName string, nodes option.NodeListOption) string
+func (rd *replicationDriver) crdbNodes() option.NodeListOption {
+	return rd.setup.src.nodes.Merge(rd.setup.dst.nodes)
 }
 
-type replicateTPCC struct {
-	warehouses int
+func (rd *replicationDriver) newMonitor(ctx context.Context) cluster.Monitor {
+	m := rd.c.NewMonitor(ctx, rd.crdbNodes())
+	m.ExpectDeaths(rd.rs.expectedNodeDeaths)
+	return m
 }
 
-func (tpcc replicateTPCC) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
-	return fmt.Sprintf(`./workload init tpcc --data-loader import --warehouses %d {pgurl%s:%s}`,
-		tpcc.warehouses, nodes, tenantName)
+func (rd *replicationDriver) startStatsCollection(
+	ctx context.Context,
+) func(time.Time) map[string]float64 {
+
+	if rd.c.IsLocal() {
+		rd.t.L().Printf("Local test. Don't setup grafana")
+		// Grafana does not run locally.
+		return func(snapTime time.Time) map[string]float64 {
+			return map[string]float64{}
+		}
+	}
+
+	client, err := clusterstats.SetupCollectorPromClient(ctx, rd.c, rd.t.L(), rd.setup.promCfg)
+	require.NoError(rd.t, err, "error creating prometheus client for stats collector")
+	collector := clusterstats.NewStatsCollector(ctx, client)
+
+	return func(snapTime time.Time) map[string]float64 {
+		metricSnap := make(map[string]float64)
+		for name, stat := range c2cPromMetrics {
+			point, err := collector.CollectPoint(ctx, rd.t.L(), snapTime, stat.Query)
+			if err != nil {
+				rd.t.L().Errorf("Could not query prom %s", err.Error())
+			}
+			// TODO(msbutler): update the CollectPoint api to conduct the sum in Prom instead.
+			metricSnap[name] = sumOverLabel(point, stat.LabelName)
+			rd.t.L().Printf("%s: %.2f", name, metricSnap[name])
+		}
+		return metricSnap
+	}
 }
 
-func (tpcc replicateTPCC) sourceRunCmd(tenantName string, nodes option.NodeListOption) string {
-	// added --tolerate-errors flags to prevent test from flaking due to a transaction retry error
-	return fmt.Sprintf(`./workload run tpcc --warehouses %d --tolerate-errors {pgurl%s:%s}`,
-		tpcc.warehouses, nodes, tenantName)
+func (rd *replicationDriver) preStreamingWorkload(ctx context.Context) {
+	if initCmd := rd.rs.workload.sourceInitCmd(rd.setup.src.name, rd.setup.src.nodes); initCmd != "" {
+		rd.t.Status("populating source cluster before replication")
+		initStart := timeutil.Now()
+		rd.c.Run(ctx, rd.setup.workloadNode, initCmd)
+		rd.t.L().Printf("src cluster workload initialization took %s minutes",
+			timeutil.Since(initStart).Minutes())
+	}
 }
 
-type replicateKV struct {
-	readPercent int
+func (rd *replicationDriver) startReplicationStream(ctx context.Context) int {
+	streamReplStmt := fmt.Sprintf("CREATE TENANT %q FROM REPLICATION OF %q ON '%s'",
+		rd.setup.dst.name, rd.setup.src.name, rd.setup.src.pgURL)
+	rd.setup.dst.sysSQL.Exec(rd.t, streamReplStmt)
+	rd.replicationStartHook(ctx, rd)
+	return getIngestionJobID(rd.t, rd.setup.dst.sysSQL, rd.setup.dst.name)
 }
 
-func (kv replicateKV) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
-	return ""
+func (rd *replicationDriver) runWorkload(ctx context.Context) error {
+	rd.beforeWorkloadHook()
+	return rd.rs.workload.runDriver(ctx, rd.c, rd.t, rd.setup)
 }
 
-func (kv replicateKV) sourceRunCmd(tenantName string, nodes option.NodeListOption) string {
-	// added --tolerate-errors flags to prevent test from flaking due to a transaction retry error
-	return fmt.Sprintf(`./workload run kv --tolerate-errors --init --read-percent %d {pgurl%s:%s}`,
-		kv.readPercent,
-		nodes,
-		tenantName)
+func (rd *replicationDriver) waitForHighWatermark(ingestionJobID int, wait time.Duration) {
+	testutils.SucceedsWithin(rd.t, func() error {
+		info, err := getStreamIngestionJobInfo(rd.setup.dst.db, ingestionJobID)
+		if err != nil {
+			return err
+		}
+		if info.GetHighWater().IsZero() {
+			return errors.New("no high watermark")
+		}
+		return nil
+	}, wait)
 }
 
-type replicationTestSpec struct {
-	// name specifies the name of the roachtest
-	name string
+func (rd *replicationDriver) getWorkloadTimeout() time.Duration {
+	if rd.rs.additionalDuration != 0 {
+		return rd.rs.additionalDuration
+	}
+	return rd.rs.timeout
+}
 
-	// srcodes is the number of nodes on the source cluster.
-	srcNodes int
+// getReplicationRetainedTime returns the `retained_time` of the replication
+// job.
+func (rd *replicationDriver) getReplicationRetainedTime() time.Time {
+	var retainedTime time.Time
+	rd.setup.dst.sysSQL.QueryRow(rd.t,
+		`SELECT retained_time FROM [SHOW TENANT $1 WITH REPLICATION STATUS]`,
+		roachpb.TenantName(rd.setup.dst.name)).Scan(&retainedTime)
+	return retainedTime
+}
 
-	// dstNodes is the number of nodes on the destination cluster.
-	dstNodes int
+func (rd *replicationDriver) stopReplicationStream(ingestionJob int, cutoverTime time.Time) {
+	rd.setup.dst.sysSQL.Exec(rd.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, rd.setup.dst.name, cutoverTime)
+	err := retry.ForDuration(time.Minute*5, func() error {
+		var status string
+		var payloadBytes []byte
+		rd.setup.dst.sysSQL.QueryRow(rd.t, `SELECT status, payload FROM crdb_internal.system_jobs WHERE id = $1`,
+			ingestionJob).Scan(&status, &payloadBytes)
+		if jobs.Status(status) == jobs.StatusFailed {
+			payload := &jobspb.Payload{}
+			if err := protoutil.Unmarshal(payloadBytes, payload); err == nil {
+				rd.t.Fatalf("job failed: %s", payload.Error)
+			}
+			rd.t.Fatalf("job failed")
+		}
+		if e, a := jobs.StatusSucceeded, jobs.Status(status); e != a {
+			return errors.Errorf("expected job status %s, but got %s", e, a)
+		}
+		return nil
+	})
+	require.NoError(rd.t, err)
+}
 
-	// cpus is the per node cpu count.
-	cpus int
+func (rd *replicationDriver) compareTenantFingerprintsAtTimestamp(
+	ctx context.Context, startTime, endTime time.Time,
+) {
+	rd.t.Status(fmt.Sprintf("comparing tenant fingerprints between start time %s and end time %s",
+		startTime.UTC(), endTime.UTC()))
 
-	// pdSize specifies the pd-ssd volume (in GB). If set to 0, local ssds are used.
-	pdSize int
+	// TODO(adityamaru,lidorcarmel): Once we agree on the format and precision we
+	// display all user facing timestamps with, we should revisit how we format
+	// the start time to ensure we are fingerprinting from the most accurate lower
+	// bound.
+	microSecondRFC3339Format := "2006-01-02 15:04:05.999999"
+	startTimeStr := startTime.Format(microSecondRFC3339Format)
+	aost := hlc.Timestamp{WallTime: endTime.UnixNano()}.AsOfSystemTime()
+	fingerprintQuery := fmt.Sprintf(`
+SELECT *
+FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), '%s'::TIMESTAMPTZ, true)
+AS OF SYSTEM TIME '%s'`, startTimeStr, aost)
 
-	// workload specifies the streaming workload.
-	workload streamingWorkload
+	var srcFingerprint int64
+	fingerPrintMonitor := rd.newMonitor(ctx)
+	fingerPrintMonitor.Go(func(ctx context.Context) error {
+		rd.setup.src.sysSQL.QueryRow(rd.t, fingerprintQuery, rd.setup.src.ID).Scan(&srcFingerprint)
+		return nil
+	})
+	var destFingerprint int64
+	fingerPrintMonitor.Go(func(ctx context.Context) error {
+		// TODO(adityamaru): Measure and record fingerprinting throughput.
+		rd.metrics.fingerprintingStart = timeutil.Now()
+		rd.setup.dst.sysSQL.QueryRow(rd.t, fingerprintQuery, rd.setup.dst.ID).Scan(&destFingerprint)
+		rd.metrics.fingerprintingEnd = timeutil.Now()
+		fingerprintingDuration := rd.metrics.fingerprintingEnd.Sub(rd.metrics.fingerprintingStart).String()
+		rd.t.L().Printf("fingerprinting the destination tenant took %s", fingerprintingDuration)
+		return nil
+	})
 
-	// additionalDuration specifies how long the workload will run after the initial scan completes.
-	additionalDuration time.Duration
+	// If the goroutine gets cancelled or fataled, return before comparing fingerprints.
+	require.NoError(rd.t, fingerPrintMonitor.WaitE())
+	require.Equal(rd.t, srcFingerprint, destFingerprint)
+}
 
-	// cutover specifies how soon before the workload ends to choose a cutover timestamp.
-	cutover time.Duration
+func (rd *replicationDriver) main(ctx context.Context) {
+	metricSnapper := rd.startStatsCollection(ctx)
+	rd.preStreamingWorkload(ctx)
 
-	// timeout specifies when the roachtest should fail due to timeout.
-	timeout time.Duration
+	rd.t.L().Printf("begin workload on src cluster")
+	m := rd.newMonitor(ctx)
+	// The roachtest driver can use the workloadCtx to cancel the workload.
+	workloadCtx, workloadCancel := context.WithCancel(ctx)
+	defer workloadCancel()
+
+	workloadDoneCh := make(chan struct{})
+	m.Go(func(ctx context.Context) error {
+		defer close(workloadDoneCh)
+		err := rd.runWorkload(workloadCtx)
+		// The workload should only return an error if the roachtest driver cancels the
+		// workloadCtx after rd.additionalDuration has elapsed after the initial scan completes.
+		if err != nil && workloadCtx.Err() == nil {
+			// Implies the workload context was not cancelled and the workload cmd returned a
+			// different error.
+			return errors.Wrapf(err, `Workload context was not cancelled. Error returned by workload cmd`)
+		}
+		rd.t.L().Printf("workload successfully finished")
+		return nil
+	})
+
+	rd.t.Status("starting replication stream")
+	rd.metrics.initalScanStart = newMetricSnapshot(metricSnapper, timeutil.Now())
+	ingestionJobID := rd.startReplicationStream(ctx)
+
+	removeTenantRateLimiters(rd.t, rd.setup.dst.sysSQL, rd.setup.dst.name)
+
+	lv := makeLatencyVerifier("stream-ingestion", 0, 2*time.Minute, rd.t.L(), getStreamIngestionJobInfo, rd.t.Status, false)
+	defer lv.maybeLogLatencyHist()
+
+	m.Go(func(ctx context.Context) error {
+		return lv.pollLatency(ctx, rd.setup.dst.db, ingestionJobID, time.Second, workloadDoneCh)
+	})
+
+	rd.t.L().Printf("waiting for replication stream to finish ingesting initial scan")
+	rd.waitForHighWatermark(ingestionJobID, rd.rs.timeout/2)
+	rd.metrics.initialScanEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
+	rd.t.Status(fmt.Sprintf(`initial scan complete. run workload and repl. stream for another %s minutes`,
+		rd.rs.additionalDuration))
+
+	select {
+	case <-workloadDoneCh:
+		rd.t.L().Printf("workload finished on its own")
+	case <-time.After(rd.getWorkloadTimeout()):
+		workloadCancel()
+		rd.t.L().Printf("workload has cancelled after %s", rd.rs.additionalDuration)
+	case <-ctx.Done():
+		rd.t.L().Printf(`roachtest context cancelled while waiting for workload duration to complete`)
+		return
+	}
+	var currentTime time.Time
+	rd.setup.dst.sysSQL.QueryRow(rd.t, "SELECT clock_timestamp()").Scan(&currentTime)
+	cutoverTime := currentTime.Add(-rd.rs.cutover)
+	rd.t.Status("cutover time chosen: ", cutoverTime.String())
+
+	retainedTime := rd.getReplicationRetainedTime()
+
+	rd.metrics.cutoverTo = newMetricSnapshot(metricSnapper, cutoverTime)
+	rd.metrics.cutoverStart = newMetricSnapshot(metricSnapper, timeutil.Now())
+
+	rd.t.Status(fmt.Sprintf("waiting for replication stream to cutover to %s",
+		cutoverTime.String()))
+	rd.stopReplicationStream(ingestionJobID, cutoverTime)
+	rd.metrics.cutoverEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
+
+	rd.metrics.export(rd.t, len(rd.setup.src.nodes))
+
+	rd.t.Status("comparing fingerprints")
+	rd.compareTenantFingerprintsAtTimestamp(
+		ctx,
+		retainedTime,
+		cutoverTime,
+	)
+	lv.assertValid(rd.t)
+}
+
+func c2cRegisterWrapper(
+	r registry.Registry,
+	sp replicationSpec,
+	run func(ctx context.Context, t test.Test, c cluster.Cluster),
+) {
+
+	clusterOps := make([]spec.Option, 0)
+	if sp.cpus != 0 {
+		clusterOps = append(clusterOps, spec.CPU(sp.cpus))
+	}
+	if sp.pdSize != 0 {
+		clusterOps = append(clusterOps, spec.VolumeSize(sp.pdSize))
+	}
+
+	r.Add(registry.TestSpec{
+		Name:            sp.name,
+		Owner:           registry.OwnerDisasterRecovery,
+		Cluster:         r.MakeClusterSpec(sp.dstNodes+sp.srcNodes+1, clusterOps...),
+		Timeout:         sp.timeout,
+		Skip:            sp.skip,
+		Tags:            sp.tags,
+		RequiresLicense: true,
+		Run:             run,
+	})
+}
+
+func runAcceptanceClusterReplication(ctx context.Context, t test.Test, c cluster.Cluster) {
+	if !c.IsLocal() {
+		t.Skip("c2c/acceptance is only meant to run on a local cluster")
+	}
+	sp := replicationSpec{
+		srcNodes: 1,
+		dstNodes: 1,
+		// The timeout field ensures the c2c roachtest driver behaves properly.
+		timeout:            10 * time.Minute,
+		workload:           replicateKV{readPercent: 0, debugRunDurationMinutes: 1},
+		additionalDuration: 0 * time.Minute,
+		cutover:            30 * time.Second,
+	}
+	rd := makeReplicationDriver(t, c, sp)
+	rd.setupC2C(ctx, t, c)
+	rd.main(ctx)
 }
 
 func registerClusterToCluster(r registry.Registry) {
-	for _, sp := range []replicationTestSpec{
+	for _, sp := range []replicationSpec{
 		{
 			name:     "c2c/tpcc/warehouses=500/duration=10/cutover=5",
 			srcNodes: 4,
@@ -434,111 +755,331 @@ func registerClusterToCluster(r registry.Registry) {
 			timeout:            1 * time.Hour,
 			additionalDuration: 10 * time.Minute,
 			cutover:            5 * time.Minute,
+			tags:               registry.Tags("aws"),
+		},
+		{
+			name:               "c2c/UnitTest",
+			srcNodes:           1,
+			dstNodes:           1,
+			cpus:               4,
+			pdSize:             10,
+			workload:           replicateKV{readPercent: 0, debugRunDurationMinutes: 1},
+			timeout:            5 * time.Minute,
+			additionalDuration: 0 * time.Minute,
+			cutover:            30 * time.Second,
+			skip:               "for local ad hoc testing",
+		},
+		{
+			name:               "c2c/BulkOps",
+			srcNodes:           4,
+			dstNodes:           4,
+			cpus:               8,
+			pdSize:             500,
+			workload:           replicateBulkOps{},
+			timeout:            4 * time.Hour,
+			additionalDuration: 0,
+			cutover:            5 * time.Minute,
 		},
 	} {
 		sp := sp
-		clusterOps := make([]spec.Option, 0)
-		clusterOps = append(clusterOps, spec.CPU(sp.cpus))
-		if sp.pdSize != 0 {
-			clusterOps = append(clusterOps, spec.VolumeSize(sp.pdSize))
+		c2cRegisterWrapper(r, sp,
+			func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				rd := makeReplicationDriver(t, c, sp)
+				rd.setupC2C(ctx, t, c)
+
+				m := c.NewMonitor(ctx)
+				hc := roachtestutil.NewHealthChecker(t, c, rd.crdbNodes())
+				m.Go(func(ctx context.Context) error {
+					require.NoError(t, hc.Runner(ctx))
+					return nil
+				})
+				defer hc.Done()
+
+				rd.main(ctx)
+			})
+	}
+}
+
+type c2cPhase int
+
+const (
+	phaseInitialScan c2cPhase = iota
+	phaseSteadyState
+	phaseCutover
+)
+
+func (c c2cPhase) String() string {
+	switch c {
+	case phaseInitialScan:
+		return "Initial Scan"
+	case phaseSteadyState:
+		return "Steady State"
+	case phaseCutover:
+		return "Cutover"
+	default:
+		return "unknown"
+	}
+}
+
+// replResilienceSpec defines inputs to the replication resilience tests, set
+// during roachtest registration. This can not be modified during roachtest
+// execution.
+type replResilienceSpec struct {
+	replicationSpec
+
+	onSrc         bool
+	onCoordinator bool
+}
+
+func (rsp *replResilienceSpec) name() string {
+	var builder strings.Builder
+	builder.WriteString("c2c/shutdown")
+	if rsp.onSrc {
+		builder.WriteString("/src")
+	} else {
+		builder.WriteString("/dest")
+	}
+	if rsp.onCoordinator {
+		builder.WriteString("/coordinator")
+	} else {
+		builder.WriteString("/worker")
+	}
+	return builder.String()
+}
+
+// replResilienceDriver manages the execution of the replication resilience tests.
+type replResilienceDriver struct {
+	replicationDriver
+	rsp replResilienceSpec
+
+	// phase indicates the c2c phase a node shutdown will occur.
+	phase c2cPhase
+
+	// the fields below are gathered after the replication stream has started
+	srcJobID     jobspb.JobID
+	dstJobID     jobspb.JobID
+	shutdownNode int
+	watcherNode  int
+}
+
+func makeReplResilienceDriver(
+	t test.Test, c cluster.Cluster, rsp replResilienceSpec,
+) replResilienceDriver {
+	rd := makeReplicationDriver(t, c, rsp.replicationSpec)
+	return replResilienceDriver{
+		replicationDriver: rd,
+		phase:             c2cPhase(rand.Intn(int(phaseCutover) + 1)),
+		rsp:               rsp,
+	}
+}
+
+func (rrd *replResilienceDriver) getJobIDs(ctx context.Context) {
+	jobIDQuery := `SELECT job_id FROM [SHOW JOBS] WHERE job_type = '%s'`
+	testutils.SucceedsWithin(rrd.t, func() error {
+		if err := rrd.setup.dst.db.QueryRowContext(ctx, fmt.Sprintf(jobIDQuery,
+			`STREAM INGESTION`)).Scan(&rrd.dstJobID); err != nil {
+			return err
+		}
+		if err := rrd.setup.src.db.QueryRowContext(ctx, fmt.Sprintf(jobIDQuery,
+			`STREAM REPLICATION`)).Scan(&rrd.srcJobID); err != nil {
+			return err
+		}
+		return nil
+	}, time.Minute)
+}
+
+func (rrd *replResilienceDriver) getTargetInfo() (
+	*clusterInfo,
+	jobspb.JobID,
+	option.NodeListOption,
+) {
+	if rrd.rsp.onSrc {
+		return rrd.setup.src, rrd.srcJobID, rrd.setup.src.nodes
+	}
+	return rrd.setup.dst, rrd.dstJobID, rrd.setup.dst.nodes
+}
+
+func (rrd *replResilienceDriver) getTargetAndWatcherNodes(ctx context.Context) {
+	var coordinatorNode int
+	info, jobID, nodes := rrd.getTargetInfo()
+
+	// To populate the coordinator_id field, a node needs to claim the job.
+	// Give the job system a minute.
+	testutils.SucceedsWithin(rrd.t, func() error {
+		return info.db.QueryRowContext(ctx,
+			`SELECT coordinator_id FROM crdb_internal.jobs WHERE job_id = $1`, jobID).Scan(&coordinatorNode)
+	}, time.Minute)
+	if !rrd.rsp.onSrc {
+		// From the destination cluster's perspective, node ids range from 1 to
+		// num_dest_nodes, but from roachprod's perspective they range from
+		// num_source_nodes+1 to num_crdb_roachprod nodes. We need to adjust for
+		// this to shut down the right node. Example: if the coordinator node on the
+		// dest cluster is 1, and there are 4 src cluster nodes, then
+		// shut down roachprod node 5.
+		coordinatorNode += rrd.rsp.srcNodes
+	}
+
+	var targetNode int
+
+	findAnotherNode := func(notThisNode int) int {
+		for {
+			anotherNode := nodes.RandNode()[0]
+			if notThisNode != anotherNode {
+				return anotherNode
+			}
+		}
+	}
+	if rrd.rsp.onCoordinator {
+		targetNode = coordinatorNode
+	} else {
+		targetNode = findAnotherNode(coordinatorNode)
+	}
+	rrd.shutdownNode = targetNode
+	rrd.watcherNode = findAnotherNode(targetNode)
+}
+
+func (rrd *replResilienceDriver) getPhase() c2cPhase {
+	progress := getJobProgress(rrd.t, rrd.setup.dst.sysSQL, rrd.dstJobID)
+	streamIngestProgress := progress.GetStreamIngest()
+	highWater := progress.GetHighWater()
+
+	if highWater == nil || highWater.IsEmpty() {
+		return phaseInitialScan
+	}
+	if streamIngestProgress.CutoverTime.IsEmpty() {
+		return phaseSteadyState
+	}
+	return phaseCutover
+}
+
+func (rrd *replResilienceDriver) waitForTargetPhase() error {
+	for {
+		currentPhase := rrd.getPhase()
+		rrd.t.L().Printf("Current Phase %s", currentPhase.String())
+		switch {
+		case currentPhase < rrd.phase:
+			time.Sleep(5 * time.Second)
+		case currentPhase == rrd.phase:
+			// Every C2C phase should last at least 30 seconds, so introduce a little
+			// bit of random waiting before node shutdown to ensure the shutdown occurs
+			// once we're settled into the target phase.
+			randomSleep := time.Duration(rand.Intn(6))
+			rrd.t.L().Printf("In target phase! Take a %d second power nap", randomSleep)
+			time.Sleep(randomSleep * time.Second)
+			return nil
+		default:
+			return errors.New("c2c job past target phase")
+		}
+	}
+}
+
+func registerClusterReplicationResilience(r registry.Registry) {
+	for _, rsp := range []replResilienceSpec{
+		{
+			onSrc:         true,
+			onCoordinator: true,
+		},
+		{
+			onSrc:         true,
+			onCoordinator: false,
+		},
+		{
+			onSrc:         false,
+			onCoordinator: true,
+		},
+		{
+			onSrc:         false,
+			onCoordinator: false,
+		},
+	} {
+		rsp := rsp
+
+		rsp.replicationSpec = replicationSpec{
+			name:               rsp.name(),
+			srcNodes:           4,
+			dstNodes:           4,
+			cpus:               8,
+			workload:           replicateKV{readPercent: 0, initDurationMinutes: 2},
+			timeout:            20 * time.Minute,
+			additionalDuration: 6 * time.Minute,
+			cutover:            3 * time.Minute,
+			expectedNodeDeaths: 1,
 		}
 
-		r.Add(registry.TestSpec{
-			Name:            sp.name,
-			Owner:           registry.OwnerDisasterRecovery,
-			Cluster:         r.MakeClusterSpec(sp.dstNodes+sp.srcNodes+1, clusterOps...),
-			Timeout:         sp.timeout,
-			RequiresLicense: true,
-			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				setup := setupC2C(ctx, t, c, sp.srcNodes, sp.dstNodes)
-				m := c.NewMonitor(ctx, setup.src.nodes.Merge(setup.dst.nodes))
-				metricSnapper := setup.startStatsCollection(ctx, t, c)
-				if initCmd := sp.workload.sourceInitCmd(setup.src.name, setup.src.nodes); initCmd != "" {
-					t.Status("populating source cluster before replication")
-					initStart := timeutil.Now()
-					c.Run(ctx, setup.workloadNode, initCmd)
-					t.L().Printf("src cluster workload initialization took %s minutes", timeutil.Since(initStart).Minutes())
+		c2cRegisterWrapper(r, rsp.replicationSpec,
+			func(ctx context.Context, t test.Test, c cluster.Cluster) {
+
+				rrd := makeReplResilienceDriver(t, c, rsp)
+				rrd.setupC2C(ctx, t, c)
+
+				shutdownSetupDone := make(chan struct{})
+
+				rrd.beforeWorkloadHook = func() {
+					// Ensure the workload begins after c2c jobs have been set up.
+					<-shutdownSetupDone
 				}
-				t.L().Printf("begin workload on src cluster")
-				workloadCtx, workloadCancel := context.WithCancel(ctx)
-				defer workloadCancel()
-				workloadDoneCh := make(chan struct{})
-				m.Go(func(ctx context.Context) error {
-					err := c.RunE(workloadCtx, setup.workloadNode,
-						sp.workload.sourceRunCmd(setup.src.name, setup.src.nodes))
-					// The workload should only stop if the workloadCtx is cancelled once
-					// sp.additionalDuration has elapsed after the initial scan completes.
-					if workloadCtx.Err() == nil {
-						// Implies the workload context was not cancelled and the workload cmd returned on
-						// its own.
-						return errors.Wrapf(err, `Workload context was not cancelled. Error returned by workload cmd`)
+
+				rrd.replicationStartHook = func(ctx context.Context, rd *replicationDriver) {
+					// Once the C2C job is set up, we need to modify some configs to
+					// ensure the shutdown doesn't bother the underlying c2c job and the
+					// foreground workload. The shutdownSetupDone channel prevents other
+					// goroutines from reading the configs concurrently.
+
+					defer close(shutdownSetupDone)
+					rrd.getJobIDs(ctx)
+					rrd.getTargetAndWatcherNodes(ctx)
+
+					// To prevent sql connections from connecting to the shutdown node,
+					// ensure roachtest process connections to cluster use watcher node
+					// from now on.
+					watcherDB := c.Conn(ctx, rd.t.L(), rrd.watcherNode)
+					watcherSQL := sqlutils.MakeSQLRunner(watcherDB)
+					if rsp.onSrc {
+						rd.setup.src.db = watcherDB
+						rd.setup.src.sysSQL = watcherSQL
+						rd.setup.gatewayNodes = c.Node(rrd.watcherNode)
+					} else {
+						rd.setup.dst.db = watcherDB
+						rd.setup.dst.sysSQL = watcherSQL
 					}
-					workloadDoneCh <- struct{}{}
+					t.L().Printf(`%s configured: Shutdown Node %d; Watcher node %d; Gateway nodes %s`,
+						rrd.rsp.name(), rrd.shutdownNode, rrd.watcherNode, rrd.setup.gatewayNodes)
+				}
+				m := rrd.newMonitor(ctx)
+				m.Go(func(ctx context.Context) error {
+					rrd.main(ctx)
 					return nil
 				})
 
-				t.Status("starting replication stream")
-				setup.metrics.initalScanStart = newMetricSnapshot(metricSnapper, timeutil.Now())
+				// Don't begin shutdown process until c2c job is set up.
+				<-shutdownSetupDone
 
-				// There's no need to remove the tenant limiters for this new app tenant, as
-				// all replication traffic flows through the system tenant.
-				streamReplStmt := fmt.Sprintf("CREATE TENANT %q FROM REPLICATION OF %q ON '%s'",
-					setup.dst.name, setup.src.name, setup.src.pgURL)
-				setup.dst.sysSQL.Exec(t, streamReplStmt)
-				ingestionJobID := getIngestionJobID(t, setup.dst.sysSQL, setup.dst.name)
-
-				// TODO(ssd): The job doesn't record the initial
-				// statement time, so we can't correctly measure the
-				// initial scan time here.
-				lv := makeLatencyVerifier("stream-ingestion", 0, 2*time.Minute, t.L(), getStreamIngestionJobInfo, t.Status, false)
-				defer lv.maybeLogLatencyHist()
-
-				m.Go(func(ctx context.Context) error {
-					return lv.pollLatency(ctx, setup.dst.db, ingestionJobID, time.Second, workloadDoneCh)
-				})
-
-				t.L().Printf("waiting for replication stream to finish ingesting initial scan")
-				waitForHighWatermark(t, setup.dst.db, ingestionJobID, sp.timeout/2)
-				setup.metrics.initialScanEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
-				t.Status(fmt.Sprintf(`initial scan complete. run workload and repl. stream for another %s minutes`,
-					sp.additionalDuration))
-
-				var currentTime time.Time
-				setup.dst.sysSQL.QueryRow(t, "SELECT clock_timestamp()").Scan(&currentTime)
-				cutoverTime := currentTime.Add(sp.additionalDuration - sp.cutover)
-				t.Status("cutover time chosen: ", cutoverTime.String())
-
-				select {
-				case <-time.After(sp.additionalDuration):
-					workloadCancel()
-					t.L().Printf("workload has finished after %s", sp.additionalDuration)
-				case <-ctx.Done():
-					t.L().Printf(`roachtest context cancelled while waiting for workload duration to complete`)
-					return
+				// While executing a node shutdown on either the src or destination
+				// cluster, ensure the destination cluster's stream ingestion job
+				// completes. If the stream producer job fails, no big deal-- in a real
+				// DR scenario the src cluster may have gone belly up during a
+				// successful c2c replication execution.
+				shutdownStarter := func() jobStarter {
+					return func(c cluster.Cluster, t test.Test) (string, error) {
+						return fmt.Sprintf("%d", rrd.dstJobID), rrd.waitForTargetPhase()
+					}
 				}
-				t.Status(fmt.Sprintf("waiting for replication stream to cutover to %s", cutoverTime.String()))
-				retainedTime := getReplicationRetainedTime(t, setup.dst.sysSQL, roachpb.TenantName(setup.dst.name))
-				setup.metrics.cutoverTo = newMetricSnapshot(metricSnapper, cutoverTime)
-				setup.metrics.cutoverStart = newMetricSnapshot(metricSnapper, timeutil.Now())
-				stopReplicationStream(t, setup.dst.sysSQL, ingestionJobID, cutoverTime)
-				setup.metrics.cutoverEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
-
-				setup.metrics.export(t, len(setup.src.nodes))
-
-				t.Status("comparing fingerprints")
-				compareTenantFingerprintsAtTimestamp(
-					t,
-					m,
-					setup,
-					retainedTime,
-					cutoverTime,
-				)
-				lv.assertValid(t)
-
+				destinationWatcherNode := rrd.watcherNode
+				if rsp.onSrc {
+					destinationWatcherNode = rrd.setup.dst.nodes[0]
+				}
+				shutdownCfg := nodeShutdownConfig{
+					shutdownNode:    rrd.shutdownNode,
+					watcherNode:     destinationWatcherNode,
+					crdbNodes:       rrd.crdbNodes(),
+					restartSettings: []install.ClusterSettingOption{install.SecureOption(true)},
+				}
+				executeNodeShutdown(ctx, t, c, shutdownCfg, shutdownStarter())
 			},
-		})
+		)
 	}
 }
+
 func getIngestionJobID(t test.Test, dstSQL *sqlutils.SQLRunner, dstTenantName string) int {
 	var tenantInfoBytes []byte
 	var tenantInfo mtinfopb.ProtoInfo
@@ -546,44 +1087,6 @@ func getIngestionJobID(t test.Test, dstSQL *sqlutils.SQLRunner, dstTenantName st
 		dstTenantName).Scan(&tenantInfoBytes)
 	require.NoError(t, protoutil.Unmarshal(tenantInfoBytes, &tenantInfo))
 	return int(tenantInfo.TenantReplicationJobID)
-}
-
-func compareTenantFingerprintsAtTimestamp(
-	t test.Test, m cluster.Monitor, setup *c2cSetup, startTime, endTime time.Time,
-) {
-	t.Status(fmt.Sprintf("comparing tenant fingerprints between start time %s and end time %s", startTime.UTC(), endTime.UTC()))
-
-	// TODO(adityamaru,lidorcarmel): Once we agree on the format and precision we
-	// display all user facing timestamps with, we should revisit how we format
-	// the start time to ensure we are fingerprinting from the most accurate lower
-	// bound.
-	microSecondRFC3339Format := "2006-01-02 15:04:05.999999"
-	startTimeStr := startTime.Format(microSecondRFC3339Format)
-	aost := hlc.Timestamp{WallTime: endTime.UnixNano()}.AsOfSystemTime()
-	fingerprintQuery := fmt.Sprintf(`
-SELECT *
-FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), '%s'::TIMESTAMPTZ, true)
-AS OF SYSTEM TIME '%s'`, startTimeStr, aost)
-
-	var srcFingerprint int64
-	m.Go(func(ctx context.Context) error {
-		setup.src.sysSQL.QueryRow(t, fingerprintQuery, setup.src.ID).Scan(&srcFingerprint)
-		return nil
-	})
-	var destFingerprint int64
-	m.Go(func(ctx context.Context) error {
-		// TODO(adityamaru): Measure and record fingerprinting throughput.
-		setup.metrics.fingerprintingStart = timeutil.Now()
-		setup.dst.sysSQL.QueryRow(t, fingerprintQuery, setup.dst.ID).Scan(&destFingerprint)
-		setup.metrics.fingerprintingEnd = timeutil.Now()
-		fingerprintingDuration := setup.metrics.fingerprintingEnd.Sub(setup.metrics.fingerprintingStart).String()
-		t.L().Printf("fingerprinting the destination tenant took %s", fingerprintingDuration)
-		return nil
-	})
-
-	// If the goroutine gets cancelled or fataled, return before comparing fingerprints.
-	require.NoError(t, m.WaitE())
-	require.Equal(t, srcFingerprint, destFingerprint)
 }
 
 type streamIngesitonJobInfo struct {
@@ -605,7 +1108,7 @@ func getStreamIngestionJobInfo(db *gosql.DB, jobID int) (jobInfo, error) {
 	var payloadBytes []byte
 	var progressBytes []byte
 	if err := db.QueryRow(
-		`SELECT status, payload, progress FROM system.jobs WHERE id = $1`, jobID,
+		`SELECT status, payload, progress FROM crdb_internal.system_jobs WHERE id = $1`, jobID,
 	).Scan(&status, &payloadBytes, &progressBytes); err != nil {
 		return nil, err
 	}
@@ -628,54 +1131,6 @@ func getStreamIngestionJobInfo(db *gosql.DB, jobID int) (jobInfo, error) {
 		highwaterTime: highwaterTime,
 		finishedTime:  time.UnixMicro(payload.FinishedMicros),
 	}, nil
-}
-
-func waitForHighWatermark(t test.Test, db *gosql.DB, ingestionJobID int, wait time.Duration) {
-	testutils.SucceedsWithin(t, func() error {
-		info, err := getStreamIngestionJobInfo(db, ingestionJobID)
-		if err != nil {
-			return err
-		}
-		if info.GetHighWater().IsZero() {
-			return errors.New("no high watermark")
-		}
-		return nil
-	}, wait)
-}
-
-// getReplicationRetainedTime returns the `retained_time` of the replication
-// job.
-func getReplicationRetainedTime(
-	t test.Test, destSQL *sqlutils.SQLRunner, destTenantName roachpb.TenantName,
-) time.Time {
-	var retainedTime time.Time
-	destSQL.QueryRow(t, `SELECT retained_time FROM [SHOW TENANT $1 WITH REPLICATION STATUS]`,
-		destTenantName).Scan(&retainedTime)
-	return retainedTime
-}
-
-func stopReplicationStream(
-	t test.Test, destSQL *sqlutils.SQLRunner, ingestionJob int, cutoverTime time.Time,
-) {
-	destSQL.Exec(t, `SELECT crdb_internal.complete_stream_ingestion_job($1, $2)`, ingestionJob, cutoverTime)
-	err := retry.ForDuration(time.Minute*5, func() error {
-		var status string
-		var payloadBytes []byte
-		destSQL.QueryRow(t, `SELECT status, payload FROM system.jobs WHERE id = $1`,
-			ingestionJob).Scan(&status, &payloadBytes)
-		if jobs.Status(status) == jobs.StatusFailed {
-			payload := &jobspb.Payload{}
-			if err := protoutil.Unmarshal(payloadBytes, payload); err == nil {
-				t.Fatalf("job failed: %s", payload.Error)
-			}
-			t.Fatalf("job failed")
-		}
-		if e, a := jobs.StatusSucceeded, jobs.Status(status); e != a {
-			return errors.Errorf("expected job status %s, but got %s", e, a)
-		}
-		return nil
-	})
-	require.NoError(t, err)
 }
 
 func srcClusterSettings(t test.Test, db *sqlutils.SQLRunner) {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -71,7 +72,7 @@ const (
 	txnFinalized
 )
 
-// A TxnCoordSender is the production implementation of client.TxnSender. It is
+// A TxnCoordSender is the production implementation of kv.TxnSender. It is
 // a Sender which wraps a lower-level Sender (a DistSender) to which it sends
 // commands. It works on behalf of the client to keep a transaction's state
 // (e.g. intents) and to perform periodic heartbeating of the transaction
@@ -87,13 +88,13 @@ const (
 // - Attaching lock spans to EndTxn requests, for cleanup.
 // - Handles retriable errors by either bumping the transaction's epoch or, in
 // case of TransactionAbortedErrors, cleaning up the transaction (in this case,
-// the client.Txn is expected to create a new TxnCoordSender instance
-// transparently for the higher-level client).
+// the kv.Txn is expected to create a new TxnCoordSender instance transparently
+// for the higher-level client).
 //
 // Since it is stateful, the TxnCoordSender needs to understand when a
 // transaction is "finished" and the state can be destroyed. As such there's a
-// contract that the client.Txn needs obey. Read-only transactions don't matter
-// - they're stateless. For the others, once an intent write is sent by the
+// contract that the kv.Txn needs obey. Read-only transactions don't matter -
+// they're stateless. For the others, once an intent write is sent by the
 // client, the TxnCoordSender considers the transactions completed in the
 // following situations:
 // - A batch containing an EndTxns (commit or rollback) succeeds.
@@ -195,7 +196,7 @@ type txnInterceptor interface {
 
 	// importLeafFinalState updates any internal state held inside the
 	// interceptor from the given LeafTxn final state.
-	importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState)
+	importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error
 
 	// epochBumpedLocked resets the interceptor in the case of a txn epoch
 	// increment.
@@ -311,19 +312,15 @@ func (tc *TxnCoordSender) initCommonInterceptors(
 		condensedIntentsEveryN: &tc.TxnCoordSenderFactory.condensedIntentsEveryN,
 	}
 	tc.interceptorAlloc.txnSpanRefresher = txnSpanRefresher{
-		st:    tcf.st,
-		knobs: &tcf.testingKnobs,
-		riGen: riGen,
+		st:      tcf.st,
+		knobs:   &tcf.testingKnobs,
+		riGen:   riGen,
+		metrics: &tc.metrics,
 		// We can only allow refresh span retries on root transactions
 		// because those are the only places where we have all of the
 		// refresh spans. If this is a leaf, as in a distributed sql flow,
 		// we need to propagate the error to the root for an epoch restart.
-		canAutoRetry:                  typ == kv.RootTxn,
-		refreshSuccess:                tc.metrics.RefreshSuccess,
-		refreshFail:                   tc.metrics.RefreshFail,
-		refreshFailWithCondensedSpans: tc.metrics.RefreshFailWithCondensedSpans,
-		refreshMemoryLimitExceeded:    tc.metrics.RefreshMemoryLimitExceeded,
-		refreshAutoRetries:            tc.metrics.RefreshAutoRetries,
+		canAutoRetry: typ == kv.RootTxn,
 	}
 	tc.interceptorAlloc.txnLockGatekeeper = txnLockGatekeeper{
 		wrapped:                 tc.wrapped,
@@ -410,7 +407,7 @@ func newLeafTxnCoordSender(
 	return tcs
 }
 
-// DisablePipelining is part of the client.TxnSender interface.
+// DisablePipelining is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) DisablePipelining() error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -469,18 +466,22 @@ func (tc *TxnCoordSender) finalizeNonLockingTxnLocked(
 	return nil
 }
 
-// Send is part of the client.TxnSender interface.
+// Send is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) Send(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
 	// NOTE: The locking here is unusual. Although it might look like it, we are
 	// NOT holding the lock continuously for the duration of the Send. We lock
-	// here, and unlock at the botton of the interceptor stack, in the
-	// txnLockGatekeeper. The we lock again in that interceptor when the response
+	// here, and unlock at the bottom of the interceptor stack, in the
+	// txnLockGatekeeper. Then we lock again in that interceptor when the response
 	// comes, and unlock again in the defer below.
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	tc.mu.active = true
+
+	if pErr := tc.maybeRejectIncompatibleRequest(ctx, ba); pErr != nil {
+		return nil, pErr
+	}
 
 	if pErr := tc.maybeRejectClientLocked(ctx, ba); pErr != nil {
 		return nil, pErr
@@ -667,6 +668,26 @@ func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) er
 	return nil
 }
 
+// maybeRejectIncompatibleRequest checks if the TxnCoordSender is compatible with
+// a given BatchRequest.
+// Specifically, a Leaf TxnCoordSender is not compatible with locking requests.
+func (tc *TxnCoordSender) maybeRejectIncompatibleRequest(
+	ctx context.Context, ba *kvpb.BatchRequest,
+) *kvpb.Error {
+	switch tc.typ {
+	case kv.RootTxn:
+		return nil
+	case kv.LeafTxn:
+		if ba.IsLocking() {
+			return kvpb.NewError(errors.WithContextTags(errors.AssertionFailedf(
+				"LeafTxn %s incompatible with locking request %s", tc.mu.txn, ba.Summary()), ctx))
+		}
+		return nil
+	default:
+		panic("unexpected TxnType")
+	}
+}
+
 // maybeRejectClientLocked checks whether the transaction is in a state that
 // prevents it from continuing, such as the heartbeat having detected the
 // transaction to have been aborted.
@@ -733,6 +754,13 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 		// All good.
 	}
 	return nil
+}
+
+// ClientFinalized is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) ClientFinalized() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.mu.txnState == txnFinalized
 }
 
 // finalizeAndCleanupTxnLocked marks the transaction state as finalized and
@@ -974,18 +1002,44 @@ func sanityCheckErrWithTxn(
 	return err
 }
 
-// TxnStatus is part of the client.TxnSender interface.
+// TxnStatus is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) TxnStatus() roachpb.TransactionStatus {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.Status
 }
 
-// SetUserPriority is part of the client.TxnSender interface.
+// SetIsoLevel is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) SetIsoLevel(isoLevel isolation.Level) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.active && isoLevel != tc.mu.txn.IsoLevel {
+		// TODO(nvanbenschoten): this error is currently returned directly to the
+		// SQL client issuing the SET TRANSACTION ISOLATION LEVEL statement. We
+		// should either wrap this error with a pgcode or catch the condition
+		// earlier and make this an assertion failure.
+		return errors.New("cannot change the isolation level of a running transaction")
+	}
+	tc.mu.txn.IsoLevel = isoLevel
+	return nil
+}
+
+// IsoLevel is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) IsoLevel() isolation.Level {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.mu.txn.IsoLevel
+}
+
+// SetUserPriority is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) SetUserPriority(pri roachpb.UserPriority) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.mu.active && pri != tc.mu.userPriority {
+		// TODO(nvanbenschoten): this error is currently returned directly to the
+		// SQL client issuing the SET TRANSACTION PRIORITY statement. We should
+		// either wrap this error with a pgcode or catch the condition earlier and
+		// make this an assertion failure.
 		return errors.New("cannot change the user priority of a running transaction")
 	}
 	tc.mu.userPriority = pri
@@ -993,7 +1047,7 @@ func (tc *TxnCoordSender) SetUserPriority(pri roachpb.UserPriority) error {
 	return nil
 }
 
-// SetDebugName is part of the client.TxnSender interface.
+// SetDebugName is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) SetDebugName(name string) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -1008,28 +1062,28 @@ func (tc *TxnCoordSender) SetDebugName(name string) {
 	tc.mu.txn.Name = name
 }
 
-// String is part of the client.TxnSender interface.
+// String is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) String() string {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.String()
 }
 
-// ReadTimestamp is part of the client.TxnSender interface.
+// ReadTimestamp is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) ReadTimestamp() hlc.Timestamp {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.ReadTimestamp
 }
 
-// ProvisionalCommitTimestamp is part of the client.TxnSender interface.
+// ProvisionalCommitTimestamp is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) ProvisionalCommitTimestamp() hlc.Timestamp {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.WriteTimestamp
 }
 
-// CommitTimestamp is part of the client.TxnSender interface.
+// CommitTimestamp is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) CommitTimestamp() hlc.Timestamp {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -1038,14 +1092,14 @@ func (tc *TxnCoordSender) CommitTimestamp() hlc.Timestamp {
 	return txn.ReadTimestamp
 }
 
-// CommitTimestampFixed is part of the client.TxnSender interface.
+// CommitTimestampFixed is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) CommitTimestampFixed() bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.CommitTimestampFixed
 }
 
-// SetFixedTimestamp is part of the client.TxnSender interface.
+// SetFixedTimestamp is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -1070,14 +1124,14 @@ func (tc *TxnCoordSender) SetFixedTimestamp(ctx context.Context, ts hlc.Timestam
 	return nil
 }
 
-// RequiredFrontier is part of the client.TxnSender interface.
+// RequiredFrontier is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) RequiredFrontier() hlc.Timestamp {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.RequiredFrontier()
 }
 
-// ManualRestart is part of the client.TxnSender interface.
+// ManualRestart is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) ManualRestart(
 	ctx context.Context, pri roachpb.UserPriority, ts hlc.Timestamp,
 ) {
@@ -1102,7 +1156,7 @@ func (tc *TxnCoordSender) ManualRestart(
 	tc.mu.txnState = txnPending
 }
 
-// IsSerializablePushAndRefreshNotPossible is part of the client.TxnSender interface.
+// IsSerializablePushAndRefreshNotPossible is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) IsSerializablePushAndRefreshNotPossible() bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -1115,14 +1169,14 @@ func (tc *TxnCoordSender) IsSerializablePushAndRefreshNotPossible() bool {
 	return isTxnPushed && refreshAttemptNotPossible
 }
 
-// Epoch is part of the client.TxnSender interface.
+// Epoch is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) Epoch() enginepb.TxnEpoch {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.mu.txn.Epoch
 }
 
-// IsLocking is part of the client.TxnSender interface.
+// IsLocking is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) IsLocking() bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -1144,16 +1198,17 @@ func (tc *TxnCoordSender) Active() bool {
 	return tc.mu.active
 }
 
-// GetLeafTxnInputState is part of the client.TxnSender interface.
+// GetLeafTxnInputState is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnInputState(
-	ctx context.Context, opt kv.TxnStatusOpt,
+	ctx context.Context,
 ) (*roachpb.LeafTxnInputState, error) {
 	tis := new(roachpb.LeafTxnInputState)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
+	pErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
+	if pErr != nil {
+		return nil, pErr.GoError()
 	}
 
 	// Copy mutable state so access is safe for the caller.
@@ -1171,17 +1226,22 @@ func (tc *TxnCoordSender) GetLeafTxnInputState(
 	return tis, nil
 }
 
-// GetLeafTxnFinalState is part of the client.TxnSender interface.
+// GetLeafTxnFinalState is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnFinalState(
-	ctx context.Context, opt kv.TxnStatusOpt,
+	ctx context.Context,
 ) (*roachpb.LeafTxnFinalState, error) {
 	tfs := new(roachpb.LeafTxnFinalState)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
-	}
+	// TODO(nvanbenschoten): should we be calling maybeRejectClientLocked here?
+	// The caller in execinfra.GetLeafTxnFinalState is not set up to propagate
+	// errors, so for now, we don't.
+	//
+	//   pErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
+	//   if pErr != nil {
+	//   	return nil, pErr.GoError()
+	//   }
 
 	// For compatibility with pre-20.1 nodes: populate the command
 	// count.
@@ -1200,26 +1260,10 @@ func (tc *TxnCoordSender) GetLeafTxnFinalState(
 	return tfs, nil
 }
 
-func (tc *TxnCoordSender) checkTxnStatusLocked(ctx context.Context, opt kv.TxnStatusOpt) error {
-	switch opt {
-	case kv.AnyTxnStatus:
-		// Nothing to check.
-	case kv.OnlyPending:
-		// Check the coordinator's proto status.
-		rejectErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
-		if rejectErr != nil {
-			return rejectErr.GoError()
-		}
-	default:
-		panic("unreachable")
-	}
-	return nil
-}
-
-// UpdateRootWithLeafFinalState is part of the client.TxnSender interface.
+// UpdateRootWithLeafFinalState is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 	ctx context.Context, tfs *roachpb.LeafTxnFinalState,
-) {
+) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
@@ -1229,7 +1273,7 @@ func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 
 	// Sanity check: don't combine if the tfs is for a different txn ID.
 	if tc.mu.txn.ID != tfs.Txn.ID {
-		return
+		return errors.AssertionFailedf("mismatched root id %s and leaf id %s", tc.mu.txn.ID, tfs.Txn.ID)
 	}
 
 	// If the LeafTxnFinalState is telling us the transaction has been
@@ -1247,16 +1291,20 @@ func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 	// as any error is received from DistSQL, which would eliminate
 	// qualms about what error comes first.
 	if tfs.Txn.Status != roachpb.PENDING {
-		return
+		return nil
 	}
 
 	tc.mu.txn.Update(&tfs.Txn)
 	for _, reqInt := range tc.interceptorStack {
-		reqInt.importLeafFinalState(ctx, tfs)
+		err := reqInt.importLeafFinalState(ctx, tfs)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-// TestingCloneTxn is part of the client.TxnSender interface.
+// TestingCloneTxn is part of the kv.TxnSender interface.
 // This is for use by tests only. To derive leaf TxnCoordSenders,
 // use GetLeafTxnInitialState instead.
 func (tc *TxnCoordSender) TestingCloneTxn() *roachpb.Transaction {
@@ -1265,7 +1313,7 @@ func (tc *TxnCoordSender) TestingCloneTxn() *roachpb.Transaction {
 	return tc.mu.txn.Clone()
 }
 
-// PrepareRetryableError is part of the client.TxnSender interface.
+// PrepareRetryableError is part of the kv.TxnSender interface.
 func (tc *TxnCoordSender) PrepareRetryableError(
 	ctx context.Context, msg redact.RedactableString,
 ) error {
@@ -1286,6 +1334,13 @@ func (tc *TxnCoordSender) Step(ctx context.Context) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.interceptorAlloc.txnSeqNumAllocator.stepLocked(ctx)
+}
+
+// GetReadSeqNum is part of the TxnSender interface.
+func (tc *TxnCoordSender) GetReadSeqNum() enginepb.TxnSeq {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.interceptorAlloc.txnSeqNumAllocator.readSeq
 }
 
 // SetReadSeqNum is part of the TxnSender interface.
@@ -1316,31 +1371,6 @@ func (tc *TxnCoordSender) GetSteppingMode(ctx context.Context) (curMode kv.Stepp
 		curMode = kv.SteppingEnabled
 	}
 	return curMode
-}
-
-// ManualRefresh is part of the TxnSender interface.
-func (tc *TxnCoordSender) ManualRefresh(ctx context.Context) error {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-
-	// Hijack the pre-emptive refresh code path to perform the refresh but
-	// provide the force flag to ensure that the refresh occurs unconditionally.
-	// We provide an empty BatchRequest - maybeRefreshPreemptivelyLocked just
-	// needs the transaction proto. The function then returns a BatchRequest
-	// with the updated transaction proto. We use this updated proto to call
-	// into updateStateLocked directly.
-	ba := &kvpb.BatchRequest{}
-	ba.Txn = tc.mu.txn.Clone()
-	const force = true
-	refreshedBa, pErr := tc.interceptorAlloc.txnSpanRefresher.maybeRefreshPreemptivelyLocked(ctx, ba, force)
-	if pErr != nil {
-		pErr = tc.updateStateLocked(ctx, ba, nil, pErr)
-	} else {
-		var br kvpb.BatchResponse
-		br.Txn = refreshedBa.Txn
-		pErr = tc.updateStateLocked(ctx, ba, &br, nil)
-	}
-	return pErr.GoError()
 }
 
 // DeferCommitWait is part of the TxnSender interface.

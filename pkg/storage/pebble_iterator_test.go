@@ -11,6 +11,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
 	"math/rand"
@@ -19,7 +20,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -72,7 +72,7 @@ func TestPebbleIterator_Corruption(t *testing.T) {
 		LowerBound: []byte("a"),
 		UpperBound: []byte("z"),
 	}
-	iter := newPebbleIterator(p.db, iterOpts, StandardDurability)
+	iter := newPebbleIterator(p.db, iterOpts, StandardDurability, noopStatsReporter)
 
 	// Seeking into the table catches the corruption.
 	ok, err := iter.SeekEngineKeyGE(ek)
@@ -94,12 +94,11 @@ func randStr(fill []byte, rng *rand.Rand) {
 func TestPebbleIterator_ExternalCorruption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	version := clusterversion.ByKey(clusterversion.V22_2)
-	st := cluster.MakeTestingClusterSettingsWithVersions(version, version, true)
+	st := cluster.MakeTestingClusterSettings()
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-	f := &MemFile{}
-	w := MakeBackupSSTWriter(ctx, st, f)
+	var f bytes.Buffer
+	w := MakeBackupSSTWriter(ctx, st, &f)
 
 	// Create an example sstable.
 	var rawValue [64]byte

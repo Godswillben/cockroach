@@ -36,13 +36,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/marusama/semaphore"
 )
 
@@ -93,7 +95,7 @@ type ServerConfig struct {
 
 	// TempFS is used by the vectorized execution engine to store columns when the
 	// working set is larger than can be stored in memory.
-	TempFS fs.FS
+	TempFS vfs.FS
 
 	// VecFDSemaphore is a weighted semaphore that restricts the number of open
 	// file descriptors in the vectorized engine.
@@ -190,6 +192,9 @@ type ServerConfig struct {
 	// AdmissionPacerFactory is used to integrate CPU-intensive work
 	// with elastic CPU control.
 	AdmissionPacerFactory admission.PacerFactory
+
+	// Allow mutation operations to trigger stats refresh.
+	StatsRefresher *stats.Refresher
 
 	// *sql.ExecutorConfig exposed as an interface (due to dependency cycles).
 	ExecutorConfig interface{}
@@ -298,6 +303,11 @@ type TestingKnobs struct {
 	// when responding to SetupFlow RPCs, after the flow is set up but before it
 	// is started.
 	SetupFlowCb func(context.Context, base.SQLInstanceID, *execinfrapb.SetupFlowRequest) error
+
+	// RunBeforeCascadeAndChecks is run before any cascade or check queries are
+	// run. The associated transaction ID of the statement performing the cascade
+	// or check query is passed in as an argument.
+	RunBeforeCascadesAndChecks func(txnID uuid.UUID)
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
